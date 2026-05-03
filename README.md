@@ -129,3 +129,7 @@ zig build -Doptimize=ReleaseFast
 Measure-Command { zig build run -Doptimize=ReleaseFast -- index . .zindeks }
 Measure-Command { zig build run -Doptimize=ReleaseFast -- search "auth middleware" }
 ```
+
+## License
+
+Zindeks is licensed under the [Apache License 2.0](LICENSE).
