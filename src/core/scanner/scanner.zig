@@ -8,18 +8,42 @@ pub const FileEntry = struct {
 };
 
 pub fn scanPath(allocator: std.mem.Allocator, root_path: []const u8) ![]FileEntry {
-    var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
-    defer root.close();
-    var files: std.ArrayList(FileEntry) = .{};
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        files: std.ArrayList(FileEntry),
+
+        fn onFile(self: *@This(), entry: FileEntry) !void {
+            try self.files.append(self.allocator, .{
+                .path = try self.allocator.dupe(u8, entry.path),
+                .content = try self.allocator.dupe(u8, entry.content),
+                .hash = entry.hash,
+                .mtime = entry.mtime,
+            });
+        }
+    };
+
+    var collector = Collector{ .allocator = allocator, .files = .{} };
     errdefer {
-        for (files.items) |file| {
+        for (collector.files.items) |file| {
             allocator.free(file.path);
             allocator.free(file.content);
         }
-        files.deinit(allocator);
+        collector.files.deinit(allocator);
     }
-    try scanDir(allocator, root, "", &files);
-    return files.toOwnedSlice(allocator);
+
+    try scanPathStreaming(allocator, root_path, &collector, Collector.onFile);
+    return collector.files.toOwnedSlice(allocator);
+}
+
+pub fn scanPathStreaming(
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+    context: anytype,
+    comptime on_file: fn (@TypeOf(context), FileEntry) anyerror!void,
+) !void {
+    var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
+    defer root.close();
+    try scanDirStreaming(@TypeOf(context), allocator, root, "", context, on_file);
 }
 
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []FileEntry) void {
@@ -30,7 +54,14 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []FileEntry) void {
     allocator.free(entries);
 }
 
-fn scanDir(allocator: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, files: *std.ArrayList(FileEntry)) !void {
+fn scanDirStreaming(
+    comptime Context: type,
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    prefix: []const u8,
+    context: Context,
+    comptime on_file: fn (Context, FileEntry) anyerror!void,
+) !void {
     var it = dir.iterate();
     while (try it.next()) |entry| {
         if (shouldSkip(entry.name)) continue;
@@ -44,7 +75,7 @@ fn scanDir(allocator: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, fi
             .directory => {
                 var child = try dir.openDir(entry.name, .{ .iterate = true });
                 defer child.close();
-                try scanDir(allocator, child, rel, files);
+                try scanDirStreaming(Context, allocator, child, rel, context, on_file);
                 allocator.free(rel);
             },
             .file => {
@@ -55,12 +86,14 @@ fn scanDir(allocator: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, fi
                 const content = try dir.readFileAlloc(allocator, entry.name, 16 * 1024 * 1024);
                 errdefer allocator.free(content);
                 const stat = try dir.statFile(entry.name);
-                try files.append(allocator, .{
+                try on_file(context, .{
                     .path = rel,
                     .content = content,
                     .hash = std.hash.Wyhash.hash(0, content),
                     .mtime = @intCast(stat.mtime),
                 });
+                allocator.free(content);
+                allocator.free(rel);
             },
             else => allocator.free(rel),
         }

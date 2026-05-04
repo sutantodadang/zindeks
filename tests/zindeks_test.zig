@@ -133,3 +133,69 @@ test "mcp server handles JSON-RPC search and get_context deterministically" {
     try testing.expect(std.mem.indexOf(u8, response.items, "\"symbols\"") != null);
     try testing.expect(std.mem.indexOf(u8, response.items, "\"authMiddleware\"") != null);
 }
+
+test "project store writes current segment outside the project tree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    try tmp.dir.makeDir("store");
+    {
+        var repo = try tmp.dir.openDir("repo", .{});
+        defer repo.close();
+        try repo.writeFile(.{ .sub_path = "main.zig", .data = "pub fn globalIndexSearch() void {}\n" });
+    }
+
+    const repo_abs = try tmp.dir.realpathAlloc(testing.allocator, "repo");
+    defer testing.allocator.free(repo_abs);
+    const store_abs = try tmp.dir.realpathAlloc(testing.allocator, "store");
+    defer testing.allocator.free(store_abs);
+
+    var write_location = try zindeks.project_store.prepareWrite(testing.allocator, repo_abs, .{ .store_root = store_abs });
+    defer write_location.deinit();
+    try zindeks.indexer.indexPath(testing.allocator, repo_abs, write_location.index_dir);
+    try write_location.commit();
+
+    var read_location = try zindeks.project_store.resolveRead(testing.allocator, repo_abs, .{ .store_root = store_abs });
+    defer read_location.deinit();
+
+    try testing.expect(!std.mem.startsWith(u8, read_location.index_dir, repo_abs));
+
+    var index = try zindeks.storage.Index.open(testing.allocator, tmp.dir, read_location.index_dir);
+    defer index.close();
+
+    var engine = zindeks.search.Engine.init(&index);
+    var results = try engine.search(testing.allocator, "global index search", 5);
+    defer results.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), results.items.len);
+    try testing.expectEqualStrings("main.zig", results.items[0].path);
+}
+
+test "streaming scanner releases file buffers after callback" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "one.zig", .data = "pub fn oneToken() void {}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "two.txt", .data = "ignored\n" });
+
+    const root_abs = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(root_abs);
+
+    const Context = struct {
+        count: usize = 0,
+        total_bytes: usize = 0,
+
+        fn onFile(self: *@This(), entry: zindeks.scanner.FileEntry) !void {
+            self.count += 1;
+            self.total_bytes += entry.content.len;
+            try testing.expectEqualStrings("one.zig", entry.path);
+        }
+    };
+
+    var context = Context{};
+    try zindeks.scanner.scanPathStreaming(testing.allocator, root_abs, &context, Context.onFile);
+
+    try testing.expectEqual(@as(usize, 1), context.count);
+    try testing.expect(context.total_bytes > 0);
+}

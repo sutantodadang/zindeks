@@ -26,6 +26,12 @@ pub const SymbolHit = struct {
     byte_off: u32,
 };
 
+const ScoredDoc = struct {
+    doc_id: u32,
+    score: f32,
+    path: []const u8,
+};
+
 pub const Engine = struct {
     index: *const storage.Index,
 
@@ -54,21 +60,30 @@ pub const Engine = struct {
             }
         }
 
-        var results: std.ArrayList(Result) = .{};
-        defer results.deinit(allocator);
+        var scored: std.ArrayList(ScoredDoc) = .{};
+        defer scored.deinit(allocator);
         var it = scores.iterator();
         while (it.next()) |entry| {
             const doc_id = entry.key_ptr.*;
-            try results.append(allocator, .{
+            try scored.append(allocator, .{
                 .doc_id = doc_id,
                 .score = entry.value_ptr.*,
                 .path = self.index.filePath(doc_id),
-                .snippet = self.snippet(doc_id, query),
             });
         }
-        std.mem.sort(Result, results.items, {}, lessResult);
-        if (results.items.len > limit) results.shrinkRetainingCapacity(limit);
-        return .{ .items = try results.toOwnedSlice(allocator) };
+        std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
+        if (scored.items.len > limit) scored.shrinkRetainingCapacity(limit);
+
+        const results = try allocator.alloc(Result, scored.items.len);
+        for (scored.items, 0..) |item, result_index| {
+            results[result_index] = .{
+                .doc_id = item.doc_id,
+                .score = item.score,
+                .path = item.path,
+                .snippet = self.snippet(item.doc_id, query),
+            };
+        }
+        return .{ .items = results };
     }
 
     pub fn lookupSymbol(self: *Engine, name: []const u8) !?SymbolHit {
@@ -109,7 +124,7 @@ pub const Engine = struct {
     }
 };
 
-fn lessResult(_: void, a: Result, b: Result) bool {
+fn lessScoredDoc(_: void, a: ScoredDoc, b: ScoredDoc) bool {
     if (a.score != b.score) return a.score > b.score;
     return std.mem.lessThan(u8, a.path, b.path);
 }

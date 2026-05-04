@@ -1,6 +1,7 @@
 pub const storage = @import("core/storage/index.zig");
 pub const scanner = @import("core/scanner/scanner.zig");
 pub const indexer = @import("core/indexer/indexer.zig");
+pub const project_store = @import("core/project_store.zig");
 pub const search = @import("core/search/engine.zig");
 
 pub const parser = struct {

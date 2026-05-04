@@ -86,6 +86,11 @@ const TokenEntry = struct {
     first_pos: u32,
 };
 
+const TokenAccum = struct {
+    tf: u16,
+    first_pos: u32,
+};
+
 pub const Writer = struct {
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -94,12 +99,29 @@ pub const Writer = struct {
     string_offsets: std.ArrayList(u32),
     string_ids: std.StringHashMap(u32),
     docs: std.ArrayList(MutableDoc),
-    contents: std.ArrayList(u8),
+    content_file: std.fs.File,
+    content_len: u64,
     symbols: std.ArrayList(SymbolRecord),
     imports: std.ArrayList(ImportRecord),
     tokens: std.ArrayList(TokenEntry),
 
     pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir, index_path: []const u8) !Writer {
+        var content_file = try createIndexFile(allocator, dir, index_path, "content.idx");
+        errdefer content_file.close();
+        const empty_header = Header{
+            .magic = MAGIC_CONTENT,
+            .version = VERSION,
+            .header_len = @sizeOf(Header),
+            .record_count = 0,
+            .section1_off = @sizeOf(Header),
+            .section1_len = 0,
+            .section2_off = @sizeOf(Header),
+            .section2_len = 0,
+            .string_table_off = @sizeOf(Header),
+            .string_table_len = 0,
+        };
+        try content_file.writeAll(std.mem.asBytes(&empty_header));
+
         return .{
             .allocator = allocator,
             .dir = dir,
@@ -108,7 +130,8 @@ pub const Writer = struct {
             .string_offsets = .{},
             .string_ids = std.StringHashMap(u32).init(allocator),
             .docs = .{},
-            .contents = .{},
+            .content_file = content_file,
+            .content_len = 0,
             .symbols = .{},
             .imports = .{},
             .tokens = .{},
@@ -122,7 +145,7 @@ pub const Writer = struct {
         self.string_offsets.deinit(self.allocator);
         self.strings.deinit(self.allocator);
         self.docs.deinit(self.allocator);
-        self.contents.deinit(self.allocator);
+        self.content_file.close();
         self.symbols.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.tokens.deinit(self.allocator);
@@ -132,8 +155,9 @@ pub const Writer = struct {
     pub fn addFile(self: *Writer, path: []const u8, hash: u64, mtime: i64, content: []const u8) !u32 {
         const doc_id: u32 = @intCast(self.docs.items.len);
         const path_sid = try self.intern(path);
-        const content_off: u64 = @intCast(self.contents.items.len);
-        try self.contents.appendSlice(self.allocator, content);
+        const content_off = self.content_len;
+        try self.content_file.writeAll(content);
+        self.content_len += content.len;
         try self.docs.append(self.allocator, .{ .rec = .{
             .path_sid = path_sid,
             .content_off = content_off,
@@ -176,7 +200,7 @@ pub const Writer = struct {
         self.attachRanges();
         std.mem.sort(TokenEntry, self.tokens.items, self, lessTokenByText);
 
-        try self.writeContent();
+        try self.finalizeContent();
         try self.writeMeta();
         try self.writeSymbols();
         try self.writePostings();
@@ -214,6 +238,9 @@ pub const Writer = struct {
     }
 
     fn indexContentTokens(self: *Writer, doc_id: u32, content: []const u8) !void {
+        var per_doc = std.AutoHashMap(u32, TokenAccum).init(self.allocator);
+        defer per_doc.deinit();
+
         var i: usize = 0;
         var pos: u32 = 0;
         while (i < content.len) {
@@ -223,8 +250,18 @@ pub const Writer = struct {
             }
             const start = i;
             while (i < content.len and isIdent(content[i])) i += 1;
-            try self.indexIdentifier(doc_id, content[start..i], pos);
+            try self.indexIdentifierIntoMap(doc_id, &per_doc, content[start..i], pos);
             pos += 1;
+        }
+
+        var it = per_doc.iterator();
+        while (it.next()) |entry| {
+            try self.tokens.append(self.allocator, .{
+                .term_sid = entry.key_ptr.*,
+                .doc_id = doc_id,
+                .tf = entry.value_ptr.tf,
+                .first_pos = entry.value_ptr.first_pos,
+            });
         }
     }
 
@@ -237,7 +274,7 @@ pub const Writer = struct {
         var part_len: usize = 0;
         var prev_lower = false;
         for (ident) |c| {
-            if (!isIdent(c)) {
+            if (!std.ascii.isAlphanumeric(c)) {
                 if (part_len > 0) {
                     try self.addToken(doc_id, part_buf[0..part_len], pos);
                     part_len = 0;
@@ -259,10 +296,54 @@ pub const Writer = struct {
         if (part_len > 0) try self.addToken(doc_id, part_buf[0..part_len], pos);
     }
 
+    fn indexIdentifierIntoMap(self: *Writer, doc_id: u32, tokens_for_doc: *std.AutoHashMap(u32, TokenAccum), ident: []const u8, pos: u32) !void {
+        var normalized_buf: [256]u8 = undefined;
+        const normalized = normalizeInto(&normalized_buf, ident);
+        if (normalized.len > 0) try self.addTokenToMap(doc_id, tokens_for_doc, normalized, pos);
+
+        var part_buf: [256]u8 = undefined;
+        var part_len: usize = 0;
+        var prev_lower = false;
+        for (ident) |c| {
+            if (!std.ascii.isAlphanumeric(c)) {
+                if (part_len > 0) {
+                    try self.addTokenToMap(doc_id, tokens_for_doc, part_buf[0..part_len], pos);
+                    part_len = 0;
+                }
+                prev_lower = false;
+                continue;
+            }
+            const upper_boundary = std.ascii.isUpper(c) and prev_lower;
+            if (upper_boundary and part_len > 0) {
+                try self.addTokenToMap(doc_id, tokens_for_doc, part_buf[0..part_len], pos);
+                part_len = 0;
+            }
+            if (part_len < part_buf.len) {
+                part_buf[part_len] = std.ascii.toLower(c);
+                part_len += 1;
+            }
+            prev_lower = std.ascii.isLower(c) or std.ascii.isDigit(c);
+        }
+        if (part_len > 0) try self.addTokenToMap(doc_id, tokens_for_doc, part_buf[0..part_len], pos);
+    }
+
     fn addToken(self: *Writer, doc_id: u32, term: []const u8, pos: u32) !void {
         if (term.len == 0) return;
         const sid = try self.intern(term);
         try self.tokens.append(self.allocator, .{ .term_sid = sid, .doc_id = doc_id, .tf = 1, .first_pos = pos });
+        self.docs.items[doc_id].rec.token_count += 1;
+    }
+
+    fn addTokenToMap(self: *Writer, doc_id: u32, tokens_for_doc: *std.AutoHashMap(u32, TokenAccum), term: []const u8, pos: u32) !void {
+        if (term.len == 0) return;
+        const sid = try self.intern(term);
+        const entry = try tokens_for_doc.getOrPut(sid);
+        if (entry.found_existing) {
+            if (entry.value_ptr.tf < std.math.maxInt(u16)) entry.value_ptr.tf += 1;
+            entry.value_ptr.first_pos = @min(entry.value_ptr.first_pos, pos);
+        } else {
+            entry.value_ptr.* = .{ .tf = 1, .first_pos = pos };
+        }
         self.docs.items[doc_id].rec.token_count += 1;
     }
 
@@ -272,8 +353,21 @@ pub const Writer = struct {
         try self.writeFile("meta.idx", MAGIC_META, @intCast(self.docs.items.len), docs_bytes, offsets_bytes, self.strings.items);
     }
 
-    fn writeContent(self: *Writer) !void {
-        try self.writeFile("content.idx", MAGIC_CONTENT, @intCast(self.docs.items.len), self.contents.items, &.{}, &.{});
+    fn finalizeContent(self: *Writer) !void {
+        const h = Header{
+            .magic = MAGIC_CONTENT,
+            .version = VERSION,
+            .header_len = @sizeOf(Header),
+            .record_count = @intCast(self.docs.items.len),
+            .section1_off = @sizeOf(Header),
+            .section1_len = self.content_len,
+            .section2_off = @sizeOf(Header) + self.content_len,
+            .section2_len = 0,
+            .string_table_off = @sizeOf(Header) + self.content_len,
+            .string_table_len = 0,
+        };
+        try self.content_file.seekTo(0);
+        try self.content_file.writeAll(std.mem.asBytes(&h));
     }
 
     fn writeSymbols(self: *Writer) !void {
@@ -341,9 +435,7 @@ pub const Writer = struct {
     }
 
     fn writeFile(self: *Writer, name: []const u8, magic: u32, count: u32, first_section: []const u8, second_section: []const u8, strings: []const u8) !void {
-        const rel = try std.fs.path.join(self.allocator, &.{ self.index_path, name });
-        defer self.allocator.free(rel);
-        var file = try self.dir.createFile(rel, .{ .truncate = true });
+        var file = try createIndexFile(self.allocator, self.dir, self.index_path, name);
         defer file.close();
 
         const h = Header{
@@ -373,6 +465,13 @@ pub const Writer = struct {
         return std.mem.sliceTo(self.strings.items[off..], 0);
     }
 };
+
+fn createIndexFile(allocator: std.mem.Allocator, dir: std.fs.Dir, index_path: []const u8, name: []const u8) !std.fs.File {
+    const rel = try std.fs.path.join(allocator, &.{ index_path, name });
+    defer allocator.free(rel);
+    if (std.fs.path.isAbsolute(rel)) return std.fs.createFileAbsolute(rel, .{ .truncate = true });
+    return dir.createFile(rel, .{ .truncate = true });
+}
 
 pub const Index = struct {
     allocator: std.mem.Allocator,
@@ -528,7 +627,10 @@ pub const MappedFile = struct {
     pub fn open(allocator: std.mem.Allocator, dir: std.fs.Dir, index_path: []const u8, name: []const u8) !MappedFile {
         const rel = try std.fs.path.join(allocator, &.{ index_path, name });
         defer allocator.free(rel);
-        var file = try dir.openFile(rel, .{});
+        var file = if (std.fs.path.isAbsolute(rel))
+            try std.fs.openFileAbsolute(rel, .{})
+        else
+            try dir.openFile(rel, .{});
         defer file.close();
         const size_u64 = try file.getEndPos();
         const size = std.math.cast(usize, size_u64) orelse return error.FileTooBig;
@@ -539,7 +641,8 @@ pub const MappedFile = struct {
         }
 
         return openPosix(allocator, file, size) catch {
-            const bytes = try dir.readFileAlloc(allocator, rel, 1 << 34);
+            try file.seekTo(0);
+            const bytes = try file.readToEndAlloc(allocator, 1 << 34);
             return .{ .allocator = allocator, .bytes = bytes, .mode = .allocated };
         };
     }
