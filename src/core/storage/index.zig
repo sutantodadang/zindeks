@@ -574,6 +574,37 @@ pub const Index = struct {
         return std.mem.sliceTo(self.strings[off..], 0);
     }
 
+    /// Returns the document frequency (df) for a term — how many documents
+    /// contain this term. Used for IDF calculation in BM25.
+    pub fn postingsLenForTerm(self: *const Index, term: []const u8) u32 {
+        var buf: [256]u8 = undefined;
+        const normalized = normalizeInto(&buf, term);
+        var lo: usize = 0;
+        var hi: usize = self.terms.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            const current = self.stringAt(self.terms[mid].term_sid);
+            const order = std.mem.order(u8, current, normalized);
+            switch (order) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => return self.terms[mid].postings_len,
+            }
+        }
+        return 0;
+    }
+
+    /// Calculate average document length in tokens across all indexed documents.
+    pub fn avgDocLength(self: *const Index) f32 {
+        if (self.docs.len == 0) return 1.0;
+        var total: u64 = 0;
+        for (self.docs) |doc| {
+            total += doc.token_count;
+        }
+        const avg = @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(self.docs.len));
+        return if (avg > 0) avg else 1.0;
+    }
+
     pub fn postingsForTerm(self: *const Index, term: []const u8) []const PostingRecord {
         var buf: [256]u8 = undefined;
         const normalized = normalizeInto(&buf, term);

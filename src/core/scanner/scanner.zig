@@ -46,6 +46,73 @@ pub fn scanPathStreaming(
     try scanDirStreaming(@TypeOf(context), allocator, root, "", context, on_file);
 }
 
+/// Metadata-only file entry (no content). Used for fast staleness checks.
+pub const FileMetadata = struct {
+    path: []const u8,
+    size: u64,
+    mtime: i64,
+};
+
+/// Scan a directory for source files, returning only metadata (path, size, mtime).
+/// Much faster than scanPath() since it never reads file contents.
+pub fn scanPathMetadata(allocator: std.mem.Allocator, root_path: []const u8) ![]FileMetadata {
+    var list = std.ArrayList(FileMetadata).initCapacity(allocator, 64) catch @panic("OOM");
+    errdefer {
+        for (list.items) |meta| allocator.free(meta.path);
+        list.deinit(allocator);
+    }
+
+    var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
+    defer root.close();
+    try scanDirMetadata(allocator, root, "", &list);
+    return list.toOwnedSlice(allocator);
+}
+
+fn scanDirMetadata(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    prefix: []const u8,
+    list: *std.ArrayList(FileMetadata),
+) !void {
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (shouldSkip(entry.name)) continue;
+        const rel = if (prefix.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fs.path.join(allocator, &.{ prefix, entry.name });
+        errdefer allocator.free(rel);
+
+        switch (entry.kind) {
+            .directory => {
+                var child = try dir.openDir(entry.name, .{ .iterate = true });
+                defer child.close();
+                try scanDirMetadata(allocator, child, rel, list);
+                allocator.free(rel);
+            },
+            .file => {
+                if (!looksLikeSource(rel)) {
+                    allocator.free(rel);
+                    continue;
+                }
+                const stat = try dir.statFile(entry.name);
+                try list.append(allocator, .{
+                    .path = rel,
+                    .size = stat.size,
+                    .mtime = @intCast(stat.mtime),
+                });
+                allocator.free(rel);
+            },
+            else => allocator.free(rel),
+        }
+    }
+}
+
+pub fn freeMetadata(allocator: std.mem.Allocator, entries: []FileMetadata) void {
+    for (entries) |entry| allocator.free(entry.path);
+    allocator.free(entries);
+}
+
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []FileEntry) void {
     for (entries) |entry| {
         allocator.free(entry.path);

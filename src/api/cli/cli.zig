@@ -34,13 +34,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             try stdout.print("{d:.3}\t{s}\t{s}\n", .{ item.score, item.path, item.snippet });
         }
     } else if (std.mem.eql(u8, cmd, "serve")) {
-        const parsed = try parseReadArgs(allocator, args[2..]);
-        var location = try project_store.resolveRead(allocator, parsed.repo, .{ .index_dir = parsed.index_dir, .store_root = parsed.store_root });
-        defer location.deinit();
-        var idx = try storage.Index.open(allocator, std.fs.cwd(), location.index_dir);
-        defer idx.close();
-        var engine = search.Engine.init(&idx);
-        try mcp.serve(allocator, &engine);
+        var server = mcp.Server.init(allocator, .{});
+        defer server.deinit();
+        try server.serve();
     } else if (std.mem.eql(u8, cmd, "update")) {
         update.run(allocator, args[2..], std.fs.File.stdout().deprecatedWriter()) catch |err| switch (err) {
             error.HelpRequested => return update.usage(std.fs.File.stdout().deprecatedWriter()),

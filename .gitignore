@@ -1,3 +1,11 @@
 .zig-cache/
 zig-out/
 .zindeks/
+.vscode/
+.sisyphus/
+
+# Exclude upstream CI/config from vendored dependencies
+vendor/**/.github/
+vendor/**/.git/
+vendor/**/.gitignore
+vendor/**/.gitattributes
