@@ -267,22 +267,49 @@ pub const QueryCursor = struct {
 /// Language identifiers — maps file extensions to tree-sitter grammars.
 pub const LanguageId = enum {
     c,
+    c_sharp,
     cpp,
+    css,
+    dart,
+    elixir,
     go,
+    haskell,
+    java,
     javascript,
+    json,
+    lua,
     python,
     rust,
+    scala,
+    swift,
+    toml,
+    tsx,
+    typescript,
+    yaml,
     zig,
 
     pub fn fromExtension(ext: []const u8) ?LanguageId {
         if (std.mem.eql(u8, ext, ".c") or std.mem.eql(u8, ext, ".h")) return .c;
         if (std.mem.eql(u8, ext, ".cpp") or std.mem.eql(u8, ext, ".cc") or std.mem.eql(u8, ext, ".cxx") or
             std.mem.eql(u8, ext, ".hpp") or std.mem.eql(u8, ext, ".hxx")) return .cpp;
+        if (std.mem.eql(u8, ext, ".cs")) return .c_sharp;
+        if (std.mem.eql(u8, ext, ".css")) return .css;
+        if (std.mem.eql(u8, ext, ".dart")) return .dart;
+        if (std.mem.eql(u8, ext, ".ex") or std.mem.eql(u8, ext, ".exs")) return .elixir;
         if (std.mem.eql(u8, ext, ".go")) return .go;
-        if (std.mem.eql(u8, ext, ".js") or std.mem.eql(u8, ext, ".jsx") or
-            std.mem.eql(u8, ext, ".ts") or std.mem.eql(u8, ext, ".tsx")) return .javascript;
+        if (std.mem.eql(u8, ext, ".hs")) return .haskell;
+        if (std.mem.eql(u8, ext, ".java")) return .java;
+        if (std.mem.eql(u8, ext, ".js") or std.mem.eql(u8, ext, ".jsx") or std.mem.eql(u8, ext, ".mjs")) return .javascript;
+        if (std.mem.eql(u8, ext, ".json")) return .json;
+        if (std.mem.eql(u8, ext, ".lua")) return .lua;
         if (std.mem.eql(u8, ext, ".py") or std.mem.eql(u8, ext, ".pyi")) return .python;
         if (std.mem.eql(u8, ext, ".rs")) return .rust;
+        if (std.mem.eql(u8, ext, ".scala") or std.mem.eql(u8, ext, ".sc")) return .scala;
+        if (std.mem.eql(u8, ext, ".swift")) return .swift;
+        if (std.mem.eql(u8, ext, ".toml")) return .toml;
+        if (std.mem.eql(u8, ext, ".ts")) return .typescript;
+        if (std.mem.eql(u8, ext, ".tsx")) return .tsx;
+        if (std.mem.eql(u8, ext, ".yaml") or std.mem.eql(u8, ext, ".yml")) return .yaml;
         if (std.mem.eql(u8, ext, ".zig")) return .zig;
         return null;
     }
@@ -290,11 +317,25 @@ pub const LanguageId = enum {
     pub fn displayName(self: LanguageId) []const u8 {
         return switch (self) {
             .c => "C",
+            .c_sharp => "C#",
             .cpp => "C++",
+            .css => "CSS",
+            .dart => "Dart",
+            .elixir => "Elixir",
             .go => "Go",
-            .javascript => "JavaScript/TypeScript",
+            .haskell => "Haskell",
+            .java => "Java",
+            .javascript => "JavaScript",
+            .json => "JSON",
+            .lua => "Lua",
             .python => "Python",
             .rust => "Rust",
+            .scala => "Scala",
+            .swift => "Swift",
+            .toml => "TOML",
+            .tsx => "TSX",
+            .typescript => "TypeScript",
+            .yaml => "YAML",
             .zig => "Zig",
         };
     }
@@ -303,23 +344,52 @@ pub const LanguageId = enum {
 // Grammars are loaded lazily via extern functions linked at build time.
 // Each grammar C file exports `tree_sitter_<lang>()` → *const TSLanguage.
 
-extern fn tree_sitter_zig() Language;
 extern fn tree_sitter_c() Language;
+extern fn tree_sitter_c_sharp() Language;
+extern fn tree_sitter_cpp() Language;
+extern fn tree_sitter_css() Language;
+extern fn tree_sitter_dart() Language;
+extern fn tree_sitter_elixir() Language;
 extern fn tree_sitter_go() Language;
+extern fn tree_sitter_haskell() Language;
+extern fn tree_sitter_java() Language;
 extern fn tree_sitter_javascript() Language;
+extern fn tree_sitter_json() Language;
+extern fn tree_sitter_lua() Language;
 extern fn tree_sitter_python() Language;
 extern fn tree_sitter_rust() Language;
+extern fn tree_sitter_scala() Language;
+extern fn tree_sitter_swift() Language;
+extern fn tree_sitter_toml() Language;
+extern fn tree_sitter_tsx() Language;
+extern fn tree_sitter_typescript() Language;
+extern fn tree_sitter_yaml() Language;
+extern fn tree_sitter_zig() Language;
 
 /// Get the tree-sitter language for a given LanguageId.
 /// Returns null if no grammar is linked for that language.
 pub fn languageForId(id: LanguageId) ?Language {
     return switch (id) {
-        .zig => tree_sitter_zig(),
         .c => tree_sitter_c(),
+        .c_sharp => tree_sitter_c_sharp(),
+        .cpp => tree_sitter_cpp(),
+        .css => tree_sitter_css(),
+        .dart => tree_sitter_dart(),
+        .elixir => tree_sitter_elixir(),
         .go => tree_sitter_go(),
+        .haskell => tree_sitter_haskell(),
+        .java => tree_sitter_java(),
         .javascript => tree_sitter_javascript(),
+        .json => tree_sitter_json(),
+        .lua => tree_sitter_lua(),
         .python => tree_sitter_python(),
         .rust => tree_sitter_rust(),
-        .cpp => null, // will use C grammar as fallback
+        .scala => tree_sitter_scala(),
+        .swift => tree_sitter_swift(),
+        .toml => tree_sitter_toml(),
+        .tsx => tree_sitter_tsx(),
+        .typescript => tree_sitter_typescript(),
+        .yaml => tree_sitter_yaml(),
+        .zig => tree_sitter_zig(),
     };
 }

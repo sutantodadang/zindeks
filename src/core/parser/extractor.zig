@@ -135,7 +135,7 @@ pub const Extractor = struct {
 /// Uses function pointers to avoid circular imports — each language module
 /// registers its extractor here at runtime via `register()`.
 pub const Registry = struct {
-    const MAX_LANGUAGES = 16;
+    const MAX_LANGUAGES = 32;
 
     entries: [MAX_LANGUAGES]Entry = undefined,
     count: u32 = 0,

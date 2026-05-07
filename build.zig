@@ -32,15 +32,35 @@ pub fn build(b: *std.Build) void {
     ts.linkLibC();
 
     // ── Vendored C: Tree-sitter grammars ──────────────────────────────
-    // Grammar source files (each has src/parser.c; some also have src/scanner.c).
-    const GrammarSpec = struct { name: []const u8, scanner: bool };
+    // Explicit paths for flexibility (some grammars live in monorepos).
+    const GrammarSpec = struct {
+        name: []const u8,       // library name (C fn: tree_sitter_<name>)
+        parser: []const u8,     // path relative to vendor/grammars/
+        scanner: ?[]const u8 = null,
+        include: []const u8,    // include dir relative to vendor/grammars/
+    };
     const grammar_specs = [_]GrammarSpec{
-        .{ .name = "tree-sitter-zig", .scanner = false },
-        .{ .name = "tree-sitter-c", .scanner = false },
-        .{ .name = "tree-sitter-go", .scanner = false },
-        .{ .name = "tree-sitter-javascript", .scanner = true },
-        .{ .name = "tree-sitter-python", .scanner = true },
-        .{ .name = "tree-sitter-rust", .scanner = true },
+        .{ .name = "tree-sitter-c",           .parser = "tree-sitter-c/src/parser.c",           .include = "tree-sitter-c/src" },
+        .{ .name = "tree-sitter-c-sharp",     .parser = "tree-sitter-c-sharp/src/parser.c",     .scanner = "tree-sitter-c-sharp/src/scanner.c", .include = "tree-sitter-c-sharp/src" },
+        .{ .name = "tree-sitter-cpp",         .parser = "tree-sitter-cpp/src/parser.c",         .scanner = "tree-sitter-cpp/src/scanner.c",     .include = "tree-sitter-cpp/src" },
+        .{ .name = "tree-sitter-css",         .parser = "tree-sitter-css/src/parser.c",         .scanner = "tree-sitter-css/src/scanner.c",     .include = "tree-sitter-css/src" },
+        .{ .name = "tree-sitter-dart",        .parser = "tree-sitter-dart/src/parser.c",        .scanner = "tree-sitter-dart/src/scanner.c",    .include = "tree-sitter-dart/src" },
+        .{ .name = "tree-sitter-elixir",      .parser = "tree-sitter-elixir/src/parser.c",      .scanner = "tree-sitter-elixir/src/scanner.c",  .include = "tree-sitter-elixir/src" },
+        .{ .name = "tree-sitter-go",          .parser = "tree-sitter-go/src/parser.c",          .include = "tree-sitter-go/src" },
+        .{ .name = "tree-sitter-haskell",     .parser = "tree-sitter-haskell/src/parser.c",     .scanner = "tree-sitter-haskell/src/scanner.c", .include = "tree-sitter-haskell/src" },
+        .{ .name = "tree-sitter-java",        .parser = "tree-sitter-java/src/parser.c",        .include = "tree-sitter-java/src" },
+        .{ .name = "tree-sitter-javascript",  .parser = "tree-sitter-javascript/src/parser.c",  .scanner = "tree-sitter-javascript/src/scanner.c", .include = "tree-sitter-javascript/src" },
+        .{ .name = "tree-sitter-json",        .parser = "tree-sitter-json/src/parser.c",        .include = "tree-sitter-json/src" },
+        .{ .name = "tree-sitter-lua",         .parser = "tree-sitter-lua/src/parser.c",         .scanner = "tree-sitter-lua/src/scanner.c",     .include = "tree-sitter-lua/src" },
+        .{ .name = "tree-sitter-python",      .parser = "tree-sitter-python/src/parser.c",      .scanner = "tree-sitter-python/src/scanner.c",  .include = "tree-sitter-python/src" },
+        .{ .name = "tree-sitter-rust",        .parser = "tree-sitter-rust/src/parser.c",        .scanner = "tree-sitter-rust/src/scanner.c",    .include = "tree-sitter-rust/src" },
+        .{ .name = "tree-sitter-scala",       .parser = "tree-sitter-scala/src/parser.c",       .scanner = "tree-sitter-scala/src/scanner.c",   .include = "tree-sitter-scala/src" },
+        .{ .name = "tree-sitter-swift",       .parser = "tree-sitter-swift/src/parser.c",       .include = "tree-sitter-swift/src" },
+        .{ .name = "tree-sitter-toml",        .parser = "tree-sitter-toml/src/parser.c",        .scanner = "tree-sitter-toml/src/scanner.c",    .include = "tree-sitter-toml/src" },
+        .{ .name = "tree-sitter-tsx",         .parser = "tree-sitter-typescript/tsx/src/parser.c", .scanner = "tree-sitter-typescript/tsx/src/scanner.c", .include = "tree-sitter-typescript/tsx/src" },
+        .{ .name = "tree-sitter-typescript",  .parser = "tree-sitter-typescript/typescript/src/parser.c", .scanner = "tree-sitter-typescript/typescript/src/scanner.c", .include = "tree-sitter-typescript/typescript/src" },
+        .{ .name = "tree-sitter-yaml",        .parser = "tree-sitter-yaml/src/parser.c",        .scanner = "tree-sitter-yaml/src/scanner.c",    .include = "tree-sitter-yaml/src" },
+        .{ .name = "tree-sitter-zig",         .parser = "tree-sitter-zig/src/parser.c",         .include = "tree-sitter-zig/src" },
     };
 
     // ── Zindeks module ──────────────────────────────────────────────
@@ -71,15 +91,15 @@ pub fn build(b: *std.Build) void {
 
     // Link tree-sitter grammar libraries (each exposes tree_sitter_<lang>()).
     inline for (grammar_specs) |g| {
-        const parser_c = b.pathJoin(&.{ "vendor/grammars", g.name, "src/parser.c" });
-        const c_files: []const []const u8 = if (g.scanner)
-            &.{ parser_c, b.pathJoin(&.{ "vendor/grammars", g.name, "src/scanner.c" }) }
+        const parser_path = b.pathJoin(&.{ "vendor/grammars", g.parser });
+        const c_files: []const []const u8 = if (g.scanner) |s|
+            &.{ parser_path, b.pathJoin(&.{ "vendor/grammars", s }) }
         else
-            &.{parser_c};
+            &.{parser_path};
 
         const g_mod = b.createModule(.{ .target = target, .optimize = optimize });
         g_mod.addCSourceFiles(.{ .files = c_files });
-        g_mod.addIncludePath(b.path(b.pathJoin(&.{ "vendor/grammars", g.name, "src" })));
+        g_mod.addIncludePath(b.path(b.pathJoin(&.{ "vendor/grammars", g.include })));
         g_mod.addIncludePath(b.path("vendor/tree-sitter/include"));
         g_mod.addIncludePath(b.path("vendor/tree-sitter/src"));
 
@@ -103,7 +123,6 @@ pub fn build(b: *std.Build) void {
 
     // ── Tests ───────────────────────────────────────────────────────
     // All tests need SQLite + tree-sitter + grammars (C libraries).
-    // We use a single test step to avoid recompiling C libraries per artifact.
     const all_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/all_tests.zig"),
         .target = target,
@@ -119,13 +138,13 @@ pub fn build(b: *std.Build) void {
     all_tests.linkLibrary(ts);
     inline for (grammar_specs) |g| {
         const g_mod = b.createModule(.{ .target = target, .optimize = optimize });
-        const parser_c = b.pathJoin(&.{ "vendor/grammars", g.name, "src/parser.c" });
-        const c_files: []const []const u8 = if (g.scanner)
-            &.{ parser_c, b.pathJoin(&.{ "vendor/grammars", g.name, "src/scanner.c" }) }
+        const parser_path = b.pathJoin(&.{ "vendor/grammars", g.parser });
+        const c_files: []const []const u8 = if (g.scanner) |s|
+            &.{ parser_path, b.pathJoin(&.{ "vendor/grammars", s }) }
         else
-            &.{parser_c};
+            &.{parser_path};
         g_mod.addCSourceFiles(.{ .files = c_files });
-        g_mod.addIncludePath(b.path(b.pathJoin(&.{ "vendor/grammars", g.name, "src" })));
+        g_mod.addIncludePath(b.path(b.pathJoin(&.{ "vendor/grammars", g.include })));
         g_mod.addIncludePath(b.path("vendor/tree-sitter/include"));
         g_mod.addIncludePath(b.path("vendor/tree-sitter/src"));
         const g_lib = b.addLibrary(.{
