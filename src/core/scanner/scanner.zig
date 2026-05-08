@@ -11,6 +11,16 @@ pub const FileEntry = struct {
     mtime: i64,
 };
 
+/// Whether to print progress to stderr during scanning.
+var progress_enabled: bool = false;
+var progress_count: usize = 0;
+
+/// Enable or disable progress reporting for scanPath/scanPathStreaming.
+pub fn setProgress(enabled: bool) void {
+    progress_enabled = enabled;
+    if (enabled) progress_count = 0;
+}
+
 pub fn scanPath(allocator: std.mem.Allocator, root_path: []const u8) ![]FileEntry {
     const Collector = struct {
         allocator: std.mem.Allocator,
@@ -48,6 +58,9 @@ pub fn scanPathStreaming(
     var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
     defer root.close();
     try scanDirStreaming(@TypeOf(context), allocator, root, "", context, on_file);
+    if (progress_enabled) {
+        std.debug.print("\r  {d} source files scanned.\n", .{progress_count});
+    }
 }
 
 /// Metadata-only file entry (no content). Used for fast staleness checks.
@@ -172,6 +185,12 @@ fn scanDirStreaming(
                 });
                 allocator.free(content);
                 allocator.free(rel);
+                if (progress_enabled) {
+                    progress_count += 1;
+                    if (progress_count % 100 == 0) {
+                        std.debug.print("\r  {d} source files scanned...", .{progress_count});
+                    }
+                }
             },
             else => allocator.free(rel),
         }

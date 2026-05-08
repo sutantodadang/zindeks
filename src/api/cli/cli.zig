@@ -5,6 +5,7 @@ const storage = @import("../../core/storage/index.zig");
 const search = @import("../../core/search/engine.zig");
 const mcp = @import("../mcp/server.zig");
 const update = @import("update.zig");
+const scanner = @import("../../core/scanner/scanner.zig");
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) return invalidUsage();
@@ -17,7 +18,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const parsed = try parseIndexArgs(args[2..]);
         var location = try project_store.prepareWrite(allocator, parsed.repo, .{ .index_dir = parsed.index_dir, .store_root = parsed.store_root });
         defer location.deinit();
+        std.debug.print("Indexing '{s}'...\n", .{parsed.repo});
+        scanner.setProgress(true);
         try indexer.indexPath(allocator, parsed.repo, location.index_dir);
+        scanner.setProgress(false);
+        std.debug.print("Done.\n", .{});
         try location.commit();
     } else if (std.mem.eql(u8, cmd, "search")) {
         if (args.len < 3) return invalidUsage();
