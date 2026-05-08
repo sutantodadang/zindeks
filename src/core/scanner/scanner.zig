@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// Maximum file size (256 MB) for source file reading.
+/// Files exceeding this limit are skipped with a warning rather than crashing the indexer.
+pub const max_file_size: usize = 256 * 1024 * 1024;
+
 pub const FileEntry = struct {
     path: []const u8,
     content: []const u8,
@@ -150,7 +154,14 @@ fn scanDirStreaming(
                     allocator.free(rel);
                     continue;
                 }
-                const content = try dir.readFileAlloc(allocator, entry.name, 16 * 1024 * 1024);
+                const content = dir.readFileAlloc(allocator, entry.name, max_file_size) catch |err| {
+                    if (err == error.FileTooBig) {
+                        std.debug.print("warning: skipping large file '{s}' (>{d} MB)\n", .{ rel, max_file_size / (1024 * 1024) });
+                        allocator.free(rel);
+                        continue;
+                    }
+                    return err;
+                };
                 errdefer allocator.free(content);
                 const stat = try dir.statFile(entry.name);
                 try on_file(context, .{
