@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const tokenizer_mod = @import("../search/tokenizer.zig");
 
 pub const MAGIC_META: u32 = 0x5a49444d;
 pub const MAGIC_CONTENT: u32 = 0x5a494443;
@@ -270,30 +271,16 @@ pub const Writer = struct {
         const normalized = normalizeInto(&normalized_buf, ident);
         if (normalized.len > 0) try self.addToken(doc_id, normalized, pos);
 
-        var part_buf: [256]u8 = undefined;
-        var part_len: usize = 0;
-        var prev_lower = false;
-        for (ident) |c| {
-            if (!std.ascii.isAlphanumeric(c)) {
-                if (part_len > 0) {
-                    try self.addToken(doc_id, part_buf[0..part_len], pos);
-                    part_len = 0;
-                }
-                prev_lower = false;
-                continue;
+        // Use tokenizer module for camelCase + snake_case splitting
+        var splits: [tokenizer_mod.MAX_SPLITS][]const u8 = undefined;
+        const n = tokenizer_mod.splitIdentifier(ident, &splits);
+        for (splits[0..n]) |sub| {
+            var sub_buf: [256]u8 = undefined;
+            const sub_norm = normalizeInto(&sub_buf, sub);
+            if (sub_norm.len > 0 and !std.mem.eql(u8, sub_norm, normalized)) {
+                try self.addToken(doc_id, sub_norm, pos);
             }
-            const upper_boundary = std.ascii.isUpper(c) and prev_lower;
-            if (upper_boundary and part_len > 0) {
-                try self.addToken(doc_id, part_buf[0..part_len], pos);
-                part_len = 0;
-            }
-            if (part_len < part_buf.len and std.ascii.isAlphanumeric(c)) {
-                part_buf[part_len] = std.ascii.toLower(c);
-                part_len += 1;
-            }
-            prev_lower = std.ascii.isLower(c) or std.ascii.isDigit(c);
         }
-        if (part_len > 0) try self.addToken(doc_id, part_buf[0..part_len], pos);
     }
 
     fn indexIdentifierIntoMap(self: *Writer, doc_id: u32, tokens_for_doc: *std.AutoHashMap(u32, TokenAccum), ident: []const u8, pos: u32) !void {
@@ -301,30 +288,16 @@ pub const Writer = struct {
         const normalized = normalizeInto(&normalized_buf, ident);
         if (normalized.len > 0) try self.addTokenToMap(doc_id, tokens_for_doc, normalized, pos);
 
-        var part_buf: [256]u8 = undefined;
-        var part_len: usize = 0;
-        var prev_lower = false;
-        for (ident) |c| {
-            if (!std.ascii.isAlphanumeric(c)) {
-                if (part_len > 0) {
-                    try self.addTokenToMap(doc_id, tokens_for_doc, part_buf[0..part_len], pos);
-                    part_len = 0;
-                }
-                prev_lower = false;
-                continue;
+        // Use tokenizer module for camelCase + snake_case splitting
+        var splits: [tokenizer_mod.MAX_SPLITS][]const u8 = undefined;
+        const n = tokenizer_mod.splitIdentifier(ident, &splits);
+        for (splits[0..n]) |sub| {
+            var sub_buf: [256]u8 = undefined;
+            const sub_norm = normalizeInto(&sub_buf, sub);
+            if (sub_norm.len > 0 and !std.mem.eql(u8, sub_norm, normalized)) {
+                try self.addTokenToMap(doc_id, tokens_for_doc, sub_norm, pos);
             }
-            const upper_boundary = std.ascii.isUpper(c) and prev_lower;
-            if (upper_boundary and part_len > 0) {
-                try self.addTokenToMap(doc_id, tokens_for_doc, part_buf[0..part_len], pos);
-                part_len = 0;
-            }
-            if (part_len < part_buf.len) {
-                part_buf[part_len] = std.ascii.toLower(c);
-                part_len += 1;
-            }
-            prev_lower = std.ascii.isLower(c) or std.ascii.isDigit(c);
         }
-        if (part_len > 0) try self.addTokenToMap(doc_id, tokens_for_doc, part_buf[0..part_len], pos);
     }
 
     fn addToken(self: *Writer, doc_id: u32, term: []const u8, pos: u32) !void {

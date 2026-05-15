@@ -4,7 +4,8 @@
 //! Phase 2 tools: search_graph, get_code_snippet, query_graph.
 //! Phase 3 tools: detect_changes, index_status, delete_project.
 //! Phase 4 tools: trace_call_path, get_architecture, manage_adr.
-//! Phase 5 tools: detect_communities.
+//! Phase 5 tools: detect_communities, rename_symbol, ingest_traces.
+//! Phase 6 tools: semantic_search, hybrid_search.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -22,6 +23,7 @@ const leiden_mod = @import("../../core/graph/leiden.zig");
 const cypher_lexer = @import("../../core/graph/cypher/lexer.zig");
 const cypher_parser = @import("../../core/graph/cypher/parser.zig");
 const cypher_executor = @import("../../core/graph/cypher/executor.zig");
+const semantic_mod = @import("../../core/search/semantic.zig");
 
 /// MCP tool descriptor — matches the tools/list response format.
 pub const Descriptor = struct {
@@ -30,7 +32,7 @@ pub const Descriptor = struct {
     inputSchema: []const u8, // JSON literal
 };
 
-/// All tools registered for Phase 1-3.
+/// All tools registered for Phase 1-6.
 pub const ALL = [_]Descriptor{
     index_repository,
     list_projects,
@@ -47,6 +49,9 @@ pub const ALL = [_]Descriptor{
     manage_adr,
     rename_symbol,
     ingest_traces,
+    detect_communities,
+    semantic_search,
+    hybrid_search,
 };
 
 pub const index_repository = Descriptor{
@@ -349,6 +354,48 @@ pub const detect_communities = Descriptor{
     ,
 };
 
+pub const semantic_search = Descriptor{
+    .name = "semantic_search",
+    .description = "Search indexed code by semantic similarity using document embeddings. Returns ranked results with cosine similarity scores.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "query": {
+    \\      "type": "string",
+    \\      "description": "Natural language query describing what to search for"
+    \\    },
+    \\    "limit": {
+    \\      "type": "integer",
+    \\      "description": "Maximum number of results (default 10, max 100)"
+    \\    }
+    \\  },
+    \\  "required": ["query"]
+    \\}
+    ,
+};
+
+pub const hybrid_search = Descriptor{
+    .name = "hybrid_search",
+    .description = "Combined BM25 keyword and semantic search using Reciprocal Rank Fusion. Returns fused results with per-source scores.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "query": {
+    \\      "type": "string",
+    \\      "description": "Search query string"
+    \\    },
+    \\    "limit": {
+    \\      "type": "integer",
+    \\      "description": "Maximum number of results (default 10, max 100)"
+    \\    }
+    \\  },
+    \\  "required": ["query"]
+    \\}
+    ,
+};
+
 // ██████████████████████████████████████████████████████████████████████████
 // Tool JSON serialization (for tools/list response)
 // ██████████████████████████████████████████████████████████████████████████
@@ -419,6 +466,12 @@ pub fn dispatch(
         try handleRenameSymbol(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "ingest_traces")) {
         try handleIngestTraces(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "detect_communities")) {
+        try handleDetectCommunities(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "semantic_search")) {
+        try handleSemanticSearch(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "hybrid_search")) {
+        try handleHybridSearch(ctx, params_obj, writer);
     } else {
         try writer.writeAll("{\"message\":\"Unknown tool: ");
         try protocol.writeJsonString(writer, tool_name);
@@ -1523,6 +1576,97 @@ fn handleIngestTraces(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
     try writer.print(
         \\{{"ingested":true,"trace_id":{},"format":"{s}","source":"{s}"}}
     , .{ id, format, source });
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: semantic_search
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.query\"}");
+        return;
+    };
+    const query = getString(params, "query") orelse "";
+    const limit = getLimit(params, 10);
+
+    if (query.len == 0) {
+        try writer.writeAll("{\"error\":\"Empty query\"}");
+        return;
+    }
+
+    var results = semantic_mod.search(gdb, query, limit, ctx.allocator) catch {
+        try writer.writeAll("{\"error\":\"Semantic search failed. Ensure embeddings have been generated.\"}");
+        return;
+    };
+    defer results.deinit(ctx.allocator);
+
+    try writer.writeByte('[');
+    for (results.items, 0..) |item, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print(
+            \\{{"document_path":{f},"score":{f},"doc_id":{}}}
+        , .{
+            std.json.fmt(item.document_path, .{}),
+            std.json.fmt(item.score, .{}),
+            item.doc_id,
+        });
+    }
+    try writer.writeByte(']');
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: hybrid_search
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const engine = ctx.engine orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No graph database loaded. Run index_repository first.\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.query\"}");
+        return;
+    };
+    const query = getString(params, "query") orelse "";
+    const limit = getLimit(params, 10);
+
+    if (query.len == 0) {
+        try writer.writeAll("{\"error\":\"Empty query\"}");
+        return;
+    }
+
+    var results = engine.hybridSearch(gdb, ctx.allocator, query, limit) catch {
+        try writer.writeAll("{\"error\":\"Hybrid search failed.\"}");
+        return;
+    };
+    defer results.deinit(ctx.allocator);
+
+    try writer.writeByte('[');
+    for (results.items, 0..) |item, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print(
+            \\{{"doc_id":{},"path":{f},"bm25_score":{f},"semantic_score":{f},"fused_score":{f},"snippet":{f}}}
+        , .{
+            item.doc_id,
+            std.json.fmt(item.path, .{}),
+            std.json.fmt(item.bm25_score, .{}),
+            std.json.fmt(item.semantic_score, .{}),
+            std.json.fmt(item.fused_score, .{}),
+            std.json.fmt(item.snippet, .{}),
+        });
+    }
+    try writer.writeByte(']');
 }
 
 fn getString(params: std.json.ObjectMap, key: []const u8) ?[]const u8 {

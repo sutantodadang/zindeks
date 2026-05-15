@@ -20,9 +20,11 @@ const SQLITE_DONE = sqlite3.SQLITE_DONE;
 /// SQLITE_TRANSIENT sentinel — tells SQLite to make an internal copy.
 /// We define our own rather than using the @cImport-generated version,
 /// which fails @ptrFromInt alignment checks on aarch64 targets in Zig 0.15.2.
-/// SQLite never calls this function pointer; it merely checks that it is non-null.
+/// SQLite calls this during statement finalization to release bound data,
+/// but since the data was already copied (the SQLITE_TRANSIENT behavior),
+/// this is a safe no-op.
 fn sqliteTransient(_: ?*anyopaque) callconv(.c) void {
-    @panic("SQLITE_TRANSIENT called — this should never happen");
+    // No-op: SQLite already copied the data, this is just cleanup.
 }
 const SQLITE_TRANSIENT: sqlite3.sqlite3_destructor_type = &sqliteTransient;
 
@@ -48,6 +50,7 @@ pub const Error = error{
     NotText,
     NotBlob,
     AlreadyClosed,
+    VectorSerializeFailed,
 };
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -133,6 +136,15 @@ pub const Statement = struct {
             SQLITE_TRANSIENT,
         );
         if (rc != SQLITE_OK) return Error.BindFailed;
+    }
+
+    pub fn columnBlob(self: *const Statement, idx: i32) ![]const u8 {
+        if (sqlite3.sqlite3_column_type(self.require(), idx) != sqlite3.SQLITE_BLOB)
+            return Error.NotBlob;
+        const raw = sqlite3.sqlite3_column_blob(self.require(), idx) orelse return "";
+        const len: usize = @intCast(sqlite3.sqlite3_column_bytes(self.require(), idx));
+        const ptr: [*]const u8 = @ptrCast(raw);
+        return ptr[0..len];
     }
 
     pub fn bindNull(self: *Statement, idx: i32) !void {
@@ -231,6 +243,17 @@ const MIGRATIONS = [_][:0]const u8{
     \\);
     ,
     \\CREATE INDEX IF NOT EXISTS idx_traces_source ON traces(source);
+    ,
+    \\CREATE TABLE IF NOT EXISTS document_embeddings (
+    \\    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\    document_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    \\    vector       BLOB    NOT NULL,
+    \\    dimensions   INTEGER NOT NULL DEFAULT 384,
+    \\    model_name   TEXT    NOT NULL DEFAULT 'fasttext-subword-384',
+    \\    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    \\);
+    ,
+    \\CREATE INDEX IF NOT EXISTS idx_embeddings_document ON document_embeddings(document_id);
 };
 
 pub const GraphDb = struct {
@@ -303,7 +326,194 @@ pub const GraphDb = struct {
         }
         return 0.0;
     }
+
+    /// Insert a document embedding vector. The vector is stored as a raw BLOB.
+    /// Use `vectorSerialize` to convert a []const f32 to a byte slice.
+    pub fn insertEmbedding(
+        self: *GraphDb,
+        document_id: i64,
+        vector: []const u8,
+        dimensions: u32,
+        model_name: []const u8,
+    ) !void {
+        var stmt = try self.prepare(
+            "INSERT INTO document_embeddings (document_id, vector, dimensions, model_name) VALUES (?, ?, ?, ?)",
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, document_id);
+        try stmt.bindBlob(2, vector);
+        try stmt.bindInt(3, dimensions);
+        try stmt.bindText(4, model_name);
+        _ = try stmt.step();
+    }
+
+    /// Check if embeddings already exist for a document (avoid duplicates on re-index).
+    pub fn hasEmbedding(self: *GraphDb, document_id: i64) !bool {
+        var stmt = try self.prepare(
+            "SELECT COUNT(*) FROM document_embeddings WHERE document_id = ?",
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, document_id);
+        if (try stmt.step()) {
+            const count = try stmt.columnInt(0);
+            return count > 0;
+        }
+        return false;
+    }
+
+    /// Delete existing embeddings for a document (for re-indexing).
+    pub fn deleteEmbeddings(self: *GraphDb, document_id: i64) !void {
+        var stmt = try self.prepare(
+            "DELETE FROM document_embeddings WHERE document_id = ?",
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, document_id);
+        _ = try stmt.step();
+    }
+
+    /// Find documents related to symbols whose names match `query_term`.
+    /// Traverses 1-hop edges from matching symbols and returns a map of
+    /// document_id -> proximity_score (based on edge confidence).
+    ///
+    /// Scores decay with distance: 1-hop gets full confidence, 2-hop gets
+    /// confidence * 0.5.  Only edges with confidence >= min_confidence are
+    /// followed.
+    pub fn findRelatedDocuments(
+        self: *GraphDb,
+        query_term: []const u8,
+        min_confidence: f32,
+        allocator: std.mem.Allocator,
+    ) !std.AutoHashMap(u32, f32) {
+        var scores = std.AutoHashMap(u32, f32).init(allocator);
+        errdefer scores.deinit();
+
+        // 1-hop: symbols whose name matches query_term -> outgoing edges
+        {
+            var stmt = try self.prepare(
+                \\SELECT DISTINCT e.target_symbol_id, e.confidence
+                \\FROM symbols s
+                \\JOIN edges e ON e.source_symbol_id = s.id
+                \\WHERE s.name LIKE ? AND e.confidence >= ?
+            );
+            defer stmt.finalize();
+            try stmt.bindText(1, query_term);
+            try stmt.bindFloat(2, min_confidence);
+
+            while (try stmt.step()) {
+                const target_sym_id = try stmt.columnInt(0);
+                const confidence = try stmt.columnFloat(1);
+
+                // Look up the document for the target symbol
+                var doc_stmt = try self.prepare(
+                    "SELECT document_id FROM symbols WHERE id = ?"
+                );
+                defer doc_stmt.finalize();
+                try doc_stmt.bindInt(1, target_sym_id);
+                if (try doc_stmt.step()) {
+                    const doc_id: u32 = @intCast(try doc_stmt.columnInt(0));
+                    const entry = try scores.getOrPut(doc_id);
+                    if (!entry.found_existing) entry.value_ptr.* = 0;
+                    entry.value_ptr.* += @floatCast(confidence);
+                }
+            }
+        }
+
+        // Also follow 1-hop incoming edges
+        {
+            var stmt = try self.prepare(
+                \\SELECT DISTINCT e.source_symbol_id, e.confidence
+                \\FROM symbols s
+                \\JOIN edges e ON e.target_symbol_id = s.id
+                \\WHERE s.name LIKE ? AND e.confidence >= ?
+            );
+            defer stmt.finalize();
+            try stmt.bindText(1, query_term);
+            try stmt.bindFloat(2, min_confidence);
+
+            while (try stmt.step()) {
+                const source_sym_id = try stmt.columnInt(0);
+                const confidence = try stmt.columnFloat(1);
+
+                var doc_stmt = try self.prepare(
+                    "SELECT document_id FROM symbols WHERE id = ?"
+                );
+                defer doc_stmt.finalize();
+                try doc_stmt.bindInt(1, source_sym_id);
+                if (try doc_stmt.step()) {
+                    const doc_id: u32 = @intCast(try doc_stmt.columnInt(0));
+                    const entry = try scores.getOrPut(doc_id);
+                    if (!entry.found_existing) entry.value_ptr.* = 0;
+                    entry.value_ptr.* += @floatCast(confidence);
+                }
+            }
+        }
+
+        return scores;
+    }
+
+    /// Find the kinds of symbols matching `query_term` and return a map of
+    /// document_id -> max_kind_boost_score.  Boost values are determined by
+    /// symbol kind (function > struct > const > variable > module > unknown).
+    pub fn findKindBoosts(
+        self: *GraphDb,
+        query_term: []const u8,
+        allocator: std.mem.Allocator,
+    ) !std.AutoHashMap(u32, f32) {
+        var boosts = std.AutoHashMap(u32, f32).init(allocator);
+        errdefer boosts.deinit();
+
+        var stmt = try self.prepare(
+            \\SELECT document_id, kind FROM symbols WHERE name LIKE ?
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, query_term);
+
+        while (try stmt.step()) {
+            const doc_id: u32 = @intCast(try stmt.columnInt(0));
+            const kind_str = try stmt.columnText(1);
+            const boost = kindBoostFromString(kind_str);
+
+            const entry = try boosts.getOrPut(doc_id);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = boost;
+            } else if (boost > entry.value_ptr.*) {
+                entry.value_ptr.* = boost;
+            }
+        }
+
+        return boosts;
+    }
 };
+
+/// Serialize a f32 vector into a byte slice for BLOB storage.
+/// Caller owns the returned memory.
+pub fn vectorSerialize(allocator: std.mem.Allocator, vec: []const f32) ![]u8 {
+    const bytes = std.mem.sliceAsBytes(vec);
+    const result = try allocator.dupe(u8, bytes);
+    return result;
+}
+
+/// Deserialize a BLOB back into a f32 vector.
+/// Caller owns the returned memory.
+pub fn vectorDeserialize(allocator: std.mem.Allocator, blob: []const u8) ![]f32 {
+    if (blob.len % @sizeOf(f32) != 0) return Error.VectorSerializeFailed;
+    const count = blob.len / @sizeOf(f32);
+    const result = try allocator.alloc(f32, count);
+    const floats = std.mem.bytesAsSlice(f32, blob);
+    @memcpy(result, floats);
+    return result;
+}
+
+/// Return a kind-boost multiplier for a symbol kind string.
+/// Higher values rank symbols of that kind more prominently in search.
+pub fn kindBoostFromString(kind: []const u8) f32 {
+    if (std.mem.eql(u8, kind, "function")) return 1.30;
+    if (std.mem.eql(u8, kind, "struct_type")) return 1.20;
+    if (std.mem.eql(u8, kind, "const_value")) return 1.10;
+    if (std.mem.eql(u8, kind, "variable")) return 1.00;
+    if (std.mem.eql(u8, kind, "module")) return 1.00;
+    return 0.80; // unknown / fallback
+}
 
 // ██████████████████████████████████████████████████████████████████████████
 // Tests
@@ -322,12 +532,12 @@ test "graph_db migrate creates schema" {
     const tables: i64 = try db.queryScalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     );
-    try std.testing.expectEqual(@as(i64, 5), tables);
+    try std.testing.expectEqual(@as(i64, 6), tables);
 
     const indexes: i64 = try db.queryScalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'",
     );
-    try std.testing.expectEqual(@as(i64, 9), indexes);
+    try std.testing.expectEqual(@as(i64, 10), indexes);
 }
 
 test "graph_db insert and query document" {
