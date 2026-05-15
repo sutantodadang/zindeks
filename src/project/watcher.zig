@@ -88,13 +88,13 @@ pub const PollWatcher = struct {
         defer {
             var iter = last_mtimes.keyIterator();
             while (iter.next()) |key| self.allocator.free(key.*);
-            last_mtimes.deinit(self.allocator);
+            last_mtimes.deinit();
         }
 
         while (self.running.load(.acquire)) {
             // ── Scan current filesystem state ────────────────────────
             const current = scanner.scanPathMetadata(self.allocator, self.project_path) catch {
-                std.time.sleep(self.interval_ms * std.time.ns_per_ms);
+                std.Thread.sleep(@as(u64, self.interval_ms) * std.time.ns_per_ms);
                 continue;
             };
 
@@ -107,7 +107,7 @@ pub const PollWatcher = struct {
             // ── Diff ─────────────────────────────────────────────────
             var events = std.ArrayList(Event).initCapacity(self.allocator, 16) catch {
                 scanner.freeMetadata(self.allocator, current);
-                std.time.sleep(self.interval_ms * std.time.ns_per_ms);
+                std.Thread.sleep(@as(u64, self.interval_ms) * std.time.ns_per_ms);
                 continue;
             };
 
@@ -118,10 +118,10 @@ pub const PollWatcher = struct {
                 const mtime = kv.value_ptr.*;
                 if (last_mtimes.get(path)) |last_mtime| {
                     if (mtime != last_mtime) {
-                        events.append(.{ .path = self.allocator.dupe(u8, path) catch continue, .kind = .modified }) catch {};
+                        events.append(self.allocator, .{ .path = self.allocator.dupe(u8, path) catch continue, .kind = .modified }) catch {};
                     }
                 } else {
-                    events.append(.{ .path = self.allocator.dupe(u8, path) catch continue, .kind = .added }) catch {};
+                    events.append(self.allocator, .{ .path = self.allocator.dupe(u8, path) catch continue, .kind = .added }) catch {};
                 }
             }
 
@@ -129,7 +129,7 @@ pub const PollWatcher = struct {
             var last_iter = last_mtimes.keyIterator();
             while (last_iter.next()) |key| {
                 if (!current_map.contains(key.*)) {
-                    events.append(.{ .path = self.allocator.dupe(u8, key.*) catch continue, .kind = .deleted }) catch {};
+                    events.append(self.allocator, .{ .path = self.allocator.dupe(u8, key.*) catch continue, .kind = .deleted }) catch {};
                 }
             }
 
@@ -142,7 +142,7 @@ pub const PollWatcher = struct {
             // Clear old
             var old_iter = last_mtimes.keyIterator();
             while (old_iter.next()) |key| self.allocator.free(key.*);
-            last_mtimes.clearAndFree(self.allocator);
+            last_mtimes.clearAndFree();
 
             // Copy from current
             var copy_iter = current_map.iterator();
@@ -160,11 +160,11 @@ pub const PollWatcher = struct {
 
             var clean_iter = current_map.iterator();
             while (clean_iter.next()) |kv| _ = kv;
-            current_map.deinit(self.allocator);
+            current_map.deinit();
 
             scanner.freeMetadata(self.allocator, current);
 
-            std.time.sleep(self.interval_ms * std.time.ns_per_ms);
+            std.Thread.sleep(@as(u64, self.interval_ms) * std.time.ns_per_ms);
         }
     }
 };

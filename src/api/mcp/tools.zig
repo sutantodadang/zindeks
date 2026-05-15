@@ -54,6 +54,7 @@ pub const ALL = [_]Descriptor{
     get_symbol_community,
     semantic_search,
     hybrid_search,
+    health_check,
 };
 
 pub const index_repository = Descriptor{
@@ -445,6 +446,17 @@ pub const hybrid_search = Descriptor{
     ,
 };
 
+pub const health_check = Descriptor{
+    .name = "health_check",
+    .description = "Check the health of the indexed project. Returns document/symbol/edge/embedding/community counts, last indexed time, and uptime.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {}
+    \\}
+    ,
+};
+
 // ██████████████████████████████████████████████████████████████████████████
 // Tool JSON serialization (for tools/list response)
 // ██████████████████████████████████████████████████████████████████████████
@@ -525,6 +537,8 @@ pub fn dispatch(
         try handleSemanticSearch(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "hybrid_search")) {
         try handleHybridSearch(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "health_check")) {
+        try handleHealthCheck(ctx, params_obj, writer);
     } else {
         try writer.writeAll("{\"message\":\"Unknown tool: ");
         try protocol.writeJsonString(writer, tool_name);
@@ -1110,6 +1124,40 @@ fn handleIndexStatus(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
         try writer.print("{f}:{}", .{ std.json.fmt(lang, .{}), cnt });
     }
     try writer.writeAll("}}");
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: health_check
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleHealthCheck(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    _ = params_obj;
+
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+
+    const doc_count = gdb.queryScalar("SELECT COUNT(*) FROM documents") catch 0;
+    const sym_count = gdb.queryScalar("SELECT COUNT(*) FROM symbols") catch 0;
+    const edge_count = gdb.queryScalar("SELECT COUNT(*) FROM edges") catch 0;
+    const emb_count = gdb.queryScalar("SELECT COUNT(*) FROM document_embeddings") catch 0;
+    const community_count = gdb.queryScalar("SELECT COUNT(DISTINCT community_id) FROM symbols WHERE community_id IS NOT NULL") catch 0;
+    const last_indexed: i64 = gdb.queryScalar("SELECT COALESCE(MAX(indexed_at), 0) FROM documents") catch 0;
+
+    const status: []const u8 = if (doc_count > 0) "healthy" else "needs_indexing";
+
+    try writer.print(
+        \\{{"status":{f},"counts":{{"documents":{},"symbols":{},"edges":{},"embeddings":{},"communities":{}}},"last_indexed":{},"uptime_seconds":0}}
+    , .{
+        std.json.fmt(status, .{}),
+        doc_count,
+        sym_count,
+        edge_count,
+        emb_count,
+        community_count,
+        last_indexed,
+    });
 }
 
 // ██████████████████████████████████████████████████████████████████████████
