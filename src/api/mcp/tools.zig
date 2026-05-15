@@ -50,6 +50,8 @@ pub const ALL = [_]Descriptor{
     rename_symbol,
     ingest_traces,
     detect_communities,
+    list_communities,
+    get_symbol_community,
     semantic_search,
     hybrid_search,
 };
@@ -228,7 +230,7 @@ pub const delete_project = Descriptor{
 
 pub const trace_call_path = Descriptor{
     .name = "trace_call_path",
-    .description = "Trace the call graph from a symbol: inbound (who calls it), outbound (what it calls), or both. Detects cycles.",
+    .description = "Trace the call graph from a symbol: inbound (who calls it), outbound (what it calls), or both. Detects cycles and optionally includes edge confidence scores.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -245,6 +247,10 @@ pub const trace_call_path = Descriptor{
     \\    "max_depth": {
     \\      "type": "integer",
     \\      "description": "Maximum BFS depth (default 5, max 10)"
+    \\    },
+    \\    "include_confidence": {
+    \\      "type": "boolean",
+    \\      "description": "Include edge confidence scores in output (default: false)"
     \\    }
     \\  },
     \\  "required": ["name"]
@@ -254,11 +260,16 @@ pub const trace_call_path = Descriptor{
 
 pub const get_architecture = Descriptor{
     .name = "get_architecture",
-    .description = "Analyze the codebase architecture: modules, entry points, high fan-in/fan-out symbols, and overall stats.",
+    .description = "Analyze the codebase architecture: modules, entry points, high fan-in/fan-out symbols, hotspots, module coupling, and overall stats.",
     .inputSchema =
     \\{
     \\  "type": "object",
-    \\  "properties": {}
+    \\  "properties": {
+    \\    "limit": {
+    \\      "type": "integer",
+    \\      "description": "Maximum entries per category (default 10)"
+    \\    }
+    \\  }
     \\}
     ,
 };
@@ -345,11 +356,49 @@ pub const ingest_traces = Descriptor{
 
 pub const detect_communities = Descriptor{
     .name = "detect_communities",
-    .description = "Run Leiden community detection on the symbol graph. Assigns community_id to each symbol and returns the number of communities and modularity score.",
+    .description = "Run Leiden community detection on the symbol graph. Assigns community_id to each symbol. Returns community count, modularity score, and top communities with member counts.",
     .inputSchema =
     \\{
     \\  "type": "object",
-    \\  "properties": {}
+    \\  "properties": {
+    \\    "resolution": {
+    \\      "type": "number",
+    \\      "description": "Resolution parameter for community granularity (default 1.0, higher = more communities)"
+    \\    }
+    \\  }
+    \\}
+    ,
+};
+
+pub const list_communities = Descriptor{
+    .name = "list_communities",
+    .description = "List all detected communities with member counts and sample member symbols. Requires detect_communities to have been run first.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "limit": {
+    \\      "type": "integer",
+    \\      "description": "Maximum number of communities to return (default 20)"
+    \\    }
+    \\  }
+    \\}
+    ,
+};
+
+pub const get_symbol_community = Descriptor{
+    .name = "get_symbol_community",
+    .description = "Return the community ID and member symbols for a given symbol. Requires detect_communities to have been run first.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "symbol_name": {
+    \\      "type": "string",
+    \\      "description": "Exact symbol name to look up"
+    \\    }
+    \\  },
+    \\  "required": ["symbol_name"]
     \\}
     ,
 };
@@ -468,6 +517,10 @@ pub fn dispatch(
         try handleIngestTraces(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "detect_communities")) {
         try handleDetectCommunities(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "list_communities")) {
+        try handleListCommunities(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "get_symbol_community")) {
+        try handleGetSymbolCommunity(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "semantic_search")) {
         try handleSemanticSearch(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "hybrid_search")) {
@@ -1155,6 +1208,14 @@ fn handleTraceCallPath(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
         break :blk 5;
     };
 
+    const include_confidence = blk: {
+        if (params.get("include_confidence")) |v| switch (v) {
+            .bool => |b| break :blk b,
+            else => {},
+        };
+        break :blk false;
+    };
+
     var result = call_graph.trace(ctx.allocator, gdb, name, dir, max_depth) catch {
         try writer.writeAll("{\"error\":\"Trace failed. Symbol may not exist or no edges found.\"}");
         return;
@@ -1181,13 +1242,24 @@ fn handleTraceCallPath(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 
     for (result.edges, 0..) |edge, i| {
         if (i > 0) try writer.writeByte(',');
-        try writer.print(
-            \\{{"source":{f},"target":{f},"type":{f}}}
-        , .{
-            std.json.fmt(edge.source_name, .{}),
-            std.json.fmt(edge.target_name, .{}),
-            std.json.fmt(edge.edge_type, .{}),
-        });
+        if (include_confidence) {
+            try writer.print(
+                \\{{"source":{f},"target":{f},"type":{f},"confidence":{}}}
+            , .{
+                std.json.fmt(edge.source_name, .{}),
+                std.json.fmt(edge.target_name, .{}),
+                std.json.fmt(edge.edge_type, .{}),
+                edge.confidence,
+            });
+        } else {
+            try writer.print(
+                \\{{"source":{f},"target":{f},"type":{f}}}
+            , .{
+                std.json.fmt(edge.source_name, .{}),
+                std.json.fmt(edge.target_name, .{}),
+                std.json.fmt(edge.edge_type, .{}),
+            });
+        }
     }
 
     try writer.writeAll("]}");
@@ -1198,11 +1270,19 @@ fn handleTraceCallPath(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
-    _ = params_obj;
-
     const gdb = ctx.gdb orelse {
         try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
         return;
+    };
+
+    const limit: u32 = blk: {
+        if (params_obj) |p| {
+            if (p.get("limit")) |v| switch (v) {
+                .integer => |i| if (i > 0) break :blk @intCast(@min(i, 50)),
+                else => {},
+            };
+        }
+        break :blk 10;
     };
 
     var arch = arch_mod.getArchitecture(ctx.allocator, gdb) catch {
@@ -1210,6 +1290,18 @@ fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
         return;
     };
     defer arch.deinit(ctx.allocator);
+
+    const hotspots = arch_mod.getHotSpots(ctx.allocator, gdb, limit) catch {
+        try writer.writeAll("{\"error\":\"Hotspot analysis failed.\"}");
+        return;
+    };
+    defer for (hotspots) |*h| h.deinit(ctx.allocator);
+    defer ctx.allocator.free(hotspots);
+
+    const coupling = arch_mod.getModuleCoupling(gdb) catch {
+        try writer.writeAll("{\"error\":\"Coupling analysis failed.\"}");
+        return;
+    };
 
     try writer.print(
         \\{{"total_files":{},"total_symbols":{},"total_edges":{},"modules":[
@@ -1249,7 +1341,20 @@ fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
         , .{ std.json.fmt(h.name, .{}), std.json.fmt(h.kind, .{}), std.json.fmt(h.file_path, .{}), h.fan_in });
     }
 
-    try writer.writeAll("]}");
+    try writer.writeAll("],\"hotspots\":[");
+
+    for (hotspots, 0..) |h, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print(
+            \\{{"name":{f},"kind":{f},"file":{f},"fan_in":{},"fan_out":{},"total":{}}}
+        , .{ std.json.fmt(h.name, .{}), std.json.fmt(h.kind, .{}), std.json.fmt(h.file_path, .{}), h.fan_in, h.fan_out, h.total });
+    }
+
+    try writer.print(
+        \\],"_coupling":{{"internal":{},"external":{},"ratio":{}}}
+    , .{ coupling.internal_edges, coupling.external_edges, coupling.couplingRatio() });
+
+    try writer.writeByte('}');
 }
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -1348,21 +1453,166 @@ fn handleManageAdr(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyty
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
-    _ = params_obj;
-
     const gdb = ctx.gdb orelse {
         try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
         return;
     };
 
-    const result = leiden_mod.detect(ctx.allocator, gdb) catch {
+    const resolution: f64 = blk: {
+        if (params_obj) |p| {
+            if (p.get("resolution")) |v| switch (v) {
+                .float => |f| if (f > 0.0) break :blk f,
+                .integer => |i| if (i > 0) break :blk @floatFromInt(i),
+                else => {},
+            };
+        }
+        break :blk 1.0;
+    };
+
+    const result = leiden_mod.detect(ctx.allocator, gdb, resolution) catch {
         try writer.writeAll("{\"error\":\"Community detection failed.\"}");
         return;
     };
 
+    // List top communities (up to 20)
+    const top_communities = gdb.listCommunities(20, ctx.allocator) catch {
+        try writer.print(
+            \\{{"communities":{},"modularity":{},"top_communities":[]}}
+        , .{ result.communities, result.modularity });
+        return;
+    };
+    defer ctx.allocator.free(top_communities);
+
     try writer.print(
-        \\{{"communities":{},"modularity":{}}}
+        \\{{"communities":{},"modularity":{},"top_communities":[
     , .{ result.communities, result.modularity });
+
+    for (top_communities, 0..) |tc, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print(
+            \\{{"community_id":{},"member_count":{}}}
+        , .{ tc.community_id, tc.member_count });
+    }
+
+    try writer.writeAll("]}");
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: list_communities
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleListCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+
+    const limit: u32 = blk: {
+        if (params_obj) |p| {
+            if (p.get("limit")) |v| switch (v) {
+                .integer => |i| if (i > 0) break :blk @intCast(@min(i, 100)),
+                else => {},
+            };
+        }
+        break :blk 20;
+    };
+
+    const communities = gdb.listCommunities(limit, ctx.allocator) catch {
+        try writer.writeAll("{\"error\":\"Failed to list communities. Have you run detect_communities?\"}");
+        return;
+    };
+    defer ctx.allocator.free(communities);
+
+    try writer.writeAll("{\"communities\":[");
+
+    for (communities, 0..) |c, i| {
+        if (i > 0) try writer.writeByte(',');
+
+        // Get sample members (up to 5)
+        var members = gdb.getCommunityMembers(c.community_id, ctx.allocator) catch {
+            try writer.print(
+                \\{{"community_id":{},"member_count":{},"sample":[]}}
+            , .{ c.community_id, c.member_count });
+            continue;
+        };
+        defer {
+            for (members) |*m| m.deinit(ctx.allocator);
+            ctx.allocator.free(members);
+        }
+
+        try writer.print(
+            \\{{"community_id":{},"member_count":{},"sample":[
+        , .{ c.community_id, c.member_count });
+
+        const sample_count = @min(@as(usize, 5), members.len);
+        for (members[0..sample_count], 0..) |m, j| {
+            if (j > 0) try writer.writeByte(',');
+            try writer.print(
+                \\{{"name":{f},"kind":{f},"file":{f}}}
+            , .{ std.json.fmt(m.name, .{}), std.json.fmt(m.kind, .{}), std.json.fmt(m.file_path, .{}) });
+        }
+
+        try writer.writeByte('}');
+    }
+
+    try writer.writeAll("]}");
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: get_symbol_community
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleGetSymbolCommunity(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.symbol_name\"}");
+        return;
+    };
+    const symbol_name = getString(params, "symbol_name") orelse {
+        try writer.writeAll("{\"error\":\"Missing required param: symbol_name\"}");
+        return;
+    };
+
+    const community_id = gdb.getSymbolCommunity(symbol_name) catch {
+        try writer.writeAll("{\"error\":\"Failed to query symbol community.\"}");
+        return;
+    };
+
+    if (community_id == null) {
+        try writer.print(
+            \\{{"found":false,"community_id":null,"symbol_name":{f},"members":[]}}
+        , .{std.json.fmt(symbol_name, .{})});
+        return;
+    }
+
+    const cid = community_id.?;
+    const members = gdb.getCommunityMembers(cid, ctx.allocator) catch {
+        try writer.print(
+            \\{{"found":true,"community_id":{},"symbol_name":{f},"members":[]}}
+        , .{ cid, std.json.fmt(symbol_name, .{}) });
+        return;
+    };
+    defer {
+        for (members) |*m| m.deinit(ctx.allocator);
+        ctx.allocator.free(members);
+    }
+
+    try writer.print(
+        \\{{"found":true,"community_id":{},"symbol_name":{f},"members":[
+    , .{ cid, std.json.fmt(symbol_name, .{}) });
+
+    for (members, 0..) |m, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print(
+            \\{{"name":{f},"kind":{f},"file":{f}}}
+        , .{ std.json.fmt(m.name, .{}), std.json.fmt(m.kind, .{}), std.json.fmt(m.file_path, .{}) });
+    }
+
+    try writer.writeAll("]}");
 }
 
 // ██████████████████████████████████████████████████████████████████████████

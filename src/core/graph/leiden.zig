@@ -37,7 +37,9 @@ const Edge = struct {
 
 /// Run Leiden community detection on the graph database.
 /// Writes community_id back to the symbols table.
-pub fn detect(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb) !LeidenResult {
+/// `resolution` controls community granularity: higher values produce more,
+/// smaller communities (typical range 0.1–5.0, default 1.0).
+pub fn detect(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb, resolution: f64) !LeidenResult {
     // ── Load graph from SQLite ──────────────────────────────────────
     const graph = try loadGraph(allocator, gdb);
     defer graph.deinit(allocator);
@@ -51,7 +53,7 @@ pub fn detect(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb) !LeidenResul
     defer allocator.free(community);
     for (0..graph.node_count) |i| community[i] = @intCast(i);
 
-    const gamma: f64 = 1.0; // resolution parameter
+    const gamma: f64 = resolution;
     const m = graph.total_weight;
 
     var prev_modularity: f64 = -1.0;
