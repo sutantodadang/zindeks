@@ -8,4 +8,5 @@ test {
     _ = @import("arch_test.zig");
     _ = @import("incremental_test.zig");
     _ = @import("watcher_test.zig");
+    _ = @import("ai_test.zig");
 }

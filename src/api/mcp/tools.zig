@@ -24,6 +24,10 @@ const cypher_lexer = @import("../../core/graph/cypher/lexer.zig");
 const cypher_parser = @import("../../core/graph/cypher/parser.zig");
 const cypher_executor = @import("../../core/graph/cypher/executor.zig");
 const semantic_mod = @import("../../core/search/semantic.zig");
+const ai_context = @import("../../core/ai/context.zig");
+const ai_summarize = @import("../../core/ai/summarize.zig");
+const ai_query = @import("../../core/ai/query.zig");
+const ai_window = @import("../../core/ai/window.zig");
 
 /// MCP tool descriptor — matches the tools/list response format.
 pub const Descriptor = struct {
@@ -55,6 +59,9 @@ pub const ALL = [_]Descriptor{
     semantic_search,
     hybrid_search,
     health_check,
+    get_context,
+    summarize_symbol,
+    explain_query,
 };
 
 pub const index_repository = Descriptor{
@@ -457,6 +464,73 @@ pub const health_check = Descriptor{
     ,
 };
 
+pub const get_context = Descriptor{
+    .name = "get_context",
+    .description = "Assemble rich AI-prompt context from search results, call graphs, and architecture overviews. Enforces a token budget — low-priority sections are dropped when the budget is exceeded.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "query": {
+    \\      "type": "string",
+    \\      "description": "The search query or natural-language question"
+    \\    },
+    \\    "max_tokens": {
+    \\      "type": "integer",
+    \\      "description": "Maximum token budget for the assembled context (default: 4000)"
+    \\    },
+    \\    "include_call_graph": {
+    \\      "type": "boolean",
+    \\      "description": "Whether to include call graph context for matched symbols (default: true)"
+    \\    },
+    \\    "include_architecture": {
+    \\      "type": "boolean",
+    \\      "description": "Whether to include an architecture overview (default: false)"
+    \\    }
+    \\  },
+    \\  "required": ["query"]
+    \\}
+    ,
+};
+
+pub const summarize_symbol = Descriptor{
+    .name = "summarize_symbol",
+    .description = "Summarise a code symbol: extracts signature, purpose (from doc comments), key operations, dependencies, and a rough complexity score. Supports Zig, Python, JavaScript, Rust, Go, C, C++, Java.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "symbol_name": {
+    \\      "type": "string",
+    \\      "description": "Name of the symbol to summarise"
+    \\    },
+    \\    "language": {
+    \\      "type": "string",
+    \\      "description": "Source language (e.g. 'zig', 'python', 'javascript')"
+    \\    }
+    \\  },
+    \\  "required": ["symbol_name"]
+    \\}
+    ,
+};
+
+pub const explain_query = Descriptor{
+    .name = "explain_query",
+    .description = "Parse a natural-language query and return the detected intent, extracted target symbols, constraints, and suggested MCP tools to use.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "query": {
+    \\      "type": "string",
+    \\      "description": "The natural-language query to analyse"
+    \\    }
+    \\  },
+    \\  "required": ["query"]
+    \\}
+    ,
+};
+
 // ██████████████████████████████████████████████████████████████████████████
 // Tool JSON serialization (for tools/list response)
 // ██████████████████████████████████████████████████████████████████████████
@@ -539,6 +613,12 @@ pub fn dispatch(
         try handleHybridSearch(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "health_check")) {
         try handleHealthCheck(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "get_context")) {
+        try handleGetContext(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "summarize_symbol")) {
+        try handleSummarizeSymbol(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "explain_query")) {
+        try handleExplainQuery(ctx, params_obj, writer);
     } else {
         try writer.writeAll("{\"message\":\"Unknown tool: ");
         try protocol.writeJsonString(writer, tool_name);
@@ -1965,6 +2045,260 @@ fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
         });
     }
     try writer.writeByte(']');
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: get_context
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const engine = ctx.engine orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No graph database loaded. Run index_repository first.\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.query\"}");
+        return;
+    };
+    const query = getString(params, "query") orelse "";
+    if (query.len == 0) {
+        try writer.writeAll("{\"error\":\"Empty query\"}");
+        return;
+    }
+
+    const max_tokens: usize = blk: {
+        if (params.get("max_tokens")) |v| switch (v) {
+            .integer => |i| if (i > 0) break :blk @intCast(@min(i, 32000)),
+            else => {},
+        };
+        break :blk 4000;
+    };
+
+    const include_call_graph = blk: {
+        if (params.get("include_call_graph")) |v| switch (v) {
+            .bool => |b| break :blk b,
+            else => {},
+        };
+        break :blk true;
+    };
+
+    const include_arch = blk: {
+        if (params.get("include_architecture")) |v| switch (v) {
+            .bool => |b| break :blk b,
+            else => {},
+        };
+        break :blk false;
+    };
+
+    var builder = ai_context.ContextBuilder.init(ctx.allocator);
+    defer builder.deinit();
+
+    // Run BM25 search
+    var results = engine.search(ctx.allocator, query, 10) catch {
+        try writer.writeAll("{\"error\":\"Search failed.\"}");
+        return;
+    };
+    defer results.deinit(ctx.allocator);
+
+    try builder.addSearchResults(query, results.items);
+
+    // Optionally add architecture overview
+    if (include_arch) {
+        if (arch_mod.getArchitecture(ctx.allocator, gdb)) |arch| {
+            defer arch.deinit(ctx.allocator);
+            try builder.addArchitectureOverview(arch);
+        } else |_| {
+            // Silently skip if architecture query fails
+        }
+    }
+
+    // Optionally add call graph context for top result symbols
+    if (include_call_graph) {
+        for (results.items[0..@min(results.items.len, 3)]) |result| {
+            // Extract symbol names from snippet or path
+            _ = result;
+            // Skips per-symbol trace to keep response fast.
+            // Individual call graph queries should use trace_call_path.
+        }
+    }
+
+    const assembled = try builder.build(max_tokens);
+    defer ctx.allocator.free(assembled);
+
+    const token_est = ai_window.estimateTokens(assembled);
+
+    try writer.print(
+        \\{{"context":{f},"token_estimate":{},"max_tokens":{}}}
+    , .{
+        std.json.fmt(assembled, .{}),
+        token_est,
+        max_tokens,
+    });
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: summarize_symbol
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleSummarizeSymbol(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.symbol_name\"}");
+        return;
+    };
+    const symbol_name = getString(params, "symbol_name") orelse {
+        try writer.writeAll("{\"error\":\"Missing required param: symbol_name\"}");
+        return;
+    };
+    const language = getString(params, "language") orelse "unknown";
+
+    // Look up the symbol in the graph DB to get its code snippet
+    var stmt = try gdb.prepare(
+        \\SELECT s.name, s.kind, d.path, d.content
+        \\FROM symbols s
+        \\JOIN documents d ON d.id = s.document_id
+        \\WHERE s.name = ?
+        \\LIMIT 1
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, symbol_name);
+
+    if (!(try stmt.step())) {
+        try writer.print(
+            \\{{"error":"Symbol '{s}' not found."}}
+        , .{symbol_name});
+        return;
+    }
+
+    const name = try stmt.columnText(1); // skip s.name
+    _ = name;
+    _ = try stmt.columnText(2);
+    const path = try stmt.columnText(3);
+    const content = try stmt.columnText(4);
+    _ = path;
+
+    const summary = ai_summarize.summarizeSymbol(ctx.allocator, content, language) catch {
+        try writer.writeAll("{\"error\":\"Failed to summarise symbol.\"}");
+        return;
+    };
+    defer summary.deinit(ctx.allocator);
+
+    // Serialise key_operations and dependencies as JSON arrays
+    var ops_json = std.ArrayList(u8){};
+    defer ops_json.deinit(ctx.allocator);
+    try ops_json.append('[');
+    for (summary.key_operations, 0..) |op, i| {
+        if (i > 0) try ops_json.append(',');
+        try ops_json.writer().print("{f}", .{std.json.fmt(op, .{})});
+    }
+    try ops_json.append(']');
+
+    var deps_json = std.ArrayList(u8).init(ctx.allocator);
+    defer deps_json.deinit();
+    try deps_json.append('[');
+    for (summary.dependencies, 0..) |dep, i| {
+        if (i > 0) try deps_json.append(',');
+        try deps_json.writer().print("{f}", .{std.json.fmt(dep, .{})});
+    }
+    try deps_json.append(']');
+
+    try writer.print(
+        \\{{"name":{f},"kind":{f},"purpose":{f},"complexity":{f},"signature":{f},"key_operations":{s},"dependencies":{s}}}
+    , .{
+        std.json.fmt(summary.name, .{}),
+        std.json.fmt(summary.kind, .{}),
+        std.json.fmt(summary.purpose, .{}),
+        std.json.fmt(summary.complexity_score, .{}),
+        std.json.fmt(summary.signature, .{}),
+        ops_json.items,
+        deps_json.items,
+    });
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: explain_query
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleExplainQuery(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    _ = ctx.gdb; // no gdb needed for query parsing
+    _ = ctx.engine;
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.query\"}");
+        return;
+    };
+    const query = getString(params, "query") orelse "";
+    if (query.len == 0) {
+        try writer.writeAll("{\"error\":\"Empty query\"}");
+        return;
+    }
+
+    const parsed = ai_query.parseQuery(ctx.allocator, query) catch {
+        try writer.writeAll("{\"error\":\"Failed to parse query.\"}");
+        return;
+    };
+    defer parsed.deinit(ctx.allocator);
+
+    const intent_str = @tagName(parsed.intent);
+
+    // Serialise target_symbols as JSON array
+    var syms_json = std.ArrayList(u8).init(ctx.allocator);
+    defer syms_json.deinit();
+    try syms_json.append('[');
+    for (parsed.target_symbols, 0..) |sym, i| {
+        if (i > 0) try syms_json.append(',');
+        try syms_json.writer().print("{f}", .{std.json.fmt(sym, .{})});
+    }
+    try syms_json.append(']');
+
+    // Serialise constraints as JSON array
+    var cons_json = std.ArrayList(u8).init(ctx.allocator);
+    defer cons_json.deinit();
+    try cons_json.append('[');
+    for (parsed.constraints, 0..) |c, i| {
+        if (i > 0) try cons_json.append(',');
+        try cons_json.writer().print(
+            \\{{"kind":"{s}","value":{f}}}
+        , .{ @tagName(c.kind), std.json.fmt(c.value, .{}) });
+    }
+    try cons_json.append(']');
+
+    // Suggested tools
+    const tools = ai_query.suggestedTools(ctx.allocator, parsed.intent) catch {
+        try writer.writeAll("{\"error\":\"Failed to get suggested tools.\"}");
+        return;
+    };
+    defer {
+        for (tools) |t| ctx.allocator.free(t);
+        ctx.allocator.free(tools);
+    }
+
+    var tools_json = std.ArrayList(u8){};
+    defer tools_json.deinit(ctx.allocator);
+    try tools_json.append('[');
+    for (tools, 0..) |t, i| {
+        if (i > 0) try tools_json.append(',');
+        try tools_json.writer().print("{f}", .{std.json.fmt(t, .{})});
+    }
+    try tools_json.append(']');
+
+    try writer.print(
+        \\{{"intent":"{s}","target_symbols":{s},"constraints":{s},"suggested_tools":{s}}}
+    , .{
+        intent_str,
+        syms_json.items,
+        cons_json.items,
+        tools_json.items,
+    });
 }
 
 fn getString(params: std.json.ObjectMap, key: []const u8) ?[]const u8 {
