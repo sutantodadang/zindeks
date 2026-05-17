@@ -108,3 +108,48 @@ test "graph_db find related documents" {
     try std.testing.expectEqual(@as(usize, 1), related.count());
     try std.testing.expectApproxEqRel(@as(f32, 0.95), related.get(2).?, 0.001);
 }
+
+test "graph_db community queries" {
+    var db = try graph_db.GraphDb.open(":memory:");
+    defer db.close();
+    try db.migrate();
+
+    // Insert test data
+    try db.exec("INSERT INTO documents (path, language) VALUES ('a.zig', 'Zig')");
+    try db.exec("INSERT INTO documents (path, language) VALUES ('b.zig', 'Zig')");
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end, community_id) VALUES (1, 'foo', 'function', 1, 5, 1)");
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end, community_id) VALUES (1, 'bar', 'function', 10, 15, 1)");
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end, community_id) VALUES (2, 'baz', 'function', 1, 5, 2)");
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end) VALUES (2, 'qux', 'function', 10, 15)");
+
+    // getSymbolCommunity
+    const cid_foo = try db.getSymbolCommunity("foo");
+    try std.testing.expectEqual(@as(i64, 1), cid_foo.?);
+
+    const cid_baz = try db.getSymbolCommunity("baz");
+    try std.testing.expectEqual(@as(i64, 2), cid_baz.?);
+
+    // Symbol with no community
+    const cid_qux = try db.getSymbolCommunity("qux");
+    try std.testing.expectEqual(@as(?i64, null), cid_qux);
+
+    // getCommunityMembers
+    const members = try db.getCommunityMembers(1, std.testing.allocator);
+    defer {
+        for (members) |*m| m.deinit(std.testing.allocator);
+        std.testing.allocator.free(members);
+    }
+    try std.testing.expectEqual(@as(usize, 2), members.len);
+    try std.testing.expectEqualStrings("bar", members[0].name); // sorted by name
+
+    // listCommunities
+    const communities = try db.listCommunities(10, std.testing.allocator);
+    defer std.testing.allocator.free(communities);
+
+    try std.testing.expectEqual(@as(usize, 2), communities.len);
+    // Community 1 has 2 members, community 2 has 1 (sorted by count desc)
+    try std.testing.expectEqual(@as(i64, 1), communities[0].community_id);
+    try std.testing.expectEqual(@as(u32, 2), communities[0].member_count);
+    try std.testing.expectEqual(@as(i64, 2), communities[1].community_id);
+    try std.testing.expectEqual(@as(u32, 1), communities[1].member_count);
+}

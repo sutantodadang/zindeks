@@ -451,6 +451,93 @@ pub const GraphDb = struct {
         return scores;
     }
 
+    /// A symbol entry returned from community queries.
+    pub const CommunityMember = struct {
+        name: []const u8,
+        kind: []const u8,
+        file_path: []const u8,
+
+        pub fn deinit(self: *CommunityMember, allocator: std.mem.Allocator) void {
+            allocator.free(self.name);
+            allocator.free(self.kind);
+            allocator.free(self.file_path);
+        }
+    };
+
+    /// A community summary with member count.
+    pub const CommunityInfo = struct {
+        community_id: i64,
+        member_count: u32,
+    };
+
+    /// Return all symbols belonging to a community.
+    pub fn getCommunityMembers(
+        self: *GraphDb,
+        community_id: i64,
+        allocator: std.mem.Allocator,
+    ) ![]CommunityMember {
+        var stmt = try self.prepare(
+            \\SELECT s.name, s.kind, d.path
+            \\FROM symbols s
+            \\JOIN documents d ON d.id = s.document_id
+            \\WHERE s.community_id = ?
+            \\ORDER BY s.name
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, community_id);
+
+        var members = std.ArrayList(CommunityMember).initCapacity(allocator, 16) catch @panic("OOM");
+        while (try stmt.step()) {
+            try members.append(allocator, .{
+                .name = try allocator.dupe(u8, try stmt.columnText(0)),
+                .kind = try allocator.dupe(u8, try stmt.columnText(1)),
+                .file_path = try allocator.dupe(u8, try stmt.columnText(2)),
+            });
+        }
+        return members.toOwnedSlice(allocator);
+    }
+
+    /// List all communities with their member counts.
+    pub fn listCommunities(
+        self: *GraphDb,
+        limit: u32,
+        allocator: std.mem.Allocator,
+    ) ![]CommunityInfo {
+        var stmt = try self.prepare(
+            \\SELECT community_id, COUNT(*) AS cnt
+            \\FROM symbols
+            \\WHERE community_id IS NOT NULL
+            \\GROUP BY community_id
+            \\ORDER BY cnt DESC
+            \\LIMIT ?
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, @as(i64, @intCast(limit)));
+
+        var result = std.ArrayList(CommunityInfo).initCapacity(allocator, 16) catch @panic("OOM");
+        while (try stmt.step()) {
+            try result.append(allocator, .{
+                .community_id = try stmt.columnInt(0),
+                .member_count = @intCast(try stmt.columnInt(1)),
+            });
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Get the community ID for a symbol by name. Returns null if not found or
+    /// no community assigned.
+    pub fn getSymbolCommunity(self: *GraphDb, symbol_name: []const u8) !?i64 {
+        var stmt = try self.prepare(
+            \\SELECT community_id FROM symbols WHERE name = ? LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, symbol_name);
+
+        if (!(try stmt.step())) return null;
+        if (sqlite3.sqlite3_column_type(stmt.require(), 0) == sqlite3.SQLITE_NULL) return null;
+        return try stmt.columnInt(0);
+    }
+
     /// Find the kinds of symbols matching `query_term` and return a map of
     /// document_id -> max_kind_boost_score.  Boost values are determined by
     /// symbol kind (function > struct > const > variable > module > unknown).

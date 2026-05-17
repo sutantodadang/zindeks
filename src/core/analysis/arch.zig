@@ -56,6 +56,35 @@ pub const ArchitectureView = struct {
     }
 };
 
+/// A hotspot symbol — high combined fan-in + fan-out.
+pub const HotSpot = struct {
+    name: []const u8,
+    kind: []const u8,
+    file_path: []const u8,
+    fan_in: u32,
+    fan_out: u32,
+    total: u32,
+
+    pub fn deinit(self: *HotSpot, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.kind);
+        allocator.free(self.file_path);
+    }
+};
+
+/// Cross-module coupling result.
+pub const ModuleCoupling = struct {
+    internal_edges: u32,
+    external_edges: u32,
+    total_edges: u32,
+
+    /// Fraction of edges that cross document boundaries (0..1).
+    pub fn couplingRatio(self: ModuleCoupling) f64 {
+        if (self.total_edges == 0) return 0.0;
+        return @as(f64, @floatFromInt(self.external_edges)) / @as(f64, @floatFromInt(self.total_edges));
+    }
+};
+
 // ██████████████████████████████████████████████████████████████████████████
 // Analysis
 // ██████████████████████████████████████████████████████████████████████████
@@ -182,5 +211,58 @@ pub fn getArchitecture(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb) !Ar
         .total_symbols = total_symbols,
         .total_edges = total_edges,
         .total_files = total_files,
+    };
+}
+
+/// Return the top-N symbols with highest combined fan-in + fan-out (hotspots).
+pub fn getHotSpots(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb, limit: u32) ![]HotSpot {
+    var stmt = try gdb.prepare(
+        \\SELECT s.name, s.kind, d.path,
+        \\  (SELECT COUNT(*) FROM edges e WHERE e.source_symbol_id = s.id AND e.edge_type = 'calls') AS fan_out,
+        \\  (SELECT COUNT(*) FROM edges e WHERE e.target_symbol_id = s.id AND e.edge_type = 'calls') AS fan_in
+        \\FROM symbols s
+        \\JOIN documents d ON d.id = s.document_id
+        \\WHERE fan_out > 0 OR fan_in > 0
+        \\ORDER BY (fan_out + fan_in) DESC
+        \\LIMIT ?
+    );
+    defer stmt.finalize();
+    try stmt.bindInt(1, @as(i64, @intCast(limit)));
+
+    var results = std.ArrayList(HotSpot).initCapacity(allocator, 16) catch @panic("OOM");
+    while (try stmt.step()) {
+        const fo: u32 = @intCast(try stmt.columnInt(3));
+        const fi: u32 = @intCast(try stmt.columnInt(4));
+        try results.append(allocator, .{
+            .name = try allocator.dupe(u8, try stmt.columnText(0)),
+            .kind = try allocator.dupe(u8, try stmt.columnText(1)),
+            .file_path = try allocator.dupe(u8, try stmt.columnText(2)),
+            .fan_in = fi,
+            .fan_out = fo,
+            .total = fo + fi,
+        });
+    }
+    return results.toOwnedSlice(allocator);
+}
+
+/// Compute cross-module coupling: how many edges connect symbols in different
+/// documents vs. the same document.
+pub fn getModuleCoupling(gdb: *graph_db.GraphDb) !ModuleCoupling {
+    const total: u32 = @intCast(try gdb.queryScalar(
+        "SELECT COUNT(*) FROM edges WHERE edge_type = 'calls'",
+    ));
+
+    const external: u32 = @intCast(try gdb.queryScalar(
+        \\SELECT COUNT(*)
+        \\FROM edges e
+        \\JOIN symbols src ON src.id = e.source_symbol_id
+        \\JOIN symbols tgt ON tgt.id = e.target_symbol_id
+        \\WHERE e.edge_type = 'calls' AND src.document_id != tgt.document_id
+    ));
+
+    return ModuleCoupling{
+        .internal_edges = total - external,
+        .external_edges = external,
+        .total_edges = total,
     };
 }
