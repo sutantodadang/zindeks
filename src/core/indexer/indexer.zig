@@ -4,6 +4,7 @@ const storage = @import("../storage/index.zig");
 const symbols = @import("../../parser/symbols.zig");
 const embeddings = @import("../search/embeddings.zig");
 const graph_db = @import("../storage/graph_db.zig");
+const parallel = @import("parallel.zig");
 
 pub fn indexPath(allocator: std.mem.Allocator, repo_path: []const u8, index_path: []const u8) !void {
     try std.fs.cwd().makePath(index_path);
@@ -86,6 +87,25 @@ pub fn indexEntries(allocator: std.mem.Allocator, entries: []const scanner.FileE
     }
 
     try writer.finish();
+}
+
+/// Index a repository using the parallel worker pool.
+/// Falls back to sequential indexPath() if thread_count is 1.
+pub fn indexParallel(
+    allocator: std.mem.Allocator,
+    repo_path: []const u8,
+    index_path: []const u8,
+    thread_count: usize,
+) !void {
+    if (thread_count <= 1) {
+        return indexPath(allocator, repo_path, index_path);
+    }
+
+    var idx = try parallel.ParallelIndexer.init(allocator, thread_count);
+    defer idx.deinit(allocator);
+
+    const paths = [_][]const u8{repo_path};
+    try idx.indexPaths(allocator, &paths, index_path);
 }
 
 /// Generate an embedding for a document and store it in the graph database.

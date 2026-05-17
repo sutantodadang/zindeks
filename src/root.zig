@@ -1,6 +1,9 @@
 pub const storage = struct {
     pub const index = @import("core/storage/index.zig");
     pub const graph_db = @import("core/storage/graph_db.zig");
+    pub const batch = @import("core/storage/batch.zig");
+    pub const cache = @import("core/storage/cache.zig");
+    pub const pool = @import("core/storage/pool.zig");
 };
 
 pub const scanner = struct {
@@ -10,6 +13,7 @@ pub const scanner = struct {
 pub const indexer = struct {
     pub const indexer = @import("core/indexer/indexer.zig");
     pub const incremental = @import("core/indexer/incremental.zig");
+    pub const parallel = @import("core/indexer/parallel.zig");
 };
 pub const project_store = @import("core/project_store.zig");
 pub const config = @import("core/config.zig");
@@ -48,6 +52,7 @@ pub const api = struct {
         pub const server = @import("api/mcp/server.zig");
         pub const protocol = @import("api/mcp/protocol.zig");
         pub const tools = @import("api/mcp/tools.zig");
+        pub const stream = @import("api/mcp/stream.zig");
     };
     pub const cli = struct {
         pub const cli = @import("api/cli/cli.zig");
@@ -63,3 +68,5 @@ pub const ai = struct {
     pub const query = @import("core/ai/query.zig");
     pub const window = @import("core/ai/window.zig");
 };
+
+pub const bench = @import("core/bench.zig");
