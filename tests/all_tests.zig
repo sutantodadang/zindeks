@@ -9,4 +9,6 @@ test {
     _ = @import("incremental_test.zig");
     _ = @import("watcher_test.zig");
     _ = @import("ai_test.zig");
+    _ = @import("cli_test.zig");
+    _ = @import("config_test.zig");
 }

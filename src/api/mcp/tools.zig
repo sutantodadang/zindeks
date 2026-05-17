@@ -28,6 +28,7 @@ const ai_context = @import("../../core/ai/context.zig");
 const ai_summarize = @import("../../core/ai/summarize.zig");
 const ai_query = @import("../../core/ai/query.zig");
 const ai_window = @import("../../core/ai/window.zig");
+const config_mod = @import("../../core/config.zig");
 
 /// MCP tool descriptor — matches the tools/list response format.
 pub const Descriptor = struct {
@@ -62,6 +63,8 @@ pub const ALL = [_]Descriptor{
     get_context,
     summarize_symbol,
     explain_query,
+    get_config,
+    set_config,
 };
 
 pub const index_repository = Descriptor{
@@ -531,6 +534,49 @@ pub const explain_query = Descriptor{
     ,
 };
 
+pub const get_config = Descriptor{
+    .name = "get_config",
+    .description = "Return the current zindeks configuration as JSON.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {}
+    \\}
+    ,
+};
+
+pub const set_config = Descriptor{
+    .name = "set_config",
+    .description = "Update zindeks configuration values and persist to file. Pass key-value pairs as string params.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "colors_enabled": {
+    \\      "type": "string",
+    \\      "description": "Enable/disable color output (true|false)"
+    \\    },
+    \\    "max_results": {
+    \\      "type": "string",
+    \\      "description": "Default max search results"
+    \\    },
+    \\    "default_repo": {
+    \\      "type": "string",
+    \\      "description": "Default GitHub repo for updates"
+    \\    },
+    \\    "embedding_model": {
+    \\      "type": "string",
+    \\      "description": "Embedding model name"
+    \\    },
+    \\    "store_root": {
+    \\      "type": "string",
+    \\      "description": "Custom index store root path"
+    \\    }
+    \\  }
+    \\}
+    ,
+};
+
 // ██████████████████████████████████████████████████████████████████████████
 // Tool JSON serialization (for tools/list response)
 // ██████████████████████████████████████████████████████████████████████████
@@ -619,6 +665,10 @@ pub fn dispatch(
         try handleSummarizeSymbol(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "explain_query")) {
         try handleExplainQuery(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "get_config")) {
+        try handleGetConfig(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "set_config")) {
+        try handleSetConfig(ctx, params_obj, writer);
     } else {
         try writer.writeAll("{\"message\":\"Unknown tool: ");
         try protocol.writeJsonString(writer, tool_name);
@@ -2110,8 +2160,9 @@ fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
     // Optionally add architecture overview
     if (include_arch) {
         if (arch_mod.getArchitecture(ctx.allocator, gdb)) |arch| {
-            defer arch.deinit(ctx.allocator);
-            try builder.addArchitectureOverview(arch);
+            var mutable_arch = arch;
+            defer mutable_arch.deinit(ctx.allocator);
+            try builder.addArchitectureOverview(mutable_arch);
         } else |_| {
             // Silently skip if architecture query fails
         }
@@ -2195,21 +2246,21 @@ fn handleSummarizeSymbol(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
     // Serialise key_operations and dependencies as JSON arrays
     var ops_json = std.ArrayList(u8){};
     defer ops_json.deinit(ctx.allocator);
-    try ops_json.append('[');
+    try ops_json.append(ctx.allocator, '[');
     for (summary.key_operations, 0..) |op, i| {
-        if (i > 0) try ops_json.append(',');
-        try ops_json.writer().print("{f}", .{std.json.fmt(op, .{})});
+        if (i > 0) try ops_json.append(ctx.allocator, ',');
+        try ops_json.writer(ctx.allocator).print("{f}", .{std.json.fmt(op, .{})});
     }
-    try ops_json.append(']');
+    try ops_json.append(ctx.allocator, ']');
 
-    var deps_json = std.ArrayList(u8).init(ctx.allocator);
-    defer deps_json.deinit();
-    try deps_json.append('[');
+    var deps_json = std.ArrayList(u8){};
+    defer deps_json.deinit(ctx.allocator);
+    try deps_json.append(ctx.allocator, '[');
     for (summary.dependencies, 0..) |dep, i| {
-        if (i > 0) try deps_json.append(',');
-        try deps_json.writer().print("{f}", .{std.json.fmt(dep, .{})});
+        if (i > 0) try deps_json.append(ctx.allocator, ',');
+        try deps_json.writer(ctx.allocator).print("{f}", .{std.json.fmt(dep, .{})});
     }
-    try deps_json.append(']');
+    try deps_json.append(ctx.allocator, ']');
 
     try writer.print(
         \\{{"name":{f},"kind":{f},"purpose":{f},"complexity":{f},"signature":{f},"key_operations":{s},"dependencies":{s}}}
@@ -2251,26 +2302,26 @@ fn handleExplainQuery(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
     const intent_str = @tagName(parsed.intent);
 
     // Serialise target_symbols as JSON array
-    var syms_json = std.ArrayList(u8).init(ctx.allocator);
-    defer syms_json.deinit();
-    try syms_json.append('[');
+    var syms_json = std.ArrayList(u8){};
+    defer syms_json.deinit(ctx.allocator);
+    try syms_json.append(ctx.allocator, '[');
     for (parsed.target_symbols, 0..) |sym, i| {
-        if (i > 0) try syms_json.append(',');
-        try syms_json.writer().print("{f}", .{std.json.fmt(sym, .{})});
+        if (i > 0) try syms_json.append(ctx.allocator, ',');
+        try syms_json.writer(ctx.allocator).print("{f}", .{std.json.fmt(sym, .{})});
     }
-    try syms_json.append(']');
+    try syms_json.append(ctx.allocator, ']');
 
     // Serialise constraints as JSON array
-    var cons_json = std.ArrayList(u8).init(ctx.allocator);
-    defer cons_json.deinit();
-    try cons_json.append('[');
+    var cons_json = std.ArrayList(u8){};
+    defer cons_json.deinit(ctx.allocator);
+    try cons_json.append(ctx.allocator, '[');
     for (parsed.constraints, 0..) |c, i| {
-        if (i > 0) try cons_json.append(',');
-        try cons_json.writer().print(
+        if (i > 0) try cons_json.append(ctx.allocator, ',');
+        try cons_json.writer(ctx.allocator).print(
             \\{{"kind":"{s}","value":{f}}}
         , .{ @tagName(c.kind), std.json.fmt(c.value, .{}) });
     }
-    try cons_json.append(']');
+    try cons_json.append(ctx.allocator, ']');
 
     // Suggested tools
     const tools = ai_query.suggestedTools(ctx.allocator, parsed.intent) catch {
@@ -2284,12 +2335,12 @@ fn handleExplainQuery(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 
     var tools_json = std.ArrayList(u8){};
     defer tools_json.deinit(ctx.allocator);
-    try tools_json.append('[');
+    try tools_json.append(ctx.allocator, '[');
     for (tools, 0..) |t, i| {
-        if (i > 0) try tools_json.append(',');
-        try tools_json.writer().print("{f}", .{std.json.fmt(t, .{})});
+        if (i > 0) try tools_json.append(ctx.allocator, ',');
+        try tools_json.writer(ctx.allocator).print("{f}", .{std.json.fmt(t, .{})});
     }
-    try tools_json.append(']');
+    try tools_json.append(ctx.allocator, ']');
 
     try writer.print(
         \\{{"intent":"{s}","target_symbols":{s},"constraints":{s},"suggested_tools":{s}}}
@@ -2299,6 +2350,102 @@ fn handleExplainQuery(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
         cons_json.items,
         tools_json.items,
     });
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: get_config
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleGetConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    _ = params_obj;
+
+    // Load config from default path (or return defaults)
+    const config_path = config_mod.getDefaultPath(ctx.allocator) catch {
+        try writer.writeAll("{\"error\":\"Cannot determine config path\"}");
+        return;
+    };
+    defer ctx.allocator.free(config_path);
+
+    var cfg = config_mod.Config.load(ctx.allocator, config_path) catch |err| switch (err) {
+        error.FileNotFound => config_mod.Config{},
+        else => {
+            try writer.writeAll("{\"error\":\"Failed to load config\"}");
+            return;
+        },
+    };
+    defer cfg.deinit(ctx.allocator);
+
+    const store_root_str = cfg.store_root orelse "null";
+    const index_dir_str = cfg.index_dir orelse "null";
+
+    try writer.print(
+        \\{{"store_root":"{s}","index_dir":"{s}","default_repo":"{s}","colors_enabled":{},"max_results":{},"embedding_model":"{s}","config_path":"{s}"}}
+    , .{
+        store_root_str,
+        index_dir_str,
+        cfg.default_repo,
+        cfg.colors_enabled,
+        cfg.max_results,
+        cfg.embedding_model,
+        config_path,
+    });
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: set_config
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleSetConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params\"}");
+        return;
+    };
+
+    // Determine config path
+    const config_path = config_mod.getDefaultPath(ctx.allocator) catch {
+        try writer.writeAll("{\"error\":\"Cannot determine config path\"}");
+        return;
+    };
+    defer ctx.allocator.free(config_path);
+
+    // Load existing config
+    var cfg = config_mod.Config.load(ctx.allocator, config_path) catch |err| switch (err) {
+        error.FileNotFound => config_mod.Config{},
+        else => {
+            try writer.writeAll("{\"error\":\"Failed to load config\"}");
+            return;
+        },
+    };
+    defer cfg.deinit(ctx.allocator);
+
+    // Apply updates
+    if (getString(params, "store_root")) |v| {
+        if (cfg.store_root) |old| ctx.allocator.free(old);
+        cfg.store_root = try ctx.allocator.dupe(u8, v);
+    }
+    if (getString(params, "default_repo")) |v| {
+        if (cfg.default_repo.len > 0) ctx.allocator.free(cfg.default_repo);
+        cfg.default_repo = try ctx.allocator.dupe(u8, v);
+    }
+    if (getString(params, "embedding_model")) |v| {
+        if (cfg.embedding_model.len > 0) ctx.allocator.free(cfg.embedding_model);
+        cfg.embedding_model = try ctx.allocator.dupe(u8, v);
+    }
+    if (getString(params, "colors_enabled")) |v| {
+        cfg.colors_enabled = std.mem.eql(u8, v, "true");
+    }
+    if (getString(params, "max_results")) |v| {
+        cfg.max_results = std.fmt.parseUnsigned(u32, v, 10) catch cfg.max_results;
+    }
+
+    // Persist
+    cfg.save(config_path) catch {
+        try writer.writeAll("{\"error\":\"Failed to save config\"}");
+        return;
+    };
+
+    try writer.writeAll("{\"success\":true}");
 }
 
 fn getString(params: std.json.ObjectMap, key: []const u8) ?[]const u8 {
