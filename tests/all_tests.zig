@@ -11,4 +11,5 @@ test {
     _ = @import("ai_test.zig");
     _ = @import("cli_test.zig");
     _ = @import("config_test.zig");
+    _ = @import("perf_test.zig");
 }

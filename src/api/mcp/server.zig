@@ -9,6 +9,7 @@ const tools = @import("tools.zig");
 const storage = @import("../../core/storage/index.zig");
 const search = @import("../../core/search/engine.zig");
 const graph_db = @import("../../core/storage/graph_db.zig");
+const pool = @import("../../core/storage/pool.zig");
 const project_store = @import("../../core/project_store.zig");
 
 const ServerInfo = struct {
@@ -25,6 +26,7 @@ pub const Server = struct {
     idx: ?storage.Index,
     engine: ?search.Engine,
     gdb: ?graph_db.GraphDb,
+    connection_pool: ?*pool.ConnectionPool,
     response_buf: std.ArrayList(u8),
 
     pub fn init(allocator: std.mem.Allocator, info: ServerInfo) Server {
@@ -37,16 +39,24 @@ pub const Server = struct {
             .idx = null,
             .engine = null,
             .gdb = null,
+            .connection_pool = null,
             .response_buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
         };
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.connection_pool) |cp| cp.deinit();
         if (self.gdb) |*gdb| gdb.close();
         if (self.idx) |*idx| idx.close();
         if (self.project_path) |p| self.allocator.free(p);
         self.response_buf.deinit(self.allocator);
         self.transport.deinit();
+    }
+
+    /// Set a connection pool for this server. The pool must outlive the server.
+    /// When set, handlers can acquire pooled connections for parallel queries.
+    pub fn setConnectionPool(self: *Server, cp: *pool.ConnectionPool) void {
+        self.connection_pool = cp;
     }
 
     /// Run the server event loop.  Blocks until stdin closes.

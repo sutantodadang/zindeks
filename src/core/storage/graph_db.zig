@@ -258,6 +258,7 @@ const MIGRATIONS = [_][:0]const u8{
 
 pub const GraphDb = struct {
     db: *sqlite3.sqlite3,
+    statement_cache: ?*anyopaque = null, // *StatementCache, opaque to avoid circular import
 
     /// Open (or create) a database at `path`.  Pass `":memory:"` for an
     /// in-process ephemeral database.
@@ -273,6 +274,17 @@ pub const GraphDb = struct {
     pub fn close(self: *GraphDb) void {
         _ = sqlite3.sqlite3_close(self.db);
         self.db = undefined;
+    }
+
+    /// Enable statement caching.  The cache must outlive the GraphDb.
+    pub fn useCache(self: *GraphDb, cache: anytype) void {
+        self.statement_cache = @ptrCast(@constCast(cache));
+    }
+
+    /// Create a BatchInserter attached to this database.
+    /// Returns a BatchInserter that buffers inserts and flushes in transactions.
+    pub fn batchInserter(self: *GraphDb, allocator: std.mem.Allocator, batch_size: usize) @import("batch.zig").BatchInserter {
+        return @import("batch.zig").BatchInserter.init(allocator, self, batch_size);
     }
 
     /// Prepare a SQL statement.
