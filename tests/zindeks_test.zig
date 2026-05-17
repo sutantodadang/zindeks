@@ -71,7 +71,7 @@ test "search ranks keyword hits and returns deterministic context" {
     var index = try zindeks.storage.index.Index.open(testing.allocator, tmp.dir, "idx");
     defer index.close();
 
-    var engine = zindeks.search.Engine.init(&index);
+    var engine = zindeks.search.engine.Engine.init(&index);
     var results = try engine.search(testing.allocator, "auth middleware", 4);
     defer results.deinit(testing.allocator);
 
@@ -133,7 +133,7 @@ test "project store writes current segment outside the project tree" {
     var index = try zindeks.storage.index.Index.open(testing.allocator, tmp.dir, read_location.index_dir);
     defer index.close();
 
-    var engine = zindeks.search.Engine.init(&index);
+    var engine = zindeks.search.engine.Engine.init(&index);
     var results = try engine.search(testing.allocator, "global index search", 5);
     defer results.deinit(testing.allocator);
 

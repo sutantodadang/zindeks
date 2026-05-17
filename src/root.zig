@@ -27,7 +27,12 @@ pub const graph = struct {
 pub const analysis = struct {
     pub const arch = @import("core/analysis/arch.zig");
 };
-pub const search = @import("core/search/engine.zig");
+pub const search = struct {
+    pub const engine = @import("core/search/engine.zig");
+    pub const tokenizer = @import("core/search/tokenizer.zig");
+    pub const embeddings = @import("core/search/embeddings.zig");
+    pub const semantic = @import("core/search/semantic.zig");
+};
 
 pub const parser = struct {
     pub const tree_sitter = @import("core/parser/tree_sitter.zig");
