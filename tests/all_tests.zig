@@ -6,4 +6,6 @@ test {
     _ = @import("graph_db_test.zig");
     _ = @import("call_graph_test.zig");
     _ = @import("arch_test.zig");
+    _ = @import("incremental_test.zig");
+    _ = @import("watcher_test.zig");
 }
