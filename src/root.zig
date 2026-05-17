@@ -12,6 +12,7 @@ pub const indexer = struct {
     pub const incremental = @import("core/indexer/incremental.zig");
 };
 pub const project_store = @import("core/project_store.zig");
+pub const config = @import("core/config.zig");
 pub const project = struct {
     pub const watcher = @import("project/watcher.zig");
 };
@@ -48,7 +49,12 @@ pub const api = struct {
         pub const protocol = @import("api/mcp/protocol.zig");
         pub const tools = @import("api/mcp/tools.zig");
     };
-    pub const cli = @import("api/cli/cli.zig");
+    pub const cli = struct {
+        pub const cli = @import("api/cli/cli.zig");
+        pub const terminal = @import("api/cli/terminal.zig");
+        pub const errors = @import("api/cli/errors.zig");
+        pub const completions = @import("api/cli/completions.zig");
+    };
 };
 
 pub const ai = struct {

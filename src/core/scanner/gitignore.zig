@@ -67,8 +67,8 @@ pub fn collect(allocator: std.mem.Allocator, root: []const u8) !RuleSet {
     var set = RuleSet{ .allocator = allocator };
 
     // Gather path components so we can walk upward.
-    var dirs = std.ArrayList([]const u8).init(allocator);
-    defer dirs.deinit();
+    var dirs = std.ArrayList([]const u8){};
+    defer dirs.deinit(allocator);
 
     var cur = root;
     while (true) {

@@ -377,7 +377,8 @@ fn assignCommunities(
         const c = community[i];
         const result = try comm_groups.getOrPut(c);
         if (!result.found_existing) {
-            result.value_ptr.* = std.ArrayList(i64).initCapacity(allocator, 4) catch @panic("OOM");
+            result.value_ptr.* = .empty;
+            try result.value_ptr.ensureTotalCapacity(allocator, 4);
         }
         try result.value_ptr.append(allocator, graph.symbol_ids[i]);
     }
@@ -391,8 +392,9 @@ fn assignCommunities(
         const symbols_list = entry.value_ptr.*;
 
         // Build comma-separated list for IN clause
-        var buf = std.ArrayList(u8).initCapacity(allocator, 256) catch @panic("OOM");
+        var buf = std.ArrayList(u8){};
         defer buf.deinit(allocator);
+        try buf.ensureTotalCapacity(allocator, 256);
         for (symbols_list.items, 0..) |sid, j| {
             if (j > 0) try buf.append(allocator, ',');
             try buf.writer(allocator).print("{d}", .{sid});
