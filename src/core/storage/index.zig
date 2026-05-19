@@ -76,6 +76,12 @@ pub const ImportRecord = packed struct {
     target_sid: u32,
 };
 
+/// Combined term lookup result — postings slice plus document frequency.
+pub const TermLookup = struct {
+    df: u32,
+    postings: []const PostingRecord,
+};
+
 const MutableDoc = struct {
     rec: DocRecord,
 };
@@ -93,12 +99,23 @@ const TokenAccum = struct {
 };
 
 pub const Writer = struct {
+    /// Owns all of the Writer's transient allocations (string table, doc /
+    /// symbol / token arraylists, hashmap backing storage).  Held by pointer
+    /// so the `Allocator` interface (which captures a `*ArenaAllocator`) stays
+    /// valid when the Writer is returned by value from `init`.
+    ///
+    /// The arena is bulk-freed in `deinit`, eliminating per-list teardown and
+    /// removing a latent stale-pointer hazard: `string_ids` stores keys that
+    /// slice into `strings.items`, and arena `realloc` keeps prior buffers
+    /// alive so old keys remain valid even after `strings` grows.
+    parent_allocator: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,
     index_path: []const u8,
     strings: std.ArrayList(u8),
     string_offsets: std.ArrayList(u32),
-    string_ids: std.StringHashMap(u32),
+    string_ids: std.HashMapUnmanaged([]const u8, u32, InternContext, std.hash_map.default_max_load_percentage),
     docs: std.ArrayList(MutableDoc),
     content_file: std.fs.File,
     content_len: u64,
@@ -107,7 +124,13 @@ pub const Writer = struct {
     tokens: std.ArrayList(TokenEntry),
 
     pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir, index_path: []const u8) !Writer {
-        var content_file = try createIndexFile(allocator, dir, index_path, "content.idx");
+        const arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena_ptr);
+        arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena_ptr.deinit();
+        const arena_alloc = arena_ptr.allocator();
+
+        var content_file = try createIndexFile(arena_alloc, dir, index_path, "content.idx");
         errdefer content_file.close();
         const empty_header = Header{
             .magic = MAGIC_CONTENT,
@@ -124,12 +147,14 @@ pub const Writer = struct {
         try content_file.writeAll(std.mem.asBytes(&empty_header));
 
         return .{
-            .allocator = allocator,
+            .parent_allocator = allocator,
+            .arena = arena_ptr,
+            .allocator = arena_alloc,
             .dir = dir,
-            .index_path = try allocator.dupe(u8, index_path),
+            .index_path = try arena_alloc.dupe(u8, index_path),
             .strings = .{},
             .string_offsets = .{},
-            .string_ids = std.StringHashMap(u32).init(allocator),
+            .string_ids = .{},
             .docs = .{},
             .content_file = content_file,
             .content_len = 0,
@@ -140,17 +165,137 @@ pub const Writer = struct {
     }
 
     pub fn deinit(self: *Writer) void {
-        var it = self.string_ids.keyIterator();
-        while (it.next()) |key| self.allocator.free(key.*);
-        self.string_ids.deinit();
-        self.string_offsets.deinit(self.allocator);
-        self.strings.deinit(self.allocator);
-        self.docs.deinit(self.allocator);
         self.content_file.close();
-        self.symbols.deinit(self.allocator);
-        self.imports.deinit(self.allocator);
-        self.tokens.deinit(self.allocator);
-        self.allocator.free(self.index_path);
+        self.arena.deinit();
+        self.parent_allocator.destroy(self.arena);
+    }
+
+    /// State for an in-progress streaming file ingest.  Owned by the caller;
+    /// passed back into `appendStreamChunk` / `endStreamFile`.
+    pub const StreamHandle = struct {
+        doc_id: u32,
+        hasher: std.hash.Wyhash,
+        per_doc_arena: std.heap.ArenaAllocator,
+        per_doc: std.AutoHashMap(u32, TokenAccum),
+        /// Carry-over for an identifier that started near the end of the
+        /// previous chunk and may continue into the next one.  Capped at
+        /// 256 bytes — same as `normalizeInto`'s working buffer.
+        pending: [256]u8,
+        pending_len: usize,
+        bytes_written: u64,
+        /// Token-position counter (increments per identifier seen).
+        pos: u32,
+    };
+
+    /// Begin a streaming file ingest.  Reserves a doc record now; the hash
+    /// and content_len are filled in by `endStreamFile` once all chunks
+    /// have been consumed.
+    pub fn beginStreamFile(self: *Writer, path: []const u8, mtime: i64) !StreamHandle {
+        const doc_id: u32 = @intCast(self.docs.items.len);
+        const path_sid = try self.intern(path);
+        const content_off = self.content_len;
+        try self.docs.append(self.allocator, .{ .rec = .{
+            .path_sid = path_sid,
+            .content_off = content_off,
+            .content_len = 0,
+            .hash = 0,
+            .mtime = mtime,
+            .symbol_off = 0,
+            .symbol_len = 0,
+            .import_off = 0,
+            .import_len = 0,
+            .token_count = 0,
+        } });
+        var per_doc_arena = std.heap.ArenaAllocator.init(self.parent_allocator);
+        errdefer per_doc_arena.deinit();
+        const per_doc = std.AutoHashMap(u32, TokenAccum).init(per_doc_arena.allocator());
+        return .{
+            .doc_id = doc_id,
+            .hasher = std.hash.Wyhash.init(0),
+            .per_doc_arena = per_doc_arena,
+            .per_doc = per_doc,
+            .pending = undefined,
+            .pending_len = 0,
+            .bytes_written = 0,
+            .pos = 0,
+        };
+    }
+
+    /// Append a content chunk to a streaming file.  Updates the running
+    /// hash, appends to `content.idx`, and tokenizes the chunk with
+    /// carry-over handling so identifiers that straddle chunk boundaries
+    /// are still indexed as a single token.
+    pub fn appendStreamChunk(self: *Writer, handle: *StreamHandle, chunk: []const u8) !void {
+        handle.hasher.update(chunk);
+        try self.content_file.writeAll(chunk);
+        self.content_len += chunk.len;
+        handle.bytes_written += chunk.len;
+
+        var i: usize = 0;
+        while (i < chunk.len) {
+            const c = chunk[i];
+            const is_ident_char = isIdent(c);
+
+            // Extend a carried-over identifier from the previous chunk.
+            if (handle.pending_len > 0) {
+                if (is_ident_char) {
+                    if (handle.pending_len < handle.pending.len) {
+                        handle.pending[handle.pending_len] = c;
+                        handle.pending_len += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                try self.indexIdentifierIntoMap(handle.doc_id, &handle.per_doc, handle.pending[0..handle.pending_len], handle.pos);
+                handle.pos += 1;
+                handle.pending_len = 0;
+                // Fall through; the non-ident byte is skipped below.
+            }
+
+            if (!is_ident_char) {
+                i += 1;
+                continue;
+            }
+
+            const start = i;
+            while (i < chunk.len and isIdent(chunk[i])) i += 1;
+            const ident = chunk[start..i];
+            if (i == chunk.len) {
+                const copy_len = @min(ident.len, handle.pending.len);
+                @memcpy(handle.pending[0..copy_len], ident[0..copy_len]);
+                handle.pending_len = copy_len;
+                return;
+            }
+            try self.indexIdentifierIntoMap(handle.doc_id, &handle.per_doc, ident, handle.pos);
+            handle.pos += 1;
+        }
+    }
+
+    /// Finish a streaming file ingest.  Flushes any pending identifier,
+    /// drains the per-doc token accumulator into the shared `tokens` list,
+    /// and patches the doc record with the final hash + content_len.
+    pub fn endStreamFile(self: *Writer, handle: *StreamHandle) !void {
+        if (handle.pending_len > 0) {
+            try self.indexIdentifierIntoMap(handle.doc_id, &handle.per_doc, handle.pending[0..handle.pending_len], handle.pos);
+            handle.pending_len = 0;
+        }
+
+        var it = handle.per_doc.iterator();
+        while (it.next()) |entry| {
+            try self.tokens.append(self.allocator, .{
+                .term_sid = entry.key_ptr.*,
+                .doc_id = handle.doc_id,
+                .tf = entry.value_ptr.tf,
+                .first_pos = entry.value_ptr.first_pos,
+            });
+        }
+
+        const doc = &self.docs.items[handle.doc_id].rec;
+        doc.content_len = @intCast(handle.bytes_written);
+        doc.hash = handle.hasher.final();
+
+        handle.per_doc.deinit();
+        handle.per_doc_arena.deinit();
     }
 
     pub fn addFile(self: *Writer, path: []const u8, hash: u64, mtime: i64, content: []const u8) !u32 {
@@ -230,13 +375,23 @@ pub const Writer = struct {
     fn intern(self: *Writer, value: []const u8) !u32 {
         if (self.string_ids.get(value)) |sid| return sid;
         const sid: u32 = @intCast(self.string_offsets.items.len);
-        try self.string_offsets.append(self.allocator, @intCast(self.strings.items.len));
+        const off = self.strings.items.len;
+        try self.string_offsets.append(self.allocator, @intCast(off));
         try self.strings.appendSlice(self.allocator, value);
         try self.strings.append(self.allocator, 0);
-        const owned = try self.allocator.dupe(u8, value);
-        try self.string_ids.put(owned, sid);
+        const key = self.strings.items[off .. off + value.len];
+        try self.string_ids.put(self.allocator, key, sid);
         return sid;
     }
+
+const InternContext = struct {
+    pub fn hash(_: @This(), value: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, value);
+    }
+    pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return std.mem.eql(u8, a, b);
+    }
+};
 
     fn indexContentTokens(self: *Writer, doc_id: u32, content: []const u8) !void {
         var per_doc = std.AutoHashMap(u32, TokenAccum).init(self.allocator);
@@ -596,6 +751,31 @@ pub const Index = struct {
         return &.{};
     }
 
+    /// Combined lookup: returns both df (postings_len) and the postings slice
+    /// in a single binary search.  Use when both values are needed (BM25 needs
+    /// df for IDF and postings for per-doc TF).
+    pub fn lookupTerm(self: *const Index, normalized: []const u8) ?TermLookup {
+        var lo: usize = 0;
+        var hi: usize = self.terms.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            const current = self.stringAt(self.terms[mid].term_sid);
+            const order = std.mem.order(u8, current, normalized);
+            switch (order) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => {
+                    const t = self.terms[mid];
+                    return .{
+                        .df = t.postings_len,
+                        .postings = self.postings[t.postings_off .. t.postings_off + t.postings_len],
+                    };
+                },
+            }
+        }
+        return null;
+    }
+
     pub fn symbolByName(self: *const Index, name: []const u8) ?SymbolRecord {
         const h = stableHash(name);
         var lo: usize = 0;
@@ -728,14 +908,61 @@ pub fn normalizeAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out[0..normalized.len];
 }
 
+/// Lane width for byte-level SIMD normalization.  16 lanes maps to SSE2 /
+/// NEON; the compiler scalarizes cleanly on platforms without it.
+const NORM_LANES = 16;
+const U8x = @Vector(NORM_LANES, u8);
+
+/// Lowercase + filter `value`, writing the kept bytes into `buf`.
+///
+/// Processes 16 bytes at a time: builds an "is alphanumeric" mask in SIMD,
+/// computes the lowercased byte uniformly, then uses a precomputed bitmask
+/// to iterate only the kept positions for the scalar emit step.  The bulk
+/// of the per-byte work (range comparisons, ORing 0x20 for uppercase)
+/// stays in vector registers; only the variable-width store is scalar.
 pub fn normalizeInto(buf: []u8, value: []const u8) []const u8 {
     var n: usize = 0;
-    for (value) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (n < buf.len) {
-                buf[n] = std.ascii.toLower(c);
+    var i: usize = 0;
+
+    const lower_a: U8x = @splat('a');
+    const lower_z: U8x = @splat('z');
+    const upper_a: U8x = @splat('A');
+    const upper_z: U8x = @splat('Z');
+    const digit_0: U8x = @splat('0');
+    const digit_9: U8x = @splat('9');
+    const to_lower_bit: U8x = @splat(0x20);
+    const zero: U8x = @splat(0);
+
+    while (i + NORM_LANES <= value.len) : (i += NORM_LANES) {
+        const v: U8x = value[i..][0..NORM_LANES].*;
+
+        const is_upper = (v >= upper_a) & (v <= upper_z);
+        const is_lower = (v >= lower_a) & (v <= lower_z);
+        const is_digit = (v >= digit_0) & (v <= digit_9);
+        const is_alnum = is_upper | is_lower | is_digit;
+
+        const lowered = v | @select(u8, is_upper, to_lower_bit, zero);
+
+        // Iterate the keep mask scalar-side to compact into `buf`.  The
+        // SIMD work has already done the range checks and lowering; this
+        // loop is just the variable-width store.
+        var lane: usize = 0;
+        while (lane < NORM_LANES) : (lane += 1) {
+            if (is_alnum[lane]) {
+                if (n >= buf.len) return buf[0..n];
+                buf[n] = lowered[lane];
                 n += 1;
             }
+        }
+    }
+
+    // Scalar tail
+    while (i < value.len) : (i += 1) {
+        const c = value[i];
+        if (std.ascii.isAlphanumeric(c)) {
+            if (n >= buf.len) break;
+            buf[n] = std.ascii.toLower(c);
+            n += 1;
         }
     }
     return buf[0..n];

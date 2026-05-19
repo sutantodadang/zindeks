@@ -4,6 +4,47 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── Generate version.zig from build.zig.zon ─────────────────────
+    const zon_file = std.fs.cwd().openFile("build.zig.zon", .{}) catch {
+        std.debug.print("Failed to open build.zig.zon\n", .{});
+        std.process.exit(1);
+    };
+    defer zon_file.close();
+    const zon_contents = zon_file.readToEndAlloc(b.allocator, 4096) catch {
+        std.debug.print("Failed to read build.zig.zon\n", .{});
+        std.process.exit(1);
+    };
+    defer b.allocator.free(zon_contents);
+
+    const version_key = ".version = \"";
+    const version_start = std.mem.indexOf(u8, zon_contents, version_key) orelse {
+        std.debug.print("No .version field in build.zig.zon\n", .{});
+        std.process.exit(1);
+    };
+    const rest = zon_contents[version_start + version_key.len..];
+    const version_end = std.mem.indexOfScalar(u8, rest, '\"') orelse {
+        std.debug.print("Malformed .version field in build.zig.zon\n", .{});
+        std.process.exit(1);
+    };
+    const version_str = rest[0..version_end];
+
+    const version_zig_contents = std.fmt.allocPrint(b.allocator,
+        "// Auto-generated from build.zig.zon — do not edit manually\n" ++
+        "pub const version = \"{s}\";\n",
+        .{version_str},
+    ) catch @panic("OOM");
+    defer b.allocator.free(version_zig_contents);
+
+    const version_file = std.fs.cwd().createFile("src/version.zig", .{ .truncate = true }) catch {
+        std.debug.print("Failed to create src/version.zig\n", .{});
+        std.process.exit(1);
+    };
+    defer version_file.close();
+    version_file.writeAll(version_zig_contents) catch {
+        std.debug.print("Failed to write src/version.zig\n", .{});
+        std.process.exit(1);
+    };
+
     // ── Vendored C: SQLite 3 ────────────────────────────────────────
     const sqlite_mod = b.createModule(.{ .target = target, .optimize = optimize });
     sqlite_mod.addCSourceFiles(.{ .files = &.{"vendor/sqlite3/sqlite3.c"} });
@@ -113,6 +154,10 @@ pub fn build(b: *std.Build) void {
 
         exe.linkLibrary(g_lib);
     }
+    if (optimize != .Debug) {
+        exe.root_module.strip = true;
+    }
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run zindeks");

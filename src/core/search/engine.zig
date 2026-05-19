@@ -13,6 +13,7 @@
 const std = @import("std");
 const storage = @import("../storage/index.zig");
 const graph_db = @import("../storage/graph_db.zig");
+const overlay_mod = @import("../storage/overlay.zig");
 const semantic = @import("semantic.zig");
 
 /// BM25 tuning constants.
@@ -106,11 +107,59 @@ const ScoredDoc = struct {
     path: []const u8,
 };
 
+/// Bounded cache mapping normalized term → (df, postings slice).
+///
+/// Postings are slices into the mmap'd index file and remain valid for the
+/// lifetime of the Index, so caching them across queries is safe.  Eviction
+/// strategy is bulk-clear at capacity — same as `cache.StatementCache` —
+/// since "hot" search terms re-cache cheaply on the next query.
+pub const TermCache = struct {
+    map: std.StringHashMapUnmanaged(storage.TermLookup),
+    allocator: std.mem.Allocator,
+    capacity: usize,
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) TermCache {
+        return .{ .map = .{}, .allocator = allocator, .capacity = capacity };
+    }
+
+    pub fn deinit(self: *TermCache) void {
+        self.clear();
+        self.map.deinit(self.allocator);
+    }
+
+    pub fn clear(self: *TermCache) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.map.clearRetainingCapacity();
+    }
+
+    /// Look up a term, falling back to `index.lookupTerm` on miss and
+    /// caching the result.  `normalized` must outlive the call but does not
+    /// need to outlive the cache — we dupe on insert.
+    pub fn lookup(self: *TermCache, index: *const storage.Index, normalized: []const u8) ?storage.TermLookup {
+        if (self.map.get(normalized)) |hit| return hit;
+        const result = index.lookupTerm(normalized) orelse return null;
+        if (self.map.count() >= self.capacity) self.clear();
+        const key = self.allocator.dupe(u8, normalized) catch return result;
+        self.map.put(self.allocator, key, result) catch {
+            self.allocator.free(key);
+        };
+        return result;
+    }
+};
+
 pub const Engine = struct {
     index: *const storage.Index,
     avg_doc_len: f32,
     k1: f32,
     b: f32,
+    term_cache: ?*TermCache = null,
+    /// Optional BM25 delta overlay produced by incremental updates.  When
+    /// present, every base lookup is paired with an overlay lookup, base
+    /// hits whose doc-id is tombstoned are dropped, and overlay hits are
+    /// scored with their doc-id offset by `base.docCount()` so the merged
+    /// result list has unique IDs.
+    overlay: ?*overlay_mod.Overlay = null,
 
     pub fn init(index: *const storage.Index) Engine {
         return .{
@@ -131,11 +180,162 @@ pub const Engine = struct {
         };
     }
 
+    /// Attach a term cache.  The cache must outlive the engine.  When set,
+    /// `search` consults the cache before falling through to the binary
+    /// search in `Index.lookupTerm`.
+    pub fn useTermCache(self: *Engine, cache: *TermCache) void {
+        self.term_cache = cache;
+    }
+
+    /// Attach a BM25 overlay.  Must outlive the engine.  After this call,
+    /// every search reflects the overlay's adds/deletes on top of the base
+    /// index — no re-build required.
+    pub fn useOverlay(self: *Engine, ov: *overlay_mod.Overlay) void {
+        self.overlay = ov;
+    }
+
+    /// Internal: lookup with cache when available.
+    inline fn lookupTerm(self: *Engine, normalized: []const u8) ?storage.TermLookup {
+        if (self.term_cache) |c| return c.lookup(self.index, normalized);
+        return self.index.lookupTerm(normalized);
+    }
+
+    /// Combined doc count across base and any attached overlay.  Drives the
+    /// `N` term in IDF so the formula reflects the current document set,
+    /// not just the base snapshot.
+    inline fn combinedDocCount(self: *const Engine) u32 {
+        const base = self.index.docCount();
+        if (self.overlay) |ov| return base + ov.docCount();
+        return base;
+    }
+
+    /// Resolve a merged doc id (base IDs first, then overlay IDs at offset
+    /// `base.docCount()`) back to its `token_count` for BM25 length norm.
+    inline fn tokenCount(self: *const Engine, combined_id: u32) u32 {
+        const base = self.index.docCount();
+        if (combined_id < base) return self.index.docs[combined_id].token_count;
+        if (self.overlay) |ov| {
+            const local = combined_id - base;
+            if (local < ov.sub_index.docCount()) return ov.sub_index.docs[local].token_count;
+        }
+        return 0;
+    }
+
+    /// Resolve a merged doc id to a file path.
+    inline fn filePathFor(self: *const Engine, combined_id: u32) []const u8 {
+        const base = self.index.docCount();
+        if (combined_id < base) return self.index.filePath(combined_id);
+        if (self.overlay) |ov| {
+            const local = combined_id - base;
+            if (local < ov.sub_index.docCount()) return ov.sub_index.filePath(local);
+        }
+        return "";
+    }
+
+    /// Resolve a merged doc id to file content (used by snippet extraction).
+    inline fn fileContentFor(self: *const Engine, combined_id: u32) []const u8 {
+        const base = self.index.docCount();
+        if (combined_id < base) return self.index.fileContent(combined_id);
+        if (self.overlay) |ov| {
+            const local = combined_id - base;
+            if (local < ov.sub_index.docCount()) return ov.sub_index.fileContent(local);
+        }
+        return "";
+    }
+
+    /// Fixed-capacity score buffer using linear probing.  Avoids heap
+    /// allocation for the common case of < 512 unique doc ids per query.
+    const ScoreBuf = struct {
+        const CAP = 512;
+        const Entry = struct { doc_id: u32, score: f32, used: bool };
+        entries: [CAP]Entry,
+        count: usize,
+        fallback: ?std.AutoHashMap(u32, f32),
+        allocator: std.mem.Allocator,
+
+        fn init(allocator: std.mem.Allocator) ScoreBuf {
+            var buf: ScoreBuf = .{
+                .entries = undefined,
+                .count = 0,
+                .fallback = null,
+                .allocator = allocator,
+            };
+            @memset(&buf.entries, .{ .doc_id = 0, .score = 0, .used = false });
+            return buf;
+        }
+
+        fn deinit(self: *ScoreBuf) void {
+            if (self.fallback) |*fb| fb.deinit();
+        }
+
+        fn getOrPut(self: *ScoreBuf, doc_id: u32) !*f32 {
+            if (self.fallback) |*fb| {
+                const entry = try fb.getOrPut(doc_id);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                return entry.value_ptr;
+            }
+            if (self.count >= CAP * 3 / 4) {
+                // Promote to hash map when load factor exceeds 75%
+                var fb = std.AutoHashMap(u32, f32).init(self.allocator);
+                for (&self.entries) |*e| {
+                    if (!e.used) continue;
+                    try fb.put(e.doc_id, e.score);
+                }
+                self.fallback = fb;
+                const entry = try fb.getOrPut(doc_id);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                return entry.value_ptr;
+            }
+            var idx = doc_id % CAP;
+            for (0..CAP) |_| {
+                const e = &self.entries[idx];
+                if (!e.used) {
+                    e.doc_id = doc_id;
+                    e.score = 0;
+                    e.used = true;
+                    self.count += 1;
+                    return &e.score;
+                }
+                if (e.doc_id == doc_id) return &e.score;
+                idx = (idx + 1) % CAP;
+            }
+            unreachable;
+        }
+
+        fn collect(self: *ScoreBuf, allocator: std.mem.Allocator) !std.ArrayList(ScoredDoc) {
+            if (self.fallback) |*fb| {
+                var scored = std.ArrayList(ScoredDoc).initCapacity(allocator, fb.count()) catch @panic("OOM");
+                var it = fb.iterator();
+                while (it.next()) |entry| {
+                    try scored.append(allocator, .{
+                        .doc_id = entry.key_ptr.*,
+                        .score = entry.value_ptr.*,
+                        .path = "", // filled later
+                    });
+                }
+                return scored;
+            }
+            var scored = std.ArrayList(ScoredDoc).initCapacity(allocator, self.count) catch @panic("OOM");
+            for (&self.entries) |*e| {
+                if (!e.used) continue;
+                try scored.append(allocator, .{
+                    .doc_id = e.doc_id,
+                    .score = e.score,
+                    .path = "", // filled later
+                });
+            }
+            return scored;
+        }
+    };
+
     pub fn search(self: *Engine, allocator: std.mem.Allocator, query: []const u8, limit: usize) !SearchResults {
-        var scores = std.AutoHashMap(u32, f32).init(allocator);
+        var scores = ScoreBuf.init(allocator);
         defer scores.deinit();
 
-        const n: f32 = @floatFromInt(self.index.docCount());
+        // N for IDF spans base + overlay so the formula reflects the
+        // current document set after incremental updates.
+        const n: f32 = @floatFromInt(self.combinedDocCount());
+        const base_doc_count = self.index.docCount();
         var term_buf: [256]u8 = undefined;
 
         var i: usize = 0;
@@ -146,38 +346,56 @@ pub const Engine = struct {
             if (start == i) continue;
             const term = storage.normalizeInto(&term_buf, query[start..i]);
 
-            // df = document frequency (how many docs contain this term)
-            const df: f32 = @floatFromInt(self.index.postingsLenForTerm(term));
-            if (df == 0) continue;
+            // Combine df across base and overlay before computing IDF so a
+            // term that is rare in the base but common in the overlay still
+            // gets a fair weighting.
+            const base_lookup = self.lookupTerm(term);
+            const overlay_lookup: ?storage.TermLookup = if (self.overlay) |ov|
+                ov.sub_index.lookupTerm(term)
+            else
+                null;
 
-            // Robertson-Sparck Jones IDF
+            const total_df_u: u32 = (if (base_lookup) |bl| bl.df else 0) +
+                (if (overlay_lookup) |ol| ol.df else 0);
+            if (total_df_u == 0) continue;
+            const df: f32 = @floatFromInt(total_df_u);
             const idf: f32 = @log(1.0 + (n - df + 0.5) / (df + 0.5));
 
-            const postings = self.index.postingsForTerm(term);
-            for (postings) |p| {
-                const tf: f32 = @floatFromInt(p.tf);
-                const doc_len: f32 = @floatFromInt(self.index.docs[p.doc_id].token_count);
-                const norm_len = doc_len / self.avg_doc_len;
+            if (base_lookup) |lookup| {
+                for (lookup.postings) |p| {
+                    if (self.overlay) |ov| {
+                        if (ov.isTombstoned(p.doc_id)) continue;
+                    }
+                    const tf: f32 = @floatFromInt(p.tf);
+                    const doc_len: f32 = @floatFromInt(self.index.docs[p.doc_id].token_count);
+                    const norm_len = doc_len / self.avg_doc_len;
+                    const tf_score = (tf * (self.k1 + 1.0)) / (tf + self.k1 * (1.0 - self.b + self.b * norm_len));
+                    const bm25_score = idf * tf_score;
+                    const score_ptr = try scores.getOrPut(p.doc_id);
+                    score_ptr.* += bm25_score;
+                }
+            }
 
-                // BM25 TF component with document length normalization
-                const tf_score = (tf * (self.k1 + 1.0)) / (tf + self.k1 * (1.0 - self.b + self.b * norm_len));
-                const bm25_score = idf * tf_score;
-
-                const entry = try scores.getOrPut(p.doc_id);
-                if (!entry.found_existing) entry.value_ptr.* = 0;
-                entry.value_ptr.* += bm25_score;
+            if (overlay_lookup) |lookup| {
+                const ov = self.overlay.?;
+                for (lookup.postings) |p| {
+                    const combined_id = p.doc_id + base_doc_count;
+                    const tf: f32 = @floatFromInt(p.tf);
+                    const doc_len: f32 = @floatFromInt(ov.sub_index.docs[p.doc_id].token_count);
+                    const norm_len = doc_len / self.avg_doc_len;
+                    const tf_score = (tf * (self.k1 + 1.0)) / (tf + self.k1 * (1.0 - self.b + self.b * norm_len));
+                    const bm25_score = idf * tf_score;
+                    const score_ptr = try scores.getOrPut(combined_id);
+                    score_ptr.* += bm25_score;
+                }
             }
         }
 
-        var scored = std.ArrayList(ScoredDoc).initCapacity(allocator, scores.count()) catch @panic("OOM");
+        var scored = try scores.collect(allocator);
         defer scored.deinit(allocator);
-        var it = scores.iterator();
-        while (it.next()) |entry| {
-            try scored.append(allocator, .{
-                .doc_id = entry.key_ptr.*,
-                .score = entry.value_ptr.*,
-                .path = self.index.filePath(entry.key_ptr.*),
-            });
+
+        for (scored.items) |*item| {
+            item.path = self.filePathFor(item.doc_id);
         }
         std.mem.sort(ScoredDoc, scored.items, {}, lessScoredDoc);
         if (scored.items.len > limit) scored.shrinkRetainingCapacity(limit);
@@ -188,7 +406,7 @@ pub const Engine = struct {
                 .doc_id = item.doc_id,
                 .score = item.score,
                 .path = item.path,
-                .snippet = self.snippet(item.doc_id, query),
+                .snippet = self.snippetFor(item.doc_id, query),
             };
         }
         return .{ .items = results };
@@ -210,6 +428,13 @@ pub const Engine = struct {
         query: []const u8,
         limit: usize,
     ) !HybridResults {
+        // Short-circuit when the query is clearly a symbol lookup.  Semantic
+        // search adds latency proportional to the embedding-table size and
+        // never wins for exact identifier matches.
+        if (classifyQuery(query) == .identifier_only) {
+            return bm25Only(self, allocator, query, limit);
+        }
+
         // 1. Get BM25 results (use a larger pool for better fusion)
         const bm25_pool_size: usize = @max(limit * 3, 50);
         var bm25_results = try self.search(allocator, query, bm25_pool_size);
@@ -431,6 +656,14 @@ pub const Engine = struct {
         return self.search(allocator, query, limit);
     }
 
+    /// Exact-identifier search path.  Aliases `search` today but is the API
+    /// agents should call when they know the query is a symbol (no semantic
+    /// fallback, no embedding round-trip).  Stable surface even if
+    /// hybridSearch's classifier rules change.
+    pub fn fastSearch(self: *Engine, allocator: std.mem.Allocator, query: []const u8, limit: usize) !SearchResults {
+        return self.search(allocator, query, limit);
+    }
+
     /// Extract a query-aware snippet from the document.
     /// Finds the first occurrence of the first query term and returns context
     /// around it (up to SNIPPET_LEN bytes). Falls back to first SNIPPET_LEN bytes
@@ -438,8 +671,18 @@ pub const Engine = struct {
     const SNIPPET_LEN: usize = 300;
     const CONTEXT_BEFORE: usize = 80;
 
+    /// Overlay-aware wrapper used by callers that already hold a *merged*
+    /// doc id (i.e. ids >= base.docCount() refer to the overlay).
+    fn snippetFor(self: *Engine, combined_id: u32, query: []const u8) []const u8 {
+        return self.snippetFromContent(self.fileContentFor(combined_id), query);
+    }
+
     fn snippet(self: *Engine, doc_id: u32, query: []const u8) []const u8 {
-        const content = self.index.fileContent(doc_id);
+        return self.snippetFromContent(self.index.fileContent(doc_id), query);
+    }
+
+    fn snippetFromContent(self: *Engine, content: []const u8, query: []const u8) []const u8 {
+        _ = self;
         if (content.len <= SNIPPET_LEN) return content;
 
         // Extract first query term
@@ -487,3 +730,48 @@ fn lessScoredDoc(_: void, a: ScoredDoc, b: ScoredDoc) bool {
     if (a.score != b.score) return a.score > b.score;
     return std.mem.lessThan(u8, a.path, b.path);
 }
+
+/// Classifier for query routing.  `identifier_only` queries skip the
+/// semantic arm of hybrid search.
+pub const QueryShape = enum { identifier_only, natural_language };
+
+/// Heuristic: a query is identifier-only when it's a single contiguous
+/// run of identifier characters (letters, digits, `_`).  Anything with
+/// whitespace, punctuation, or multiple tokens is treated as natural
+/// language and gets the full hybrid pipeline.
+pub fn classifyQuery(query: []const u8) QueryShape {
+    const trimmed = std.mem.trim(u8, query, " \t\n\r");
+    if (trimmed.len == 0) return .natural_language;
+
+    var has_letter = false;
+    for (trimmed) |c| {
+        if (std.ascii.isAlphabetic(c)) has_letter = true;
+        const is_ident_char = std.ascii.isAlphanumeric(c) or c == '_';
+        if (!is_ident_char) return .natural_language;
+    }
+    // A query of only digits is not a useful "identifier" — fall back.
+    return if (has_letter) .identifier_only else .natural_language;
+}
+
+/// BM25-only path used by hybridSearch when the query is a single
+/// identifier.  Materializes the same HybridResult shape (with
+/// semantic_score=0, fused_score=bm25_score) so callers see a uniform
+/// schema regardless of which arm ran.
+fn bm25Only(engine: *Engine, allocator: std.mem.Allocator, query: []const u8, limit: usize) !HybridResults {
+    var bm25 = try engine.search(allocator, query, limit);
+    defer bm25.deinit(allocator);
+
+    const results = try allocator.alloc(HybridResult, bm25.items.len);
+    for (bm25.items, 0..) |r, i| {
+        results[i] = .{
+            .doc_id = r.doc_id,
+            .path = r.path,
+            .snippet = r.snippet,
+            .bm25_score = r.score,
+            .semantic_score = 0,
+            .fused_score = r.score,
+        };
+    }
+    return .{ .items = results };
+}
+

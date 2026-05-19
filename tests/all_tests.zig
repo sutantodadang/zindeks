@@ -12,4 +12,7 @@ test {
     _ = @import("cli_test.zig");
     _ = @import("config_test.zig");
     _ = @import("perf_test.zig");
+    _ = @import("parallel_indexer_test.zig");
+    _ = @import("search_phase2_test.zig");
+    _ = @import("overlay_test.zig");
 }

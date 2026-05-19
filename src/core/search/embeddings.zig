@@ -185,28 +185,68 @@ fn hashToSlot(ngram: []const u8) usize {
     return @as(usize, @intCast(h % EMBEDDING_DIM));
 }
 
-/// L2 normalize a vector in place.
+/// SIMD lane width used for f32 vector math.  8 lanes maps well to modern
+/// x86_64 (AVX) and aarch64 (NEON via 2×4) targets and the compiler will
+/// scalarize cleanly on architectures that lack wide vectors.
+const F32_LANES = 8;
+const F32x = @Vector(F32_LANES, f32);
+
+/// L2 normalize a vector in place using SIMD accumulation for the squared
+/// magnitude.  The divide-back pass is also vectorized so most of the
+/// loop body stays in vector registers.
 fn l2Normalize(vec: []f32) void {
-    var norm: f32 = 0;
-    for (vec) |v| norm += v * v;
-    norm = @sqrt(norm);
-    if (norm > 0) {
-        for (vec) |*v| v.* /= norm;
+    var i: usize = 0;
+    var acc: F32x = @splat(0);
+    while (i + F32_LANES <= vec.len) : (i += F32_LANES) {
+        const v: F32x = vec[i..][0..F32_LANES].*;
+        acc += v * v;
     }
+    var norm: f32 = @reduce(.Add, acc);
+    while (i < vec.len) : (i += 1) norm += vec[i] * vec[i];
+
+    norm = @sqrt(norm);
+    if (norm == 0) return;
+
+    const inv: F32x = @splat(1.0 / norm);
+    var j: usize = 0;
+    while (j + F32_LANES <= vec.len) : (j += F32_LANES) {
+        const v: F32x = vec[j..][0..F32_LANES].*;
+        vec[j..][0..F32_LANES].* = v * inv;
+    }
+    const inv_scalar: f32 = 1.0 / norm;
+    while (j < vec.len) : (j += 1) vec[j] *= inv_scalar;
 }
 
 /// Compute cosine similarity between two vectors.
-/// Assumes both vectors are already L2-normalized (or of equal dimension).
-/// Returns value in [-1, 1] where 1 is identical.
+/// Returns a value in [-1, 1] where 1 is identical.
+///
+/// All three accumulators (dot, |a|², |b|²) are computed in one pass over
+/// SIMD lanes, then horizontally reduced.  A scalar tail handles any
+/// remainder when `n` isn't a multiple of the lane width.
 pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
     const n = @min(a.len, b.len);
     if (n == 0) return 0;
 
-    var dot: f32 = 0;
-    var mag_a: f32 = 0;
-    var mag_b: f32 = 0;
+    var dot_vec: F32x = @splat(0);
+    var mag_a_vec: F32x = @splat(0);
+    var mag_b_vec: F32x = @splat(0);
 
-    for (a[0..n], b[0..n]) |av, bv| {
+    var i: usize = 0;
+    while (i + F32_LANES <= n) : (i += F32_LANES) {
+        const av: F32x = a[i..][0..F32_LANES].*;
+        const bv: F32x = b[i..][0..F32_LANES].*;
+        dot_vec += av * bv;
+        mag_a_vec += av * av;
+        mag_b_vec += bv * bv;
+    }
+
+    var dot: f32 = @reduce(.Add, dot_vec);
+    var mag_a: f32 = @reduce(.Add, mag_a_vec);
+    var mag_b: f32 = @reduce(.Add, mag_b_vec);
+
+    while (i < n) : (i += 1) {
+        const av = a[i];
+        const bv = b[i];
         dot += av * bv;
         mag_a += av * av;
         mag_b += bv * bv;

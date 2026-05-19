@@ -4,6 +4,7 @@ pub const storage = struct {
     pub const batch = @import("core/storage/batch.zig");
     pub const cache = @import("core/storage/cache.zig");
     pub const pool = @import("core/storage/pool.zig");
+    pub const overlay = @import("core/storage/overlay.zig");
 };
 
 pub const scanner = struct {

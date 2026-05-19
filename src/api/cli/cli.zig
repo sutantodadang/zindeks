@@ -1,15 +1,20 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const indexer = @import("../../core/indexer/indexer.zig");
+const incremental = @import("../../core/indexer/incremental.zig");
 const project_store = @import("../../core/project_store.zig");
 const storage = @import("../../core/storage/index.zig");
 const search = @import("../../core/search/engine.zig");
+const graph_db = @import("../../core/storage/graph_db.zig");
 const mcp = @import("../mcp/server.zig");
+const protocol = @import("../mcp/protocol.zig");
 const update = @import("update.zig");
 const scanner = @import("../../core/scanner/scanner.zig");
 const terminal = @import("terminal.zig");
 const errors = @import("errors.zig");
 const config_mod = @import("../../core/config.zig");
 const completions = @import("completions.zig");
+const version = @import("../../version.zig");
 
 /// Runtime state passed through the CLI pipeline.
 const CliState = struct {
@@ -57,7 +62,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const stdout_w = std.fs.File.stdout().deprecatedWriter();
         var sw = terminal.StyledWriter(@TypeOf(stdout_w)).init(stdout_w);
         sw.setColors(state.colors_enabled);
-        try sw.print("{s}zindeks 0.1.0{s}\n", .{ sw.bold(), sw.reset() });
+        try sw.print("{s}zindeks {s}{s}\n", .{ sw.bold(), version.version, sw.reset() });
         return;
     }
 
@@ -82,10 +87,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Dispatch to subcommand
     if (std.mem.eql(u8, cmd, "index")) {
         try runIndex(&state, args[global.cmd_index + 1 ..]);
+    } else if (std.mem.eql(u8, cmd, "reindex")) {
+        try runReindex(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "search")) {
         try runSearch(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "serve")) {
-        try runServe(&state);
+        try runServe(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "update")) {
         try runUpdate(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "completions")) {
@@ -211,6 +218,57 @@ fn runIndex(state: *CliState, args: []const []const u8) !void {
     try sw.print("{s}Done.{s}\n", .{ sw.green(), sw.reset() });
 }
 
+// ── Subcommand: reindex ───────────────────────────────────────────────
+//
+// Incremental update: re-uses the existing base index, runs detectChanges
+// against the graph DB, applies adds/mods/dels, and rebuilds the BM25
+// overlay.  No full re-extraction.  Falls back to a clear error if the
+// project has never been indexed.
+
+fn runReindex(state: *CliState, args: []const []const u8) !void {
+    const parsed = try parseIndexArgs(state, args);
+
+    // Resolve the existing index dir without preparing a write location —
+    // reindex never creates new project metadata, only updates.
+    var location = project_store.resolveRead(state.allocator, parsed.repo, .{
+        .index_dir = parsed.index_dir,
+        .store_root = parsed.store_root,
+    }) catch {
+        return fmtError(state.colors_enabled, errors.notFound("No existing index for this repo. Run 'zindeks index' first."), std.fs.File.stderr().deprecatedWriter());
+    };
+    defer location.deinit();
+
+    var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stderr().deprecatedWriter())).init(std.fs.File.stderr().deprecatedWriter());
+    sw.setColors(state.colors_enabled);
+
+    try sw.print("{s}Reindexing '{s}'...{s}\n", .{ sw.bold(), parsed.repo, sw.reset() });
+
+    // Open the graph DB so we can diff + apply.
+    const graph_path = try std.fs.path.join(state.allocator, &.{ location.index_dir, "graph.db" });
+    defer state.allocator.free(graph_path);
+    const graph_path_z = try state.allocator.dupeZ(u8, graph_path);
+    defer state.allocator.free(graph_path_z);
+
+    var gdb = try graph_db.GraphDb.open(graph_path_z);
+    defer gdb.close();
+    try gdb.migrate();
+
+    var diff = try incremental.detectChanges(state.allocator, &gdb, parsed.repo);
+    defer diff.deinit();
+
+    try sw.print(
+        "  added={d} modified={d} deleted={d} (of {d} total)\n",
+        .{ diff.added.len, diff.modified.len, diff.deleted.len, diff.total_files },
+    );
+
+    const stats = try incremental.applyChangesWithOverlay(state.allocator, &gdb, parsed.repo, location.index_dir, &diff);
+
+    try sw.print(
+        "{s}Done.{s} symbols+{d} edges+{d} overlay_docs={d} tombstoned={d} ({d} ms)\n",
+        .{ sw.green(), sw.reset(), stats.symbols_added, stats.edges_added, stats.overlay_docs, stats.overlay_tombstoned, stats.duration_ms },
+    );
+}
+
 // ── Subcommand: search ────────────────────────────────────────────────
 
 fn runSearch(state: *CliState, args: []const []const u8) !void {
@@ -269,11 +327,112 @@ fn runSearch(state: *CliState, args: []const []const u8) !void {
 }
 
 // ── Subcommand: serve ─────────────────────────────────────────────────
+//
+// Three modes:
+//   * no flags         → stdio (default; MCP over stdin/stdout)
+//   * --port <N>       → TCP listener; one MCP session per connection
+//   * --socket <path>  → Unix-domain-socket listener (POSIX only)
+//
+// In socket modes the daemon spawns a thread per accepted connection;
+// each gets its own Server with a socket Transport and runs until the
+// client disconnects.  Project state is per-session and auto-detected
+// at initialize time.
 
-fn runServe(state: *CliState) !void {
-    var server = mcp.Server.init(state.allocator, .{});
+const ServeMode = union(enum) {
+    stdio,
+    tcp: u16,
+    unix: []const u8,
+};
+
+fn runServe(state: *CliState, args: []const []const u8) !void {
+    var mode: ServeMode = .stdio;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--port")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            const p = std.fmt.parseInt(u16, args[i], 10) catch return fmtError(state.colors_enabled, errors.invalidArgs("--port expects an integer"), std.fs.File.stderr().deprecatedWriter());
+            mode = .{ .tcp = p };
+        } else if (std.mem.eql(u8, a, "--socket")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            mode = .{ .unix = args[i] };
+        } else if (std.mem.eql(u8, a, "--no-color") or std.mem.eql(u8, a, "--config")) {
+            // global flags consumed earlier; tolerate any trailing values
+            if (std.mem.eql(u8, a, "--config")) i += 1;
+        } else {
+            return fmtError(state.colors_enabled, errors.invalidArgs("Unknown 'serve' flag"), std.fs.File.stderr().deprecatedWriter());
+        }
+    }
+
+    switch (mode) {
+        .stdio => {
+            var server = mcp.Server.init(state.allocator, .{});
+            defer server.deinit();
+            try server.serve();
+        },
+        .tcp => |port| try runServeDaemon(state, .{ .tcp = port }),
+        .unix => |path| try runServeDaemon(state, .{ .unix = path }),
+    }
+}
+
+fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
+    var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stderr().deprecatedWriter())).init(std.fs.File.stderr().deprecatedWriter());
+    sw.setColors(state.colors_enabled);
+
+    // `std.net.Address.initUnix` is not just runtime-unavailable on
+    // Windows — it fails to *compile* there because the underlying
+    // `sockaddr.un` type is declared as `void`.  A comptime branch
+    // removes the unix arm from the AST entirely on Windows targets.
+    const addr = switch (mode) {
+        .stdio => unreachable,
+        .tcp => |port| try std.net.Address.parseIp("0.0.0.0", port),
+        .unix => |path| blk: {
+            if (comptime builtin.os.tag == .windows) {
+                try sw.print("Unix domain sockets are not supported on Windows; use --port instead.\n", .{});
+                return error.UnsupportedTransport;
+            } else {
+                // Best-effort cleanup of a stale socket file from a prior run.
+                std.fs.cwd().deleteFile(path) catch {};
+                break :blk std.net.Address.initUnix(path) catch |err| {
+                    try sw.print("Unix sockets unavailable on this platform: {s}\n", .{@errorName(err)});
+                    return err;
+                };
+            }
+        },
+    };
+
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    switch (mode) {
+        .stdio => unreachable,
+        .tcp => |port| try sw.print("{s}zindeks serve{s} listening on TCP :{d}\n", .{ sw.bold(), sw.reset(), port }),
+        .unix => |path| try sw.print("{s}zindeks serve{s} listening on unix:{s}\n", .{ sw.bold(), sw.reset(), path }),
+    }
+
+    while (true) {
+        const conn = listener.accept() catch |err| {
+            std.log.err("accept failed: {s}", .{@errorName(err)});
+            continue;
+        };
+        const thread = std.Thread.spawn(.{}, sessionThread, .{ state.allocator, conn.stream }) catch |err| {
+            std.log.err("spawn session thread failed: {s}", .{@errorName(err)});
+            conn.stream.close();
+            continue;
+        };
+        thread.detach();
+    }
+}
+
+fn sessionThread(allocator: std.mem.Allocator, stream: std.net.Stream) void {
+    const transport = protocol.Transport.initSocket(allocator, stream);
+    var server = mcp.Server.initWithTransport(allocator, .{}, transport);
     defer server.deinit();
-    try server.serve();
+    server.serve() catch |err| {
+        std.log.warn("session ended with error: {s}", .{@errorName(err)});
+    };
 }
 
 // ── Subcommand: update ────────────────────────────────────────────────
@@ -452,12 +611,15 @@ fn defaultSuggestion(cat: errors.ErrorCategory) []const u8 {
 
 fn usage(sw: anytype) !void {
     try sw.print(
-        \\{s}zindeks 0.1.0{s} — Local code knowledge graph engine
+        \\{s}zindeks {s}{s} — Local code knowledge graph engine
         \\
         \\{s}Commands:{s}
         \\  index [repo]              Index a repository
+        \\  reindex [repo]            Incremental update of an existing index
         \\  search <query> [repo]     Search indexed code (BM25)
-        \\  serve [repo]              Start MCP JSON-RPC server
+        \\  serve [--port N|--socket P]
+        \\                            Start MCP JSON-RPC server (stdio by default,
+        \\                            TCP with --port, Unix socket with --socket)
         \\  update                    Update zindeks to latest version
         \\  completions <shell>       Generate shell completions (bash|zsh|fish)
         \\  help                      Show this help
@@ -480,7 +642,7 @@ fn usage(sw: anytype) !void {
         \\  Windows: %LOCALAPPDATA%\zindeks\
         \\
     , .{
-        sw.bold(), sw.reset(),
+        sw.bold(), version.version, sw.reset(),
         sw.bold(), sw.reset(),
         sw.bold(), sw.reset(),
         sw.bold(), sw.reset(),

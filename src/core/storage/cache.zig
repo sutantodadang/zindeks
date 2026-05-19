@@ -8,75 +8,75 @@ const std = @import("std");
 const sqlite3 = @cImport({
     @cInclude("sqlite3.h");
 });
-const GraphDb = @import("graph_db.zig").GraphDb;
 
 pub const StatementCache = struct {
-    db: *GraphDb,
-    cache: std.StringHashMapUnmanaged(*sqlite3.sqlite3_stmt),
+    db_ptr: *anyopaque, // actually *sqlite3.sqlite3
+    cache: std.StringHashMapUnmanaged(*anyopaque),
     max_size: usize,
+    allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, db: *GraphDb, max_size: usize) StatementCache {
-        _ = allocator;
+    pub fn init(allocator: std.mem.Allocator, db_ptr: *anyopaque, max_size: usize) StatementCache {
         return .{
-            .db = db,
+            .db_ptr = db_ptr,
             .cache = .{},
             .max_size = max_size,
+            .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *StatementCache, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *StatementCache) void {
         var it = self.cache.iterator();
         while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            _ = sqlite3.sqlite3_finalize(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+            _ = sqlite3.sqlite3_finalize(@ptrCast(entry.value_ptr.*));
         }
-        self.cache.deinit(allocator);
+        self.cache.deinit(self.allocator);
     }
 
     /// Prepare a SQL statement, using the cache if available.
-    /// Returns a pointer to a prepared statement. The caller must NOT
+    /// Returns an opaque pointer to the prepared statement. The caller must NOT
     /// finalize the returned statement — the cache owns it.
-    pub fn prepare(self: *StatementCache, allocator: std.mem.Allocator, sql: []const u8) !*sqlite3.sqlite3_stmt {
+    pub fn prepare(self: *StatementCache, sql: []const u8) !*anyopaque {
         // Check cache first
         if (self.cache.get(sql)) |stmt| {
-            _ = sqlite3.sqlite3_reset(stmt);
-            _ = sqlite3.sqlite3_clear_bindings(stmt);
+            _ = sqlite3.sqlite3_reset(@ptrCast(stmt));
+            _ = sqlite3.sqlite3_clear_bindings(@ptrCast(stmt));
             return stmt;
         }
 
         // Evict if at capacity (simple: clear all)
         if (self.cache.count() >= self.max_size) {
-            self.clear(allocator);
+            self.clear();
         }
 
         // Prepare new statement
         var out: ?*sqlite3.sqlite3_stmt = undefined;
-        const zsql = allocator.dupeZ(u8, sql) catch return error.PrepareFailed;
-        defer allocator.free(zsql);
-        const rc = sqlite3.sqlite3_prepare_v2(@ptrCast(self.db.db), zsql.ptr, @intCast(zsql.len), &out, null);
+        const zsql = self.allocator.dupeZ(u8, sql) catch return error.PrepareFailed;
+        defer self.allocator.free(zsql);
+        const rc = sqlite3.sqlite3_prepare_v2(@ptrCast(self.db_ptr), zsql.ptr, @intCast(zsql.len), &out, null);
         if (rc != sqlite3.SQLITE_OK) return error.PrepareFailed;
 
         const stmt = out orelse return error.PrepareFailed;
 
         // Store in cache. The key is the SQL string — since callers typically
         // pass string literals or long-lived strings, we store a copy.
-        const key = allocator.dupe(u8, sql) catch {
+        const key = self.allocator.dupe(u8, sql) catch {
             _ = sqlite3.sqlite3_finalize(stmt);
             return error.PrepareFailed;
         };
-        errdefer allocator.free(key);
+        errdefer self.allocator.free(key);
 
-        try self.cache.put(allocator, key, stmt);
-        return stmt;
+        try self.cache.put(self.allocator, key, @ptrCast(stmt));
+        return @ptrCast(stmt);
     }
 
     /// Clear all cached statements.
-    pub fn clear(self: *StatementCache, allocator: std.mem.Allocator) void {
+    pub fn clear(self: *StatementCache) void {
         var it = self.cache.iterator();
         while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            _ = sqlite3.sqlite3_finalize(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+            _ = sqlite3.sqlite3_finalize(@ptrCast(entry.value_ptr.*));
         }
-        self.cache.clearAndFree(allocator);
+        self.cache.clearAndFree(self.allocator);
     }
 };

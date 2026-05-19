@@ -128,13 +128,13 @@ test "StatementCache reuses prepared statements" {
     try db.migrate();
     try db.exec("INSERT INTO documents (path, language) VALUES ('test.zig', 'Zig')");
 
-    var cache = cache_mod.StatementCache.init(std.testing.allocator, &db, 10);
-    defer cache.deinit(std.testing.allocator);
+    var cache = cache_mod.StatementCache.init(std.testing.allocator, @ptrCast(db.db), 10);
+    defer cache.deinit();
 
     const sql = "SELECT path, language FROM documents WHERE id = 1";
 
-    const stmt1 = try cache.prepare(std.testing.allocator, sql);
-    const stmt2 = try cache.prepare(std.testing.allocator, sql);
+    const stmt1 = try cache.prepare(sql);
+    const stmt2 = try cache.prepare(sql);
 
     // Same SQL should return same stmt pointer
     try std.testing.expectEqual(@intFromPtr(stmt1), @intFromPtr(stmt2));

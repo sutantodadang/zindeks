@@ -25,8 +25,30 @@ pub fn indexPath(allocator: std.mem.Allocator, repo_path: []const u8, index_path
         allocator: std.mem.Allocator,
         writer: *storage.Writer,
         gdb: *graph_db.GraphDb,
+        stream: ?storage.Writer.StreamHandle = null,
 
-        fn onFile(self: *@This(), entry: scanner.FileEntry) !void {
+        fn onEvent(self: *@This(), event: scanner.ChunkEvent) !void {
+            switch (event) {
+                .file => |entry| try self.handleSmallFile(entry),
+                .begin => |b| {
+                    self.stream = try self.writer.beginStreamFile(b.path, b.mtime);
+                },
+                .chunk => |bytes| {
+                    try self.writer.appendStreamChunk(&self.stream.?, bytes);
+                },
+                .end => {
+                    try self.writer.endStreamFile(&self.stream.?);
+                    self.stream = null;
+                    // Streamed (large) files are token-indexed only — no
+                    // symbol or embedding pass.  Symbol extraction operates
+                    // on full file content, which would defeat the streaming
+                    // memory budget, and these files are usually generated
+                    // or vendored where symbol-level navigation is low value.
+                },
+            }
+        }
+
+        fn handleSmallFile(self: *@This(), entry: scanner.FileEntry) !void {
             const doc_id = try self.writer.addFile(entry.path, entry.hash, entry.mtime, entry.content);
             const parsed = try symbols.parseSymbols(self.allocator, entry.content);
             defer {
@@ -40,14 +62,12 @@ pub fn indexPath(allocator: std.mem.Allocator, repo_path: []const u8, index_path
                     try self.writer.addSymbol(doc_id, sym.name, sym.kind, sym.line, sym.byte_off);
                 }
             }
-
-            // Generate and store document embedding
             generateEmbedding(self.allocator, self.gdb, @intCast(doc_id), entry, parsed) catch {};
         }
     };
 
     var context = Context{ .allocator = allocator, .writer = &writer, .gdb = &gdb };
-    try scanner.scanPathStreaming(allocator, repo_path, &context, Context.onFile);
+    try scanner.scanPathChunked(allocator, repo_path, &context, Context.onEvent);
 
     try writer.finish();
 }

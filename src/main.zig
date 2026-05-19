@@ -1,10 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zindeks = @import("zindeks");
 
 pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa: std.heap.GeneralPurposeAllocator(.{ .safety = builtin.mode == .Debug }) = .{};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 

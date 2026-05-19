@@ -11,6 +11,7 @@
 const std = @import("std");
 const scanner = @import("../scanner/scanner.zig");
 const graph_db = @import("../storage/graph_db.zig");
+const overlay_mod = @import("../storage/overlay.zig");
 const ts = @import("../parser/tree_sitter.zig");
 const extractor_mod = @import("../parser/extractor.zig");
 
@@ -56,6 +57,11 @@ pub const UpdateStats = struct {
     edges_added: u32 = 0,
     errors: u32 = 0,
     duration_ms: u64 = 0,
+    /// Stats from the optional BM25 overlay rebuild that runs after the
+    /// graph-DB transaction commits.  Zeroed when `applyChangesWithOverlay`
+    /// is not used.
+    overlay_docs: u32 = 0,
+    overlay_tombstoned: u32 = 0,
 };
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -315,25 +321,63 @@ pub fn applyChanges(
     return stats;
 }
 
+/// Apply changes (as `applyChanges`) and additionally rebuild the BM25
+/// delta overlay at `<index_path>/overlay/` so search reflects the new
+/// state without a full re-index.  `index_path` must already contain a
+/// base binary index built by `indexer.indexPath`.
+pub fn applyChangesWithOverlay(
+    allocator: std.mem.Allocator,
+    gdb: *GraphDb,
+    project_path: []const u8,
+    index_path: []const u8,
+    diff: *const DiffResult,
+) !UpdateStats {
+    var stats = try applyChanges(allocator, gdb, project_path, diff);
+    const ov_stats = overlay_mod.rebuild(allocator, std.fs.cwd(), index_path, project_path, gdb) catch overlay_mod.RebuildStats{};
+    stats.overlay_docs = ov_stats.overlay_docs;
+    stats.overlay_tombstoned = ov_stats.tombstoned;
+    return stats;
+}
+
 // ██████████████████████████████████████████████████████████████████████████
 // Helpers
 // ██████████████████████████████████████████████████████████████████████████
 
 /// Remove a file and all its symbols/edges from the graph DB.
-/// Uses ON DELETE CASCADE for edges (via FK on symbols).
+///
+/// `gdb.exec()` does not bind parameters, so the previous version using
+/// `exec("... WHERE path = ?")` left the `?` unbound and deleted every
+/// row in each table.  Use `prepare`+`bindText` so the predicate is
+/// honored.  ON DELETE CASCADE on symbols/edges' FKs handles the
+/// dependent rows, but we still delete edges first to avoid relying on
+/// foreign_keys=ON being enabled.
 fn removeFileFromGraph(gdb: *GraphDb, path: []const u8) !void {
-    // First delete edges whose source_symbol_id or target_symbol_id
-    // references a symbol belonging to this document.
-    try gdb.exec(
-        "DELETE FROM edges WHERE source_symbol_id IN (SELECT id FROM symbols WHERE document_id IN (SELECT id FROM documents WHERE path = ?))",
-    );
-    // Now delete symbols
-    try gdb.exec(
-        "DELETE FROM symbols WHERE document_id IN (SELECT id FROM documents WHERE path = ?)",
-    );
-    // Finally delete the document
-    try gdb.exec(
-        "DELETE FROM documents WHERE path = ?",
-    );
-    _ = path; // suppress unused — exec uses literal SQL with ? placeholders
+    {
+        var stmt = try gdb.prepare(
+            \\DELETE FROM edges WHERE source_symbol_id IN (
+            \\    SELECT id FROM symbols WHERE document_id IN (
+            \\        SELECT id FROM documents WHERE path = ?
+            \\    )
+            \\)
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, path);
+        _ = try stmt.step();
+    }
+    {
+        var stmt = try gdb.prepare(
+            \\DELETE FROM symbols WHERE document_id IN (
+            \\    SELECT id FROM documents WHERE path = ?
+            \\)
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, path);
+        _ = try stmt.step();
+    }
+    {
+        var stmt = try gdb.prepare("DELETE FROM documents WHERE path = ?");
+        defer stmt.finalize();
+        try stmt.bindText(1, path);
+        _ = try stmt.step();
+    }
 }

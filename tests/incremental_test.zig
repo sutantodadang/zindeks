@@ -145,3 +145,82 @@ test "detectChanges empty diff when nothing changed" {
     try std.testing.expectEqual(@as(u32, 0), diff.modified.len);
     try std.testing.expectEqual(@as(u32, 0), diff.deleted.len);
 }
+
+test "applyChanges removeFileFromGraph only deletes the targeted file" {
+    // Regression guard: a prior version of removeFileFromGraph used
+    // gdb.exec("... WHERE path = ?") which never bound the parameter,
+    // silently wiping every documents/symbols/edges row.
+    const allocator = std.testing.allocator;
+
+    var db = try graph_db.GraphDb.open(":memory:");
+    defer db.close();
+    try db.migrate();
+
+    // Seed two unrelated documents + symbols.
+    try db.exec("INSERT INTO documents (path, mtime) VALUES ('keep.zig', 100)");
+    const keep_id = db.lastInsertRowid();
+    try db.exec("INSERT INTO documents (path, mtime) VALUES ('drop.zig', 100)");
+    const drop_id = db.lastInsertRowid();
+
+    {
+        var stmt = try db.prepare(
+            \\INSERT INTO symbols (document_id, name, kind, line_start, line_end)
+            \\VALUES (?, 'keepSym', 'function', 1, 1)
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, keep_id);
+        _ = try stmt.step();
+    }
+    {
+        var stmt = try db.prepare(
+            \\INSERT INTO symbols (document_id, name, kind, line_start, line_end)
+            \\VALUES (?, 'dropSym', 'function', 1, 1)
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, drop_id);
+        _ = try stmt.step();
+    }
+
+    // Run a diff that marks drop.zig as deleted; apply it.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_path = try tmp_dir.dir.realpath(".", &dir_buf);
+
+    var diff = try incremental.detectChanges(allocator, &db, real_path);
+    defer diff.deinit();
+    // Both seeded rows should be detected as deleted (neither exists on disk).
+    try std.testing.expect(diff.deleted.len == 2);
+
+    // After applying, the keep_id row's symbol would also be wiped if the bug
+    // returned.  Apply only the "drop" deletion to verify path binding.
+    var drop_only = incremental.DiffResult{
+        .allocator = allocator,
+        .added = try allocator.alloc(incremental.FileChange, 0),
+        .modified = try allocator.alloc(incremental.FileChange, 0),
+        .deleted = blk: {
+            var list = try allocator.alloc(incremental.FileChange, 1);
+            list[0] = .{
+                .path = try allocator.dupe(u8, "drop.zig"),
+                .kind = .deleted,
+            };
+            break :blk list;
+        },
+        .total_files = 0,
+    };
+    defer drop_only.deinit();
+
+    _ = try incremental.applyChanges(allocator, &db, real_path, &drop_only);
+
+    const remaining_docs = try db.queryScalar("SELECT COUNT(*) FROM documents");
+    try std.testing.expectEqual(@as(i64, 1), remaining_docs);
+    const remaining_syms = try db.queryScalar("SELECT COUNT(*) FROM symbols");
+    try std.testing.expectEqual(@as(i64, 1), remaining_syms);
+
+    // Confirm we kept the right row, not the wrong one.
+    var path_stmt = try db.prepare("SELECT path FROM documents");
+    defer path_stmt.finalize();
+    try std.testing.expect(try path_stmt.step());
+    const path = try path_stmt.columnText(0);
+    try std.testing.expectEqualStrings("keep.zig", path);
+}

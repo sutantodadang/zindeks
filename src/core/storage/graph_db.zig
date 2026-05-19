@@ -27,6 +27,7 @@ fn sqliteTransient(_: ?*anyopaque) callconv(.c) void {
     // No-op: SQLite already copied the data, this is just cleanup.
 }
 const SQLITE_TRANSIENT: sqlite3.sqlite3_destructor_type = &sqliteTransient;
+const cache = @import("cache.zig");
 
 pub const ColumnType = enum {
     integer,
@@ -60,8 +61,10 @@ pub const Error = error{
 pub const Statement = struct {
     stmt: ?*sqlite3.sqlite3_stmt,
     db: *GraphDb,
+    from_cache: bool = false,
 
     pub fn finalize(self: *Statement) void {
+        if (self.from_cache) return; // cache owns it
         if (self.stmt) |s| {
             _ = sqlite3.sqlite3_finalize(s);
             self.stmt = null;
@@ -258,7 +261,8 @@ const MIGRATIONS = [_][:0]const u8{
 
 pub const GraphDb = struct {
     db: *sqlite3.sqlite3,
-    statement_cache: ?*anyopaque = null, // *StatementCache, opaque to avoid circular import
+    statement_cache: ?*cache.StatementCache = null,
+    allocator: ?std.mem.Allocator = null,
 
     /// Open (or create) a database at `path`.  Pass `":memory:"` for an
     /// in-process ephemeral database.
@@ -267,7 +271,14 @@ pub const GraphDb = struct {
         const rc = sqlite3.sqlite3_open(path.ptr, &out);
         if (rc != SQLITE_OK) return Error.OpenFailed;
         const db = out orelse return Error.OpenFailed;
-        return GraphDb{ .db = db };
+        const self = GraphDb{ .db = db };
+        // Performance pragmas: WAL mode for concurrency, NORMAL sync for speed,
+        // large page cache and in-memory temp tables.
+        _ = sqlite3.sqlite3_exec(db, "PRAGMA journal_mode = WAL;", null, null, null);
+        _ = sqlite3.sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", null, null, null);
+        _ = sqlite3.sqlite3_exec(db, "PRAGMA cache_size = -64000;", null, null, null);
+        _ = sqlite3.sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", null, null, null);
+        return self;
     }
 
     /// Close the database and free the connection.
@@ -276,9 +287,19 @@ pub const GraphDb = struct {
         self.db = undefined;
     }
 
+    /// Set the allocator used for statement cache and other internal allocations.
+    pub fn setAllocator(self: *GraphDb, allocator: std.mem.Allocator) void {
+        self.allocator = allocator;
+    }
+
+    /// Create a statement cache backed by this database.
+    pub fn createCache(self: *GraphDb, allocator: std.mem.Allocator, max_size: usize) cache.StatementCache {
+        return cache.StatementCache.init(allocator, @ptrCast(self.db), max_size);
+    }
+
     /// Enable statement caching.  The cache must outlive the GraphDb.
-    pub fn useCache(self: *GraphDb, cache: anytype) void {
-        self.statement_cache = @ptrCast(@constCast(cache));
+    pub fn useCache(self: *GraphDb, cache_ptr: *cache.StatementCache) void {
+        self.statement_cache = cache_ptr;
     }
 
     /// Create a BatchInserter attached to this database.
@@ -287,8 +308,12 @@ pub const GraphDb = struct {
         return @import("batch.zig").BatchInserter.init(allocator, self, batch_size);
     }
 
-    /// Prepare a SQL statement.
+    /// Prepare a SQL statement. Uses the statement cache if one is registered.
     pub fn prepare(self: *GraphDb, sql: [:0]const u8) !Statement {
+        if (self.statement_cache) |sc| {
+            const raw = try sc.prepare(sql);
+            return .{ .stmt = @ptrCast(raw), .db = self, .from_cache = true };
+        }
         var out: ?*sqlite3.sqlite3_stmt = undefined;
         const rc = sqlite3.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &out, null);
         if (rc != SQLITE_OK) return Error.PrepareFailed;

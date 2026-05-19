@@ -46,111 +46,217 @@ pub const ServerCapabilities = struct {
 };
 
 // ██████████████████████████████████████████████████████████████████████████
-// Transport — Content-Length-framed stdio
+// Transport — Content-Length-framed I/O over stdio or sockets
 // ██████████████████████████████████████████████████████████████████████████
+//
+// All MCP messages share the LSP-style Content-Length framing.  The only
+// thing that varies between the stdio mode (default) and the daemon socket
+// modes (TCP / Unix) is the underlying byte stream.  We model that with a
+// tagged union so handlers can be written once and dispatched per-variant.
+//
+// `write_mutex` serializes outbound writes so worker threads producing
+// streaming notifications can safely share one connection.
 
-pub const Transport = struct {
-    allocator: std.mem.Allocator,
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    buf: std.ArrayList(u8),
+pub const Transport = union(enum) {
+    stdio: Stdio,
+    socket: Socket,
 
-    const MAX_HEADER_LEN = 4096;
-    const MAX_BODY_LEN = 16 * 1024 * 1024; // 16 MiB
+    pub const MAX_HEADER_LEN = 4096;
+    pub const MAX_BODY_LEN = 16 * 1024 * 1024; // 16 MiB
+
+    pub const Stdio = struct {
+        allocator: std.mem.Allocator,
+        stdin: std.fs.File,
+        stdout: std.fs.File,
+        buf: std.ArrayList(u8),
+        write_mutex: std.Thread.Mutex,
+    };
+
+    pub const Socket = struct {
+        allocator: std.mem.Allocator,
+        stream: std.net.Stream,
+        buf: std.ArrayList(u8),
+        write_mutex: std.Thread.Mutex,
+    };
 
     pub fn init(allocator: std.mem.Allocator) Transport {
-        return .{
+        return initStdio(allocator);
+    }
+
+    pub fn initStdio(allocator: std.mem.Allocator) Transport {
+        return .{ .stdio = .{
             .allocator = allocator,
             .stdin = std.fs.File.stdin(),
             .stdout = std.fs.File.stdout(),
             .buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
-        };
+            .write_mutex = .{},
+        } };
+    }
+
+    pub fn initSocket(allocator: std.mem.Allocator, stream: std.net.Stream) Transport {
+        return .{ .socket = .{
+            .allocator = allocator,
+            .stream = stream,
+            .buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
+            .write_mutex = .{},
+        } };
     }
 
     pub fn deinit(self: *Transport) void {
-        self.buf.deinit(self.allocator);
-    }
-
-    /// Read bytes until delimiter, appending to writer (excludes delimiter).
-    /// Returns the number of bytes read (up to max_len). Returns EndOfStream if
-    /// EOF reached before delimiter.
-    fn readUntilDelimiter(file: std.fs.File, writer: anytype, delimiter: u8, max_len: usize) !usize {
-        var chunk_buf: [4096]u8 = undefined;
-        var total: usize = 0;
-        while (total < max_len) {
-            const remaining = @min(4096, max_len - total);
-            const n = file.read(chunk_buf[0..remaining]) catch |err| {
-                return err;
-            };
-            if (n == 0) return if (total > 0) error.EndOfStream else error.EndOfStream;
-            const chunk = chunk_buf[0..n];
-            if (std.mem.indexOfScalar(u8, chunk, delimiter)) |pos| {
-                try writer.writeAll(chunk[0..pos]);
-                return total + pos;
-            }
-            try writer.writeAll(chunk);
-            total += n;
+        switch (self.*) {
+            .stdio => |*s| s.buf.deinit(s.allocator),
+            .socket => |*s| {
+                s.buf.deinit(s.allocator);
+                s.stream.close();
+            },
         }
-        return total;
     }
 
-    /// Read exactly N bytes from stdin.
-    fn readExact(file: std.fs.File, buf: []u8) !bool {
-        const nread = file.readAll(buf) catch |err| {
-            return err;
-        };
-        return nread == buf.len;
-    }
-
-    /// Read the next JSON-RPC message from stdin.  Returns the raw JSON body
+    /// Read the next JSON-RPC message.  Returns the raw JSON body
     /// (allocated, caller owns) or null on EOF / framing error.
     pub fn readMessage(self: *Transport) !?[]u8 {
-        // Read Content-Length: <N>\r\n
-        self.buf.shrinkRetainingCapacity(0);
-        _ = readUntilDelimiter(self.stdin, self.buf.writer(self.allocator), '\n', MAX_HEADER_LEN) catch |err| switch (err) {
-            error.EndOfStream => return null,
-            else => |e| return e,
-        };
-
-        const header_line = self.buf.items;
-        if (header_line.len == 0) return null;
-
-        const content_length = parseContentLength(header_line) orelse {
-            self.buf.shrinkRetainingCapacity(0);
-            _ = readUntilDelimiter(self.stdin, self.buf.writer(self.allocator), '\n', MAX_HEADER_LEN) catch |err| switch (err) {
-                error.EndOfStream => return null,
-                else => |e| return e,
-            };
-            return null; // skip malformed header
-        };
-
-        if (content_length == 0 or content_length > MAX_BODY_LEN) return null;
-
-        // Consume the blank line after header
-        self.buf.shrinkRetainingCapacity(0);
-        _ = readUntilDelimiter(self.stdin, self.buf.writer(self.allocator), '\n', MAX_HEADER_LEN) catch |err| switch (err) {
-            error.EndOfStream => return null,
-            else => |e| return e,
-        };
-
-        // Read exactly content_length bytes
-        const body = try self.allocator.alloc(u8, content_length);
-        errdefer self.allocator.free(body);
-        if (!try readExact(self.stdin, body)) {
-            self.allocator.free(body);
-            return null;
+        switch (self.*) {
+            .stdio => |*s| return readFramed(s.allocator, .{ .file = s.stdin }, &s.buf),
+            .socket => |*s| return readFramed(s.allocator, .{ .stream = s.stream }, &s.buf),
         }
-        return body;
     }
 
-    /// Write a JSON-RPC message with Content-Length framing.
+    /// Write a JSON-RPC message with Content-Length framing.  Holds the
+    /// transport's write mutex so concurrent writers do not interleave.
     pub fn writeMessage(self: *Transport, json: []const u8) !void {
-        var header_buf: [256]u8 = undefined;
-        const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {}\r\n\r\n", .{json.len});
-        try self.stdout.writeAll(header);
-        try self.stdout.writeAll(json);
+        switch (self.*) {
+            .stdio => |*s| {
+                s.write_mutex.lock();
+                defer s.write_mutex.unlock();
+                var header_buf: [256]u8 = undefined;
+                const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {}\r\n\r\n", .{json.len});
+                try s.stdout.writeAll(header);
+                try s.stdout.writeAll(json);
+                s.stdout.sync() catch {};
+            },
+            .socket => |*s| {
+                s.write_mutex.lock();
+                defer s.write_mutex.unlock();
+                var header_buf: [256]u8 = undefined;
+                const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {}\r\n\r\n", .{json.len});
+                try s.stream.writeAll(header);
+                try s.stream.writeAll(json);
+            },
+        }
+    }
+
+    /// Direct access to the write mutex for callers that want to stream a
+    /// payload built one piece at a time (e.g., zero-copy result streaming
+    /// that writes directly into the transport's underlying file/stream
+    /// instead of going through `writeMessage`).
+    pub fn writeMutex(self: *Transport) *std.Thread.Mutex {
+        return switch (self.*) {
+            .stdio => |*s| &s.write_mutex,
+            .socket => |*s| &s.write_mutex,
+        };
+    }
+
+    /// Write `bytes` to the underlying stream while holding the write
+    /// mutex.  Intended for the streaming/zero-copy path that frames the
+    /// payload manually.
+    pub fn writeRawLocked(self: *Transport, bytes: []const u8) !void {
+        switch (self.*) {
+            .stdio => |*s| try s.stdout.writeAll(bytes),
+            .socket => |*s| try s.stream.writeAll(bytes),
+        }
+    }
+
+    pub fn syncLocked(self: *Transport) void {
+        switch (self.*) {
+            .stdio => |*s| s.stdout.sync() catch {},
+            .socket => {},
+        }
     }
 };
+
+/// Reader abstraction over either a File or a net.Stream — both expose
+/// `read([]u8) !usize`, so we tag-dispatch at each call site rather than
+/// type-erase.
+const ReaderSource = union(enum) {
+    file: std.fs.File,
+    stream: std.net.Stream,
+
+    fn read(self: ReaderSource, dst: []u8) !usize {
+        return switch (self) {
+            .file => |f| f.read(dst),
+            .stream => |s| s.read(dst),
+        };
+    }
+
+    fn readAll(self: ReaderSource, dst: []u8) !usize {
+        switch (self) {
+            .file => |f| return f.readAll(dst),
+            .stream => |s| {
+                // net.Stream has no readAll; loop until EOF or buffer full.
+                var got: usize = 0;
+                while (got < dst.len) {
+                    const n = try s.read(dst[got..]);
+                    if (n == 0) break;
+                    got += n;
+                }
+                return got;
+            },
+        }
+    }
+};
+
+fn readUntilDelimiter(src: ReaderSource, writer: anytype, delimiter: u8, max_len: usize) !usize {
+    var chunk_buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < max_len) {
+        const remaining = @min(4096, max_len - total);
+        const n = try src.read(chunk_buf[0..remaining]);
+        if (n == 0) return error.EndOfStream;
+        const chunk = chunk_buf[0..n];
+        if (std.mem.indexOfScalar(u8, chunk, delimiter)) |pos| {
+            try writer.writeAll(chunk[0..pos]);
+            return total + pos;
+        }
+        try writer.writeAll(chunk);
+        total += n;
+    }
+    return total;
+}
+
+fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, buf: *std.ArrayList(u8)) !?[]u8 {
+    buf.shrinkRetainingCapacity(0);
+    _ = readUntilDelimiter(src, buf.writer(allocator), '\n', Transport.MAX_HEADER_LEN) catch |err| switch (err) {
+        error.EndOfStream => return null,
+        else => |e| return e,
+    };
+
+    const header_line = buf.items;
+    if (header_line.len == 0) return null;
+
+    const content_length = parseContentLength(header_line) orelse {
+        buf.shrinkRetainingCapacity(0);
+        _ = readUntilDelimiter(src, buf.writer(allocator), '\n', Transport.MAX_HEADER_LEN) catch return null;
+        return null;
+    };
+
+    if (content_length == 0 or content_length > Transport.MAX_BODY_LEN) return null;
+
+    // Consume the blank line after header
+    buf.shrinkRetainingCapacity(0);
+    _ = readUntilDelimiter(src, buf.writer(allocator), '\n', Transport.MAX_HEADER_LEN) catch |err| switch (err) {
+        error.EndOfStream => return null,
+        else => |e| return e,
+    };
+
+    const body = try allocator.alloc(u8, content_length);
+    errdefer allocator.free(body);
+    const got = try src.readAll(body);
+    if (got != body.len) {
+        allocator.free(body);
+        return null;
+    }
+    return body;
+}
 
 fn parseContentLength(line: []const u8) ?usize {
     const trimmed = std.mem.trimRight(u8, line, " \r\n\t");

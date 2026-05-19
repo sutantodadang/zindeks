@@ -47,6 +47,7 @@ pub const ALL = [_]Descriptor{
     get_code_snippet,
     query_graph,
     detect_changes,
+    update_index,
     index_status,
     delete_project,
     trace_call_path,
@@ -65,6 +66,21 @@ pub const ALL = [_]Descriptor{
     explain_query,
     get_config,
     set_config,
+};
+
+/// Apply detected file changes incrementally: updates the SQLite graph DB
+/// and rebuilds the BM25 delta overlay so search reflects the new state
+/// without a full re-index.
+pub const update_index = Descriptor{
+    .name = "update_index",
+    .description = "Apply added/modified/deleted files to the graph DB and rebuild the BM25 overlay incrementally. Much faster than index_repository on small deltas.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {},
+    \\  "additionalProperties": false
+    \\}
+    ,
 };
 
 pub const index_repository = Descriptor{
@@ -97,7 +113,7 @@ pub const list_projects = Descriptor{
 
 pub const search_code = Descriptor{
     .name = "search_code",
-    .description = "Search indexed source files using BM25 keyword ranking. Returns matching files with relevance scores and snippets.",
+    .description = "Search indexed source files using BM25 keyword ranking. Returns matching files with relevance scores and snippets. Optional stream:true emits results as `notifications/zindeks/searchResult` notifications followed by a small summary in the tool response.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -109,6 +125,10 @@ pub const search_code = Descriptor{
     \\    "limit": {
     \\      "type": "integer",
     \\      "description": "Maximum number of results (default 10, max 100)"
+    \\    },
+    \\    "stream": {
+    \\      "type": "boolean",
+    \\      "description": "When true, server emits batched JSON-RPC notifications (notifications/zindeks/searchResult) and replies with {streamed:true,total,query}."
     \\    }
     \\  },
     \\  "required": ["query"]
@@ -605,6 +625,18 @@ pub const Context = struct {
     engine: ?*search.Engine = null,
     gdb: ?*graph_db.GraphDb = null,
     project_path: ?[]const u8 = null,
+    /// Resolved index directory for the currently loaded project.  Required
+    /// by `update_index` to know where to rebuild the overlay sub-index.
+    index_dir: ?[]const u8 = null,
+    /// Optional transport pointer.  When present, handlers that support
+    /// streaming may emit JSON-RPC notifications via the transport so the
+    /// client sees partial results before the final tool response.  Nil
+    /// when the caller does not want streaming (e.g., embedded use).
+    transport: ?*protocol.Transport = null,
+    /// JSON-RPC id of the in-flight request.  Used by streaming handlers
+    /// to tag each notification's `params.request_id` so the client can
+    /// demux when multiple tool calls overlap.
+    request_id: ?std.json.Value = null,
 };
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -633,6 +665,8 @@ pub fn dispatch(
         try handleQueryGraph(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "detect_changes")) {
         try handleDetectChanges(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "update_index")) {
+        try handleUpdateIndex(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "index_status")) {
         try handleIndexStatus(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "delete_project")) {
@@ -799,6 +833,13 @@ fn handleSearchCode(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
     };
     const query = getString(params, "query") orelse "";
     const limit = getLimit(params, 10);
+    const stream_requested = blk: {
+        if (params.get("stream")) |v| switch (v) {
+            .bool => |b| break :blk b,
+            else => {},
+        };
+        break :blk false;
+    };
 
     if (query.len == 0) {
         try writer.writeAll("{\"error\":\"Empty query\"}");
@@ -807,6 +848,18 @@ fn handleSearchCode(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
 
     var results = try engine.search(ctx.allocator, query, limit);
     defer results.deinit(ctx.allocator);
+
+    // Streaming path: when the caller has wired a transport AND requested
+    // streaming, emit batched notifications so the client sees first hits
+    // before the search finishes.  Falls back to the buffered inline path
+    // when streaming is unavailable.
+    if (stream_requested and ctx.transport != null) {
+        try emitSearchStream(ctx, query, results.items);
+        try writer.print(
+            \\{{"streamed":true,"total":{d},"query":{f}}}
+        , .{ results.items.len, std.json.fmt(query, .{}) });
+        return;
+    }
 
     try writer.writeByte('[');
     for (results.items, 0..) |item, i| {
@@ -820,6 +873,65 @@ fn handleSearchCode(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
         });
     }
     try writer.writeByte(']');
+}
+
+/// Batch size for streaming search results.  Small enough that the first
+/// notification fires quickly; large enough that we are not sending a
+/// separate framed message per hit.
+const STREAM_BATCH_SIZE: usize = 20;
+
+/// Emit search results as a sequence of JSON-RPC notifications, each one
+/// carrying up to `STREAM_BATCH_SIZE` result items plus a `request_id` /
+/// `batch_index` for client-side demux.  Writes go straight through the
+/// transport's write mutex — no shared response buffer involvement.
+fn emitSearchStream(ctx: *Context, query: []const u8, items: []const search.Result) !void {
+    const transport = ctx.transport.?;
+    var batch_buf = std.ArrayList(u8).initCapacity(ctx.allocator, 4096) catch @panic("OOM");
+    defer batch_buf.deinit(ctx.allocator);
+
+    var i: usize = 0;
+    var batch_index: u32 = 0;
+    while (i < items.len) : (batch_index += 1) {
+        const end = @min(i + STREAM_BATCH_SIZE, items.len);
+        batch_buf.shrinkRetainingCapacity(0);
+        const w = batch_buf.writer(ctx.allocator);
+        try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/zindeks/searchResult\",\"params\":{");
+        try w.print("\"query\":{f},\"batch_index\":{d},\"is_last\":{s},", .{
+            std.json.fmt(query, .{}),
+            batch_index,
+            if (end == items.len) "true" else "false",
+        });
+        if (ctx.request_id) |id_val| {
+            try w.writeAll("\"request_id\":");
+            try writeJsonValue(w, id_val);
+            try w.writeByte(',');
+        }
+        try w.writeAll("\"results\":[");
+        for (items[i..end], 0..) |item, j| {
+            if (j > 0) try w.writeByte(',');
+            try w.print(
+                \\{{"path":{f},"score":{f},"snippet":{f}}}
+            , .{
+                std.json.fmt(item.path, .{}),
+                std.json.fmt(item.score, .{}),
+                std.json.fmt(item.snippet, .{}),
+            });
+        }
+        try w.writeAll("]}}");
+        try transport.writeMessage(batch_buf.items);
+        i = end;
+    }
+}
+
+fn writeJsonValue(writer: anytype, v: std.json.Value) !void {
+    switch (v) {
+        .null => try writer.writeAll("null"),
+        .bool => |b| try writer.writeAll(if (b) "true" else "false"),
+        .integer => |n| try writer.print("{d}", .{n}),
+        .float => |f| try writer.print("{d}", .{f}),
+        .string, .number_string => |s| try protocol.writeJsonString(writer, s),
+        else => try writer.writeAll("null"),
+    }
 }
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -1210,6 +1322,51 @@ fn handleDetectChanges(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
         try writer.print("{f}", .{std.json.fmt(change.path, .{})});
     }
     try writer.writeAll("]}}");
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: update_index
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleUpdateIndex(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    _ = params_obj;
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+    const project_path = ctx.project_path orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        return;
+    };
+    const index_dir = ctx.index_dir orelse {
+        try writer.writeAll("{\"error\":\"No index directory resolved for the loaded project.\"}");
+        return;
+    };
+
+    var diff = incremental.detectChanges(ctx.allocator, gdb, project_path) catch {
+        try writer.writeAll("{\"error\":\"Failed to detect changes.\"}");
+        return;
+    };
+    defer diff.deinit();
+
+    const stats = incremental.applyChangesWithOverlay(ctx.allocator, gdb, project_path, index_dir, &diff) catch |err| {
+        try writer.print("{{\"error\":\"applyChangesWithOverlay failed: {s}\"}}", .{@errorName(err)});
+        return;
+    };
+
+    try writer.print(
+        \\{{"added":{},"modified":{},"deleted":{},"symbols_added":{},"edges_added":{},"errors":{},"overlay_docs":{},"overlay_tombstoned":{},"duration_ms":{}}}
+    , .{
+        stats.added,
+        stats.modified,
+        stats.deleted,
+        stats.symbols_added,
+        stats.edges_added,
+        stats.errors,
+        stats.overlay_docs,
+        stats.overlay_tombstoned,
+        stats.duration_ms,
+    });
 }
 
 // ██████████████████████████████████████████████████████████████████████████
