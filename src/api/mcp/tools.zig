@@ -610,10 +610,33 @@ pub fn writeToolsListJson(writer: anytype) !void {
         try writer.writeAll(",\"description\":");
         try protocol.writeJsonString(writer, tool.description);
         try writer.writeAll(",\"inputSchema\":");
-        try writer.writeAll(tool.inputSchema);
+        try writeCompactJson(writer, tool.inputSchema);
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
+}
+
+/// Pass-through writer that strips embedded `\n` / `\r` from a raw JSON
+/// blob so the result fits on a single line.  The MCP spec mandates
+/// newline-free messages on the stdio transport — our tool schemas are
+/// authored as Zig multi-line literals for readability, and would
+/// otherwise emit several physical lines and corrupt framing.  All
+/// non-newline whitespace is preserved (it stays semantically equivalent
+/// JSON).
+fn writeCompactJson(writer: anytype, raw: []const u8) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c == '\n' or c == '\r') {
+            if (i > start) try writer.writeAll(raw[start..i]);
+            // Replace the newline with a single space so the surrounding
+            // tokens stay separated (e.g. `}\n  ,` must not collapse to `},`).
+            try writer.writeByte(' ');
+            start = i + 1;
+        }
+    }
+    if (start < raw.len) try writer.writeAll(raw[start..]);
 }
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -704,10 +727,29 @@ pub fn dispatch(
     } else if (std.mem.eql(u8, tool_name, "set_config")) {
         try handleSetConfig(ctx, params_obj, writer);
     } else {
-        try writer.writeAll("{\"message\":\"Unknown tool: ");
-        try protocol.writeJsonString(writer, tool_name);
+        // Propagate as an error so the caller emits an MCP-compliant
+        // `result.isError: true` envelope.  Embedding the tool name as a
+        // properly-escaped JSON string keeps the body well-formed.
+        try writer.writeAll("{\"error\":\"Unknown tool: ");
+        try writeJsonStringContents(writer, tool_name);
         try writer.writeAll("\"}");
+        return error.UnknownTool;
     }
+}
+
+/// Like `protocol.writeJsonString` but emits the *escaped contents* only —
+/// no surrounding quote bytes.  Used when embedding a string inside a
+/// JSON value we're constructing piece-by-piece.
+fn writeJsonStringContents(writer: anytype, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => try writer.print("\\u{x:0>4}", .{c}),
+        else => try writer.writeByte(c),
+    };
 }
 
 // ██████████████████████████████████████████████████████████████████████████

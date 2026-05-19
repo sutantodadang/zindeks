@@ -64,14 +64,23 @@ pub const Transport = union(enum) {
     pub const MAX_HEADER_LEN = 4096;
     pub const MAX_BODY_LEN = 16 * 1024 * 1024; // 16 MiB
 
-    /// Persistent read buffer.  `readUntilDelimiter` historically called
-    /// `read` directly and only returned the byte range up to the first
-    /// `\n` — anything past that delimiter in the same read was thrown
-    /// away.  Over TCP this rarely mattered because each line arrived in
-    /// its own packet, but a pipe (e.g. `cat | zindeks serve`) drains the
-    /// whole frame in one read and the framing parser would lose the
-    /// body.  We now buffer all reads and carve out lines / fixed-size
-    /// bodies from the buffer.
+    /// Wire-level framing for one MCP session.
+    ///
+    /// The MCP spec for the stdio transport mandates **newline-delimited
+    /// JSON-RPC** — one JSON object per line, no embedded newlines.  An
+    /// earlier draft of this server (and many LSP-derived stacks) used
+    /// **Content-Length** framing instead, so we keep both readers and
+    /// auto-detect on the first message: if the first non-whitespace byte
+    /// is `{` or `[`, the session is newline-delimited; if it looks like
+    /// `Content-Length:`, the session uses LSP framing.  The choice is
+    /// then mirrored on writes so the client sees consistent framing.
+    pub const Framing = enum { unknown, newline, content_length };
+
+    /// Persistent read buffer.  Pipe reads can drain the entire frame in
+    /// one syscall, so a framing parser that only consumes up to the
+    /// first `\n` per call would lose everything after it.  Reads go
+    /// through this buffer; consumers carve out lines / fixed-size
+    /// bodies, and any remainder stays available for the next call.
     pub const ReadBuf = struct {
         data: std.ArrayList(u8) = .{},
         consumed: usize = 0,
@@ -82,6 +91,7 @@ pub const Transport = union(enum) {
         stdin: std.fs.File,
         stdout: std.fs.File,
         read_buf: ReadBuf,
+        framing: Framing,
         write_mutex: std.Thread.Mutex,
     };
 
@@ -89,6 +99,7 @@ pub const Transport = union(enum) {
         allocator: std.mem.Allocator,
         stream: std.net.Stream,
         read_buf: ReadBuf,
+        framing: Framing,
         write_mutex: std.Thread.Mutex,
     };
 
@@ -102,6 +113,7 @@ pub const Transport = union(enum) {
             .stdin = std.fs.File.stdin(),
             .stdout = std.fs.File.stdout(),
             .read_buf = .{},
+            .framing = .unknown,
             .write_mutex = .{},
         } };
     }
@@ -111,6 +123,7 @@ pub const Transport = union(enum) {
             .allocator = allocator,
             .stream = stream,
             .read_buf = .{},
+            .framing = .unknown,
             .write_mutex = .{},
         } };
     }
@@ -129,31 +142,26 @@ pub const Transport = union(enum) {
     /// (allocated, caller owns) or null on EOF / framing error.
     pub fn readMessage(self: *Transport) !?[]u8 {
         switch (self.*) {
-            .stdio => |*s| return readFramed(s.allocator, .{ .file = s.stdin }, &s.read_buf),
-            .socket => |*s| return readFramed(s.allocator, .{ .stream = s.stream }, &s.read_buf),
+            .stdio => |*s| return readFramed(s.allocator, .{ .file = s.stdin }, &s.read_buf, &s.framing),
+            .socket => |*s| return readFramed(s.allocator, .{ .stream = s.stream }, &s.read_buf, &s.framing),
         }
     }
 
-    /// Write a JSON-RPC message with Content-Length framing.  Holds the
-    /// transport's write mutex so concurrent writers do not interleave.
+    /// Write a JSON-RPC message using the framing detected from the
+    /// client.  Holds the transport's write mutex so concurrent writers
+    /// (worker threads streaming partial results) do not interleave.
     pub fn writeMessage(self: *Transport, json: []const u8) !void {
         switch (self.*) {
             .stdio => |*s| {
                 s.write_mutex.lock();
                 defer s.write_mutex.unlock();
-                var header_buf: [256]u8 = undefined;
-                const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {}\r\n\r\n", .{json.len});
-                try s.stdout.writeAll(header);
-                try s.stdout.writeAll(json);
+                try writeFramed(.{ .file = s.stdout }, s.framing, json);
                 s.stdout.sync() catch {};
             },
             .socket => |*s| {
                 s.write_mutex.lock();
                 defer s.write_mutex.unlock();
-                var header_buf: [256]u8 = undefined;
-                const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {}\r\n\r\n", .{json.len});
-                try s.stream.writeAll(header);
-                try s.stream.writeAll(json);
+                try writeFramed(.{ .stream = s.stream }, s.framing, json);
             },
         }
     }
@@ -199,6 +207,18 @@ const ReaderSource = union(enum) {
             .file => |f| f.read(dst),
             .stream => |s| s.read(dst),
         };
+    }
+};
+
+const WriterSink = union(enum) {
+    file: std.fs.File,
+    stream: std.net.Stream,
+
+    fn writeAll(self: WriterSink, bytes: []const u8) !void {
+        switch (self) {
+            .file => |f| try f.writeAll(bytes),
+            .stream => |s| try s.writeAll(bytes),
+        }
     }
 };
 
@@ -256,9 +276,55 @@ fn readExactBuffered(allocator: std.mem.Allocator, src: ReaderSource, rb: *Trans
     }
 }
 
-fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf) !?[]u8 {
-    // Skip any leading blank lines (defensive against clients that emit
-    // a trailing CRLF after the previous frame).
+/// Peek at the first non-whitespace byte in the buffered input without
+/// consuming it.  Used to auto-detect framing on the first message.
+/// Returns `null` on EOF.
+fn peekFirstByte(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf) !?u8 {
+    while (true) {
+        // Skip leading whitespace (incl. CR/LF carried over from a prior
+        // frame) without consuming the framing-significant byte.
+        while (rb.consumed < rb.data.items.len) {
+            const c = rb.data.items[rb.consumed];
+            switch (c) {
+                ' ', '\t', '\r', '\n' => rb.consumed += 1,
+                else => return c,
+            }
+        }
+        refill(allocator, src, rb) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => |e| return e,
+        };
+    }
+}
+
+fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf, framing: *Transport.Framing) !?[]u8 {
+    // Auto-detect on first message; lock in for the rest of the session.
+    if (framing.* == .unknown) {
+        const first = (try peekFirstByte(allocator, src, rb)) orelse return null;
+        framing.* = if (first == '{' or first == '[') .newline else .content_length;
+    }
+    return switch (framing.*) {
+        .newline => try readNewlineFrame(allocator, src, rb),
+        .content_length => try readContentLengthFrame(allocator, src, rb),
+        .unknown => unreachable,
+    };
+}
+
+/// Read one newline-delimited JSON message (the MCP-spec stdio framing).
+fn readNewlineFrame(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf) !?[]u8 {
+    while (true) {
+        const line = readLineBuffered(allocator, src, rb, Transport.MAX_BODY_LEN) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => |e| return e,
+        };
+        const trimmed = std.mem.trimRight(u8, line, " \t\r");
+        if (trimmed.len == 0) continue; // tolerate keep-alive newlines
+        return try allocator.dupe(u8, trimmed);
+    }
+}
+
+/// Read one LSP-style Content-Length-framed message.
+fn readContentLengthFrame(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf) !?[]u8 {
     var content_length: usize = 0;
     while (true) {
         const header_line = readLineBuffered(allocator, src, rb, Transport.MAX_HEADER_LEN) catch |err| switch (err) {
@@ -272,7 +338,6 @@ fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.Re
     }
     if (content_length == 0 or content_length > Transport.MAX_BODY_LEN) return null;
 
-    // Consume header lines + the blank separator.
     while (true) {
         const line = readLineBuffered(allocator, src, rb, Transport.MAX_HEADER_LEN) catch |err| switch (err) {
             error.EndOfStream => return null,
@@ -280,7 +345,6 @@ fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.Re
         };
         const trimmed = std.mem.trimRight(u8, line, " \t\r");
         if (trimmed.len == 0) break;
-        // Additional header line (e.g., Content-Type) — ignored.
     }
 
     const body = try allocator.alloc(u8, content_length);
@@ -290,6 +354,24 @@ fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.Re
         return null;
     };
     return body;
+}
+
+/// Write a single response using the negotiated framing.  Falls back to
+/// newline-delimited when no client message has been processed yet (which
+/// is the MCP-spec default).
+fn writeFramed(sink: WriterSink, framing: Transport.Framing, json: []const u8) !void {
+    switch (framing) {
+        .content_length => {
+            var header_buf: [256]u8 = undefined;
+            const header = try std.fmt.bufPrint(&header_buf, "Content-Length: {}\r\n\r\n", .{json.len});
+            try sink.writeAll(header);
+            try sink.writeAll(json);
+        },
+        .newline, .unknown => {
+            try sink.writeAll(json);
+            try sink.writeAll("\n");
+        },
+    }
 }
 
 fn parseContentLength(line: []const u8) ?usize {
@@ -427,10 +509,37 @@ pub fn writeErrorNoData(writer: anytype, id: ?std.json.Value, code: ErrorCode) !
     try writeError(writer, id, code, code.asStr());
 }
 
+/// Versions of the MCP base protocol this server has been validated
+/// against.  When the client's `protocolVersion` matches one of these we
+/// echo it back; otherwise we fall back to the server default so the
+/// handshake still succeeds (per spec the client decides whether the
+/// negotiated version is acceptable).
+pub const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+};
+pub const DEFAULT_PROTOCOL_VERSION: []const u8 = "2024-11-05";
+
+pub fn negotiateProtocolVersion(client_requested: ?[]const u8) []const u8 {
+    if (client_requested) |req| {
+        for (SUPPORTED_PROTOCOL_VERSIONS) |v| {
+            if (std.mem.eql(u8, v, req)) return v;
+        }
+    }
+    return DEFAULT_PROTOCOL_VERSION;
+}
+
 pub fn writeInitializeResult(writer: anytype, id: ?std.json.Value, name: []const u8, version: []const u8) !void {
+    try writeInitializeResultV(writer, id, name, version, DEFAULT_PROTOCOL_VERSION);
+}
+
+pub fn writeInitializeResultV(writer: anytype, id: ?std.json.Value, name: []const u8, version: []const u8, protocol_version: []const u8) !void {
     try writer.writeAll("{\"jsonrpc\":\"2.0\"");
     try writeId(writer, id);
-    try writer.writeAll(",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":");
+    try writer.writeAll(",\"result\":{\"protocolVersion\":");
+    try writeJsonString(writer, protocol_version);
+    try writer.writeAll(",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":");
     try writeJsonString(writer, name);
     try writer.writeAll(",\"version\":");
     try writeJsonString(writer, version);
@@ -459,6 +568,24 @@ pub fn writeToolResultBegin(writer: anytype, id: ?std.json.Value) !void {
 
 pub fn writeToolResultEnd(writer: anytype) !void {
     try writer.writeAll("}]}}");
+}
+
+/// Emit a full MCP-compliant `tools/call` response in one shot.
+///
+/// The MCP spec requires `result.content[].text` to be a **string**, but
+/// our handlers produce JSON bodies.  We JSON-escape the body into the
+/// `text` field so strict clients accept the response.  When `is_error`
+/// is true, the spec's `result.isError: true` flag is set instead of a
+/// JSON-RPC `error` envelope (the request is well-formed; the tool's
+/// execution is what failed).
+pub fn writeToolResultEnvelope(writer: anytype, id: ?std.json.Value, body: []const u8, is_error: bool) !void {
+    try writer.writeAll("{\"jsonrpc\":\"2.0\"");
+    try writeId(writer, id);
+    try writer.writeAll(",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
+    try writeJsonString(writer, body);
+    try writer.writeAll("}]");
+    if (is_error) try writer.writeAll(",\"isError\":true");
+    try writer.writeAll("}}");
 }
 
 fn writeId(writer: anytype, id: ?std.json.Value) !void {

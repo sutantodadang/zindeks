@@ -178,9 +178,23 @@ pub const Server = struct {
     }
 
     fn handleInitialize(self: *Server, req: protocol.ParsedRequest) !void {
+        // Honor the client's requested protocol version when it is one
+        // we have been validated against; otherwise fall back to our
+        // default.  Per MCP spec, the client decides whether to proceed
+        // after seeing our reply, so echoing the request is a safe win.
+        const requested: ?[]const u8 = blk: {
+            if (req.params) |p| {
+                if (p.get("protocolVersion")) |pv| {
+                    if (pv == .string) break :blk pv.string;
+                }
+            }
+            break :blk null;
+        };
+        const negotiated = protocol.negotiateProtocolVersion(requested);
+
         self.response_buf.shrinkRetainingCapacity(0);
         const writer = self.response_buf.writer(self.allocator);
-        try protocol.writeInitializeResult(writer, req.id, self.info.name, self.info.version);
+        try protocol.writeInitializeResultV(writer, req.id, self.info.name, self.info.version, negotiated);
         try self.transport.writeMessage(self.response_buf.items);
         self.initialized = true;
         // Best-effort auto-detect: pick up an explicit `projectRoots`/`rootUri`
@@ -329,9 +343,12 @@ pub const Server = struct {
         self.state_rwlock.lock();
         defer self.state_rwlock.unlock();
 
-        self.response_buf.shrinkRetainingCapacity(0);
-        const writer = self.response_buf.writer(self.allocator);
-        try protocol.writeToolResultBegin(writer, req.id);
+        // Dispatch into a body buffer first, then wrap with the
+        // MCP-compliant `content[0].text = <JSON-escaped string>`
+        // envelope.  Failures set `result.isError = true` per spec.
+        var body_buf = std.ArrayList(u8).initCapacity(self.allocator, 4096) catch @panic("OOM");
+        defer body_buf.deinit(self.allocator);
+        const body_writer = body_buf.writer(self.allocator);
 
         var ctx = tools.Context{
             .allocator = self.allocator,
@@ -342,12 +359,16 @@ pub const Server = struct {
             .transport = &self.transport,
             .request_id = req.id,
         };
-        tools.dispatch(&ctx, tool_name, args, writer) catch |err| {
-            try writer.writeAll(",\"error\":");
-            try protocol.writeJsonString(writer, @errorName(err));
+        var is_error = false;
+        tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
+            is_error = true;
+            body_buf.shrinkRetainingCapacity(0);
+            body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
         };
 
-        try protocol.writeToolResultEnd(writer);
+        self.response_buf.shrinkRetainingCapacity(0);
+        const writer = self.response_buf.writer(self.allocator);
+        try protocol.writeToolResultEnvelope(writer, req.id, body_buf.items, is_error);
         try self.transport.writeMessage(self.response_buf.items);
 
         if (std.mem.eql(u8, tool_name, "index_repository")) {
@@ -389,9 +410,11 @@ pub const Server = struct {
             &pc.db
         else if (self.gdb != null) &self.gdb.? else null;
 
-        out_buf.shrinkRetainingCapacity(0);
-        const writer = out_buf.writer(self.allocator);
-        try protocol.writeToolResultBegin(writer, id);
+        // Body buffer: handler emits raw JSON; we wrap with MCP-compliant
+        // envelope (text-as-string + isError flag) after dispatch returns.
+        var body_buf = std.ArrayList(u8).initCapacity(self.allocator, 4096) catch @panic("OOM");
+        defer body_buf.deinit(self.allocator);
+        const body_writer = body_buf.writer(self.allocator);
 
         var ctx = tools.Context{
             .allocator = self.allocator,
@@ -402,12 +425,16 @@ pub const Server = struct {
             .transport = &self.transport,
             .request_id = id,
         };
-        tools.dispatch(&ctx, tool_name, args, writer) catch |err| {
-            try writer.writeAll(",\"error\":");
-            try protocol.writeJsonString(writer, @errorName(err));
+        var is_error = false;
+        tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
+            is_error = true;
+            body_buf.shrinkRetainingCapacity(0);
+            body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
         };
 
-        try protocol.writeToolResultEnd(writer);
+        out_buf.shrinkRetainingCapacity(0);
+        const writer = out_buf.writer(self.allocator);
+        try protocol.writeToolResultEnvelope(writer, id, body_buf.items, is_error);
         try self.transport.writeMessage(out_buf.items);
     }
 
