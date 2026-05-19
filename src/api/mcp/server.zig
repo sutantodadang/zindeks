@@ -133,7 +133,6 @@ pub const Server = struct {
         while (try self.transport.readMessage()) |raw| {
             defer self.allocator.free(raw);
             self.handleMessage(raw) catch |err| {
-                // Log the error but keep the server alive; try to send an error response
                 std.log.err("MCP handler error: {s}", .{@errorName(err)});
                 self.respondErrorMaybe(raw, .internal_error) catch |e| {
                     std.log.err("Failed to send error response: {s}", .{@errorName(e)});

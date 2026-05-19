@@ -64,18 +64,31 @@ pub const Transport = union(enum) {
     pub const MAX_HEADER_LEN = 4096;
     pub const MAX_BODY_LEN = 16 * 1024 * 1024; // 16 MiB
 
+    /// Persistent read buffer.  `readUntilDelimiter` historically called
+    /// `read` directly and only returned the byte range up to the first
+    /// `\n` — anything past that delimiter in the same read was thrown
+    /// away.  Over TCP this rarely mattered because each line arrived in
+    /// its own packet, but a pipe (e.g. `cat | zindeks serve`) drains the
+    /// whole frame in one read and the framing parser would lose the
+    /// body.  We now buffer all reads and carve out lines / fixed-size
+    /// bodies from the buffer.
+    pub const ReadBuf = struct {
+        data: std.ArrayList(u8) = .{},
+        consumed: usize = 0,
+    };
+
     pub const Stdio = struct {
         allocator: std.mem.Allocator,
         stdin: std.fs.File,
         stdout: std.fs.File,
-        buf: std.ArrayList(u8),
+        read_buf: ReadBuf,
         write_mutex: std.Thread.Mutex,
     };
 
     pub const Socket = struct {
         allocator: std.mem.Allocator,
         stream: std.net.Stream,
-        buf: std.ArrayList(u8),
+        read_buf: ReadBuf,
         write_mutex: std.Thread.Mutex,
     };
 
@@ -88,7 +101,7 @@ pub const Transport = union(enum) {
             .allocator = allocator,
             .stdin = std.fs.File.stdin(),
             .stdout = std.fs.File.stdout(),
-            .buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
+            .read_buf = .{},
             .write_mutex = .{},
         } };
     }
@@ -97,16 +110,16 @@ pub const Transport = union(enum) {
         return .{ .socket = .{
             .allocator = allocator,
             .stream = stream,
-            .buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
+            .read_buf = .{},
             .write_mutex = .{},
         } };
     }
 
     pub fn deinit(self: *Transport) void {
         switch (self.*) {
-            .stdio => |*s| s.buf.deinit(s.allocator),
+            .stdio => |*s| s.read_buf.data.deinit(s.allocator),
             .socket => |*s| {
-                s.buf.deinit(s.allocator);
+                s.read_buf.data.deinit(s.allocator);
                 s.stream.close();
             },
         }
@@ -116,8 +129,8 @@ pub const Transport = union(enum) {
     /// (allocated, caller owns) or null on EOF / framing error.
     pub fn readMessage(self: *Transport) !?[]u8 {
         switch (self.*) {
-            .stdio => |*s| return readFramed(s.allocator, .{ .file = s.stdin }, &s.buf),
-            .socket => |*s| return readFramed(s.allocator, .{ .stream = s.stream }, &s.buf),
+            .stdio => |*s| return readFramed(s.allocator, .{ .file = s.stdin }, &s.read_buf),
+            .socket => |*s| return readFramed(s.allocator, .{ .stream = s.stream }, &s.read_buf),
         }
     }
 
@@ -187,74 +200,95 @@ const ReaderSource = union(enum) {
             .stream => |s| s.read(dst),
         };
     }
-
-    fn readAll(self: ReaderSource, dst: []u8) !usize {
-        switch (self) {
-            .file => |f| return f.readAll(dst),
-            .stream => |s| {
-                // net.Stream has no readAll; loop until EOF or buffer full.
-                var got: usize = 0;
-                while (got < dst.len) {
-                    const n = try s.read(dst[got..]);
-                    if (n == 0) break;
-                    got += n;
-                }
-                return got;
-            },
-        }
-    }
 };
 
-fn readUntilDelimiter(src: ReaderSource, writer: anytype, delimiter: u8, max_len: usize) !usize {
-    var chunk_buf: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (total < max_len) {
-        const remaining = @min(4096, max_len - total);
-        const n = try src.read(chunk_buf[0..remaining]);
-        if (n == 0) return error.EndOfStream;
-        const chunk = chunk_buf[0..n];
-        if (std.mem.indexOfScalar(u8, chunk, delimiter)) |pos| {
-            try writer.writeAll(chunk[0..pos]);
-            return total + pos;
+/// Read more bytes from the underlying source into the persistent read
+/// buffer.  Compacts already-consumed prefix to keep `read_buf.data`
+/// bounded across long-lived sessions.
+fn refill(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf) !void {
+    if (rb.consumed > 0) {
+        const remaining = rb.data.items.len - rb.consumed;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, rb.data.items[0..remaining], rb.data.items[rb.consumed..]);
         }
-        try writer.writeAll(chunk);
-        total += n;
+        rb.data.shrinkRetainingCapacity(remaining);
+        rb.consumed = 0;
     }
-    return total;
+    var tmp: [4096]u8 = undefined;
+    const n = try src.read(&tmp);
+    if (n == 0) return error.EndOfStream;
+    try rb.data.appendSlice(allocator, tmp[0..n]);
 }
 
-fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, buf: *std.ArrayList(u8)) !?[]u8 {
-    buf.shrinkRetainingCapacity(0);
-    _ = readUntilDelimiter(src, buf.writer(allocator), '\n', Transport.MAX_HEADER_LEN) catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => |e| return e,
-    };
+/// Read one `\n`-terminated line from the buffered source.  Returns the
+/// slice excluding the delimiter; the trailing `\r` (if any) is left in
+/// place so `parseContentLength` can trim it.  Refills the buffer as
+/// needed; errors with `error.EndOfStream` when the source is drained
+/// without producing a full line, or `error.LineTooLong` past `max_len`.
+fn readLineBuffered(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf, max_len: usize) ![]const u8 {
+    while (true) {
+        const slice = rb.data.items[rb.consumed..];
+        if (std.mem.indexOfScalar(u8, slice, '\n')) |pos| {
+            const line_end = rb.consumed + pos;
+            const line = rb.data.items[rb.consumed..line_end];
+            rb.consumed = line_end + 1;
+            return line;
+        }
+        if (rb.data.items.len - rb.consumed >= max_len) return error.LineTooLong;
+        try refill(allocator, src, rb);
+    }
+}
 
-    const header_line = buf.items;
-    if (header_line.len == 0) return null;
+/// Read exactly `dst.len` bytes from the buffered source.  Refills as
+/// needed.
+fn readExactBuffered(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf, dst: []u8) !void {
+    var written: usize = 0;
+    while (written < dst.len) {
+        const avail = rb.data.items.len - rb.consumed;
+        if (avail == 0) {
+            try refill(allocator, src, rb);
+            continue;
+        }
+        const take = @min(avail, dst.len - written);
+        @memcpy(dst[written..][0..take], rb.data.items[rb.consumed..][0..take]);
+        rb.consumed += take;
+        written += take;
+    }
+}
 
-    const content_length = parseContentLength(header_line) orelse {
-        buf.shrinkRetainingCapacity(0);
-        _ = readUntilDelimiter(src, buf.writer(allocator), '\n', Transport.MAX_HEADER_LEN) catch return null;
-        return null;
-    };
-
+fn readFramed(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBuf) !?[]u8 {
+    // Skip any leading blank lines (defensive against clients that emit
+    // a trailing CRLF after the previous frame).
+    var content_length: usize = 0;
+    while (true) {
+        const header_line = readLineBuffered(allocator, src, rb, Transport.MAX_HEADER_LEN) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => |e| return e,
+        };
+        const trimmed = std.mem.trimRight(u8, header_line, " \t\r");
+        if (trimmed.len == 0) continue;
+        content_length = parseContentLength(trimmed) orelse continue;
+        break;
+    }
     if (content_length == 0 or content_length > Transport.MAX_BODY_LEN) return null;
 
-    // Consume the blank line after header
-    buf.shrinkRetainingCapacity(0);
-    _ = readUntilDelimiter(src, buf.writer(allocator), '\n', Transport.MAX_HEADER_LEN) catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => |e| return e,
-    };
+    // Consume header lines + the blank separator.
+    while (true) {
+        const line = readLineBuffered(allocator, src, rb, Transport.MAX_HEADER_LEN) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => |e| return e,
+        };
+        const trimmed = std.mem.trimRight(u8, line, " \t\r");
+        if (trimmed.len == 0) break;
+        // Additional header line (e.g., Content-Type) — ignored.
+    }
 
     const body = try allocator.alloc(u8, content_length);
     errdefer allocator.free(body);
-    const got = try src.readAll(body);
-    if (got != body.len) {
+    readExactBuffered(allocator, src, rb, body) catch {
         allocator.free(body);
         return null;
-    }
+    };
     return body;
 }
 
