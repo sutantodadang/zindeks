@@ -2,10 +2,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zindeks = @import("zindeks");
 
-pub fn main() !void {
+pub fn main() u8 {
     var gpa: std.heap.GeneralPurposeAllocator(.{ .safety = builtin.mode == .Debug }) = .{};
     defer _ = gpa.deinit();
     const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    return mainErr(allocator) catch |err| {
+        // CliError: the handler already printed a clean message; don't dump
+        // a stack trace on top of it.  Other errors bubble through.
+        if (err == error.CliError) return 1;
+        std.debug.print("error: {s}\n", .{@errorName(err)});
+        if (builtin.mode == .Debug) {
+            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
+        }
+        return 1;
+    };
+}
+
+fn mainErr(allocator: std.mem.Allocator) !u8 {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -29,8 +42,9 @@ pub fn main() !void {
             \\Run 'zindeks help' for detailed usage.
             \\
         );
-        return;
+        return 0;
     }
 
     try zindeks.api.cli.cli.run(allocator, args);
+    return 0;
 }

@@ -660,6 +660,9 @@ pub const Context = struct {
     /// to tag each notification's `params.request_id` so the client can
     /// demux when multiple tool calls overlap.
     request_id: ?std.json.Value = null,
+    /// Optional parser pool — when non-null, incremental updates reuse
+    /// TSParser instances instead of allocating/freeing per file.
+    parser_pool: ?*incremental.ParserPool = null,
 };
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -1391,7 +1394,7 @@ fn handleUpdateIndex(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     };
     defer diff.deinit();
 
-    const stats = incremental.applyChangesWithOverlay(ctx.allocator, gdb, project_path, index_dir, &diff) catch |err| {
+    const stats = incremental.applyChangesWithOverlayPooled(ctx.allocator, gdb, project_path, index_dir, &diff, ctx.parser_pool) catch |err| {
         try writer.print("{{\"error\":\"applyChangesWithOverlay failed: {s}\"}}", .{@errorName(err)});
         return;
     };

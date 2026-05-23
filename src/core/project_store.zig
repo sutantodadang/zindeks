@@ -91,6 +91,43 @@ const Lock = struct {
     }
 };
 
+/// Compute the project dir for `repo_path` without creating it.
+/// Returns null when caller passed an explicit `index_dir` (no project dir).
+/// Caller owns the returned slice.
+pub fn projectDirFor(allocator: std.mem.Allocator, repo_path: []const u8, options: Options) !?[]u8 {
+    if (options.index_dir != null) return null;
+    const project_root = try canonicalProjectRoot(allocator, repo_path);
+    defer allocator.free(project_root);
+    const store_root = try defaultStoreRoot(allocator, options.store_root);
+    defer allocator.free(store_root);
+    const project_id = try makeProjectId(allocator, project_root);
+    defer allocator.free(project_id);
+    return try std.fs.path.join(allocator, &.{ store_root, "projects", project_id });
+}
+
+/// Compute the lock file path for `repo_path` without taking the lock.
+/// Used by error reporters to show users which file is blocking them.
+/// Returns null when caller passed an explicit `index_dir` (no lock used).
+pub fn lockPathFor(allocator: std.mem.Allocator, repo_path: []const u8, options: Options) !?[]u8 {
+    const project_dir = (try projectDirFor(allocator, repo_path, options)) orelse return null;
+    defer allocator.free(project_dir);
+    return try std.fs.path.join(allocator, &.{ project_dir, "lock" });
+}
+
+/// Delete a project's stored data (all segments + lock + project.json + current).
+/// Caller is responsible for ensuring no other process holds the project open.
+/// Returns true if a project dir was found and removed, false if there was
+/// nothing to delete.  Errors propagate (permission, IO).
+pub fn deleteProject(allocator: std.mem.Allocator, repo_path: []const u8, options: Options) !bool {
+    const project_dir = (try projectDirFor(allocator, repo_path, options)) orelse return false;
+    defer allocator.free(project_dir);
+    std.fs.deleteTreeAbsolute(project_dir) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub fn prepareWrite(allocator: std.mem.Allocator, repo_path: []const u8, options: Options) !WriteLocation {
     if (options.index_dir) |index_dir| {
         try std.fs.cwd().makePath(index_dir);

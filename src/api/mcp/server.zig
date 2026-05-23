@@ -13,25 +13,102 @@ const graph_db = @import("../../core/storage/graph_db.zig");
 const pool = @import("../../core/storage/pool.zig");
 const project_store = @import("../../core/project_store.zig");
 const version = @import("../../version.zig");
+const incremental = @import("../../core/indexer/incremental.zig");
+const ParserPool = incremental.ParserPool;
 
 const ServerInfo = struct {
     name: []const u8 = "zindeks",
     version: []const u8 = version.version,
 };
 
-/// Tool names that mutate Server-level state (project, engine, overlay,
-/// graph DB schema, on-disk index).  These run inline under an exclusive
-/// state lock; everything else can be dispatched to the thread pool.
-const MUTATING_TOOLS = [_][]const u8{
-    "index_repository",
-    "update_index",
-    "delete_project",
-    "rename_symbol",
+// ─────────────────────────────────────────────────────────────────────────────
+// Lock-mode classification (B2 — fine-grained MCP locks)
+//
+// Lock acquisition order (MUST be respected on every code path that holds
+// more than one lock, to prevent deadlock):
+//
+//   attach_mutex → meta_lock → overlay_rwlock → gdb_rwlock
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How a tool needs to acquire each of the three sub-locks.
+const LockKind = enum { none, shared, exclusive };
+
+const LockMode = struct {
+    /// Does this tool need the top-level attach_mutex?
+    attach: bool = false,
+    /// Does this tool touch project_path / index_dir (meta_lock)?
+    meta: LockKind = .none,
+    /// Does this tool touch idx / overlay / engine (BM25 path)?
+    overlay: LockKind = .none,
+    /// Does this tool touch gdb / pool (graph path)?
+    gdb: LockKind = .none,
+
+    /// True when the tool should be run inline (holding state) rather than
+    /// dispatched to the thread pool.  Exclusive-lock holders run inline so
+    /// they don't block the pool indefinitely.
+    fn isInline(self: LockMode) bool {
+        return self.attach or
+            self.meta == .exclusive or
+            self.overlay == .exclusive or
+            self.gdb == .exclusive;
+    }
 };
 
+fn lockMode(name: []const u8) LockMode {
+    // ── Full re-attach (index_repository, delete_project) ─────────────────
+    // Need attach_mutex + all sub-locks exclusive.
+    if (std.mem.eql(u8, name, "index_repository") or
+        std.mem.eql(u8, name, "delete_project"))
+    {
+        return .{ .attach = true, .meta = .exclusive, .overlay = .exclusive, .gdb = .exclusive };
+    }
+    // ── BM25 overlay writer (update_index) ────────────────────────────────
+    if (std.mem.eql(u8, name, "update_index")) {
+        return .{ .meta = .shared, .overlay = .exclusive };
+    }
+    // ── Graph writer (rename_symbol) ──────────────────────────────────────
+    if (std.mem.eql(u8, name, "rename_symbol")) {
+        return .{ .gdb = .exclusive };
+    }
+    // ── ADR create/update — graph writer ─────────────────────────────────
+    // manage_adr with action=create/update mutates the DB; we conservatively
+    // treat all manage_adr calls as graph-write so we don't have to inspect
+    // the arguments here.
+    if (std.mem.eql(u8, name, "manage_adr")) {
+        return .{ .gdb = .exclusive };
+    }
+    // ── ingest_traces — graph writer ─────────────────────────────────────
+    if (std.mem.eql(u8, name, "ingest_traces")) {
+        return .{ .gdb = .exclusive };
+    }
+    // ── BM25 search (engine/overlay readers) ─────────────────────────────
+    if (std.mem.eql(u8, name, "search_code") or
+        std.mem.eql(u8, name, "semantic_search"))
+    {
+        return .{ .overlay = .shared };
+    }
+    // ── Hybrid: needs both overlay + gdb (shared) ─────────────────────────
+    if (std.mem.eql(u8, name, "hybrid_search")) {
+        return .{ .overlay = .shared, .gdb = .shared };
+    }
+    // ── Pure meta reads (no DB, no engine) ───────────────────────────────
+    if (std.mem.eql(u8, name, "list_projects") or
+        std.mem.eql(u8, name, "get_config") or
+        std.mem.eql(u8, name, "set_config") or
+        std.mem.eql(u8, name, "health_check"))
+    {
+        return .{ .meta = .shared };
+    }
+    // ── Graph readers (all remaining registered tools) ────────────────────
+    // Default: graph shared.  Unknown tools get graph-shared which is safe
+    // (it only prevents concurrent graph writes, not reads or overlay ops).
+    return .{ .gdb = .shared };
+}
+
 fn isMutatingTool(name: []const u8) bool {
-    for (MUTATING_TOOLS) |m| if (std.mem.eql(u8, name, m)) return true;
-    return false;
+    const mode = lockMode(name);
+    return mode.isInline();
 }
 
 pub const Server = struct {
@@ -39,31 +116,61 @@ pub const Server = struct {
     transport: protocol.Transport,
     info: ServerInfo,
     initialized: bool,
+    // ── Guarded by meta_lock ─────────────────────────────────────────────
     project_path: ?[]const u8,
     /// Resolved index directory for the currently loaded project — needed
     /// so `update_index` knows where to rebuild the overlay.
     index_dir: ?[]const u8,
+    // ── Guarded by overlay_rwlock ────────────────────────────────────────
     idx: ?storage.Index,
     overlay: ?overlay_mod.Overlay,
     engine: ?search.Engine,
+    // ── Guarded by gdb_rwlock ────────────────────────────────────────────
     /// Single graph-DB handle used when no pool is available (initialize-
     /// time, schema migrations).  When `pool` is non-null, read-only
     /// handlers acquire from it instead.
     gdb: ?graph_db.GraphDb,
     pool: ?pool.ConnectionPool,
     /// Worker pool for concurrent read-only tool dispatch.  Mutating tools
-    /// run inline on the main loop so they can hold the state write-lock
-    /// without blocking workers indefinitely.
+    /// run inline on the main loop so they can hold their sub-lock(s)
+    /// exclusively without blocking all workers.
     thread_pool: std.Thread.Pool,
     thread_pool_initialized: bool,
-    /// Read-write lock guarding the loaded-project fields above (idx,
-    /// engine, overlay, gdb, pool, project_path, index_dir).  Mutating
-    /// tools take exclusive (write); read-only tools take shared (read).
-    state_rwlock: std.Thread.RwLock,
-    /// Counts in-flight worker jobs so we can drain them before tearing
-    /// down on `deinit`.
-    inflight: std.atomic.Value(u32),
+
+    // ── Fine-grained locks (B2) ──────────────────────────────────────────
+    //
+    // Lock acquisition order (MUST be respected — see lockMode() above):
+    //   attach_mutex → meta_lock → overlay_rwlock → gdb_rwlock
+    //
+    // attach_mutex: held during full project attach/detach (index_repository,
+    //   delete_project).  Serialize these top-level operations; while held,
+    //   acquire all sub-locks exclusively in order.
+    attach_mutex: std.Thread.Mutex,
+    // meta_lock: guards project_path, index_dir.  Only touched on attach/
+    //   detach and by tools that need to read the active project path.
+    meta_lock: std.Thread.Mutex,
+    // overlay_rwlock: guards idx, overlay, engine (BM25 search path).
+    //   Writers: update_index, index_repository, delete_project.
+    //   Readers: search_code, semantic_search, hybrid_search.
+    overlay_rwlock: std.Thread.RwLock,
+    // gdb_rwlock: guards gdb, pool (graph DB path).
+    //   Writers: rename_symbol, manage_adr, ingest_traces, index_repository,
+    //     delete_project.
+    //   Readers: all remaining graph-read tools.
+    gdb_rwlock: std.Thread.RwLock,
+
+    // ── In-flight worker counter (Condition-based, replaces busy-wait) ────
+    /// Counts in-flight worker jobs.  Protected by `inflight_mu`.
+    inflight: u32,
+    inflight_mu: std.Thread.Mutex,
+    inflight_cv: std.Thread.Condition,
+
     response_buf: std.ArrayList(u8),
+
+    /// Long-lived parser pool — reuses TSParser instances across incremental
+    /// index updates so we avoid alloc/free of TSParser + grammar binding per
+    /// file.  Created in init, destroyed in deinit.
+    parser_pool: ParserPool,
 
     /// Per-call pool size — small enough to stay light, big enough to let
     /// a few concurrent search_code calls actually overlap.  Bumped up by
@@ -90,9 +197,15 @@ pub const Server = struct {
             .pool = null,
             .thread_pool = undefined,
             .thread_pool_initialized = false,
-            .state_rwlock = .{},
-            .inflight = std.atomic.Value(u32).init(0),
+            .attach_mutex = .{},
+            .meta_lock = .{},
+            .overlay_rwlock = .{},
+            .gdb_rwlock = .{},
+            .inflight = 0,
+            .inflight_mu = .{},
+            .inflight_cv = .{},
             .response_buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
+            .parser_pool = ParserPool.init(allocator),
         };
     }
 
@@ -109,6 +222,7 @@ pub const Server = struct {
         if (self.idx) |*idx| idx.close();
         if (self.project_path) |p| self.allocator.free(p);
         if (self.index_dir) |p| self.allocator.free(p);
+        self.parser_pool.deinit();
         self.response_buf.deinit(self.allocator);
         self.transport.deinit();
     }
@@ -120,12 +234,24 @@ pub const Server = struct {
     }
 
     fn waitForInflight(self: *Server) void {
-        // Busy-wait with backoff — pool drain ordering is not exposed by
-        // std.Thread.Pool, and we only call this on deinit / before state
-        // mutations, so a few ms of polling is acceptable.
-        while (self.inflight.load(.acquire) > 0) {
-            std.Thread.sleep(std.time.ns_per_ms);
-        }
+        // Condition-based drain: wake immediately when the last in-flight
+        // worker signals the condition variable.  No polling, no sleep.
+        self.inflight_mu.lock();
+        defer self.inflight_mu.unlock();
+        while (self.inflight > 0) self.inflight_cv.wait(&self.inflight_mu);
+    }
+
+    fn inflightIncrement(self: *Server) void {
+        self.inflight_mu.lock();
+        defer self.inflight_mu.unlock();
+        self.inflight += 1;
+    }
+
+    fn inflightDecrement(self: *Server) void {
+        self.inflight_mu.lock();
+        defer self.inflight_mu.unlock();
+        self.inflight -= 1;
+        if (self.inflight == 0) self.inflight_cv.signal();
     }
 
     /// Run the server event loop.  Blocks until stdin closes.
@@ -224,9 +350,18 @@ pub const Server = struct {
         var probe = project_store.resolveRead(self.allocator, project_path, .{}) catch return;
         probe.deinit();
 
+        // Auto-attach at initialize time: acquire all sub-locks exclusively
+        // in documented order (no in-flight workers yet at this point, so
+        // waitForInflight is a no-op, but we call it for correctness).
         self.waitForInflight();
-        self.state_rwlock.lock();
-        defer self.state_rwlock.unlock();
+        self.attach_mutex.lock();
+        defer self.attach_mutex.unlock();
+        self.meta_lock.lock();
+        defer self.meta_lock.unlock();
+        self.overlay_rwlock.lock();
+        defer self.overlay_rwlock.unlock();
+        self.gdb_rwlock.lock();
+        defer self.gdb_rwlock.unlock();
         try self.openProjectByPath(project_path);
     }
 
@@ -335,13 +470,51 @@ pub const Server = struct {
         return true; // worker now owns req
     }
 
-    /// Mutating-tool path: write-lock state, drain any concurrent workers,
-    /// run the handler inline so post-call effects (load/reattach) see a
-    /// quiescent server.
+    /// Inline-tool path: acquire the tool's required sub-lock(s), drain any
+    /// concurrent workers, run the handler, run post-call hooks (project load /
+    /// overlay reattach), then release the locks.
+    ///
+    /// Lock acquisition follows the documented order:
+    ///   attach_mutex → meta_lock → overlay_rwlock → gdb_rwlock
     fn runMutatingTool(self: *Server, req: *protocol.ParsedRequest, tool_name: []const u8, args: ?std.json.ObjectMap) !void {
+        const mode = lockMode(tool_name);
+
+        // Drain workers first so no concurrent reader holds a sub-lock we
+        // are about to acquire exclusively.
         self.waitForInflight();
-        self.state_rwlock.lock();
-        defer self.state_rwlock.unlock();
+
+        // Acquire in documented order, release in reverse via defer.
+        if (mode.attach) self.attach_mutex.lock();
+        defer if (mode.attach) self.attach_mutex.unlock();
+
+        if (mode.meta != .none) self.meta_lock.lock();
+        defer if (mode.meta != .none) self.meta_lock.unlock();
+
+        switch (mode.overlay) {
+            .none => {},
+            .shared => self.overlay_rwlock.lockShared(),
+            .exclusive => self.overlay_rwlock.lock(),
+        }
+        defer {
+            switch (mode.overlay) {
+                .none => {},
+                .shared => self.overlay_rwlock.unlockShared(),
+                .exclusive => self.overlay_rwlock.unlock(),
+            }
+        }
+
+        switch (mode.gdb) {
+            .none => {},
+            .shared => self.gdb_rwlock.lockShared(),
+            .exclusive => self.gdb_rwlock.lock(),
+        }
+        defer {
+            switch (mode.gdb) {
+                .none => {},
+                .shared => self.gdb_rwlock.unlockShared(),
+                .exclusive => self.gdb_rwlock.unlock(),
+            }
+        }
 
         // Dispatch into a body buffer first, then wrap with the
         // MCP-compliant `content[0].text = <JSON-escaped string>`
@@ -358,6 +531,7 @@ pub const Server = struct {
             .index_dir = self.index_dir,
             .transport = &self.transport,
             .request_id = req.id,
+            .parser_pool = &self.parser_pool,
         };
         var is_error = false;
         tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
@@ -385,8 +559,9 @@ pub const Server = struct {
     /// Synchronous fallback for read-only tools when the thread pool
     /// dispatch fails (e.g., OOM under load).  Keeps the loop usable.
     fn runReadOnlyInline(self: *Server, req: *protocol.ParsedRequest, tool_name: []const u8, args: ?std.json.ObjectMap) !void {
-        self.state_rwlock.lockShared();
-        defer self.state_rwlock.unlockShared();
+        const mode = lockMode(tool_name);
+        acquireSharedLocks(self, mode);
+        defer releaseSharedLocks(self, mode);
         try self.runReadOnly(req.id, tool_name, args, &self.response_buf);
     }
 
@@ -424,6 +599,7 @@ pub const Server = struct {
             .index_dir = self.index_dir,
             .transport = &self.transport,
             .request_id = id,
+            .parser_pool = &self.parser_pool,
         };
         var is_error = false;
         tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
@@ -440,9 +616,9 @@ pub const Server = struct {
 
     fn dispatchReadOnly(self: *Server, req: protocol.ParsedRequest, tool_name: []const u8, args: ?std.json.ObjectMap) !void {
         try self.ensureThreadPool();
-        _ = self.inflight.fetchAdd(1, .acq_rel);
+        self.inflightIncrement();
         const owned_name = self.allocator.dupe(u8, tool_name) catch |err| {
-            _ = self.inflight.fetchSub(1, .acq_rel);
+            self.inflightDecrement();
             return err;
         };
         const job = WorkerJob{
@@ -453,7 +629,7 @@ pub const Server = struct {
         };
         self.thread_pool.spawn(workerEntry, .{job}) catch |err| {
             self.allocator.free(owned_name);
-            _ = self.inflight.fetchSub(1, .acq_rel);
+            self.inflightDecrement();
             return err;
         };
     }
@@ -473,11 +649,12 @@ pub const Server = struct {
         defer {
             mut.req.deinit();
             mut.server.allocator.free(mut.tool_name);
-            _ = mut.server.inflight.fetchSub(1, .acq_rel);
+            mut.server.inflightDecrement();
         }
 
-        mut.server.state_rwlock.lockShared();
-        defer mut.server.state_rwlock.unlockShared();
+        const mode = lockMode(mut.tool_name);
+        acquireSharedLocks(mut.server, mode);
+        defer releaseSharedLocks(mut.server, mode);
 
         var local_buf = std.ArrayList(u8).initCapacity(mut.server.allocator, 4096) catch return;
         defer local_buf.deinit(mut.server.allocator);
@@ -497,14 +674,19 @@ pub const Server = struct {
     // Project loading / error responders
     // ██████████████████████████████████████████████████████████████████████
 
-    /// Public entry point: takes the state write-lock and loads the
+    /// Public entry point: acquires all locks exclusively and loads the
     /// project named in `args.path`.  Safe to call from the main loop's
-    /// initialize path or from auto-detect — both happen before workers
-    /// could be in flight, but we still lock for correctness.
+    /// initialize path or from auto-detect.
     pub fn loadProject(self: *Server, args: ?std.json.ObjectMap) !void {
         self.waitForInflight();
-        self.state_rwlock.lock();
-        defer self.state_rwlock.unlock();
+        self.attach_mutex.lock();
+        defer self.attach_mutex.unlock();
+        self.meta_lock.lock();
+        defer self.meta_lock.unlock();
+        self.overlay_rwlock.lock();
+        defer self.overlay_rwlock.unlock();
+        self.gdb_rwlock.lock();
+        defer self.gdb_rwlock.unlock();
         try self.loadProjectLocked(args);
     }
 
@@ -625,6 +807,27 @@ pub const Server = struct {
         try self.respondError(id, code);
     }
 };
+
+// ██████████████████████████████████████████████████████████████████████████
+// Fine-grained lock helpers (B2)
+// ██████████████████████████████████████████████████████████████████████████
+
+/// Acquire the shared (reader) sides of whichever sub-locks `mode` requires.
+/// Lock acquisition order: meta_lock → overlay_rwlock → gdb_rwlock.
+/// (attach_mutex is never needed for read-only paths.)
+fn acquireSharedLocks(server: *Server, mode: LockMode) void {
+    if (mode.meta != .none) server.meta_lock.lock();
+    if (mode.overlay != .none) server.overlay_rwlock.lockShared();
+    if (mode.gdb != .none) server.gdb_rwlock.lockShared();
+}
+
+/// Release the shared sides of whichever sub-locks `mode` requires.
+/// Release order is reverse of acquisition (meta last, gdb first).
+fn releaseSharedLocks(server: *Server, mode: LockMode) void {
+    if (mode.gdb != .none) server.gdb_rwlock.unlockShared();
+    if (mode.overlay != .none) server.overlay_rwlock.unlockShared();
+    if (mode.meta != .none) server.meta_lock.unlock();
+}
 
 // ██████████████████████████████████████████████████████████████████████████
 // Auto-detect helpers

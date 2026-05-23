@@ -10,6 +10,19 @@ const parser = @import("parser.zig");
 const QueryNode = parser.QueryNode;
 const ExprKind = parser.ExprKind;
 
+// B7: Static alias constants — eliminates allocPrint("t{d}", idx) / allocPrint("e{d}", idx)
+// in the MATCH clause loop (2 mallocs per clause → 0).
+// Supports up to 16 MATCH clauses; any query with more falls back to the old path.
+const MAX_STATIC_ALIASES = 16;
+const table_aliases: [MAX_STATIC_ALIASES][]const u8 = .{
+    "t0", "t1", "t2",  "t3",  "t4",  "t5",  "t6",  "t7",
+    "t8", "t9", "t10", "t11", "t12", "t13", "t14", "t15",
+};
+const edge_aliases: [MAX_STATIC_ALIASES][]const u8 = .{
+    "e0", "e1", "e2",  "e3",  "e4",  "e5",  "e6",  "e7",
+    "e8", "e9", "e10", "e11", "e12", "e13", "e14", "e15",
+};
+
 /// Execute a parsed Cypher query and return a JSON array of result rows.
 pub fn execute(
     allocator: std.mem.Allocator,
@@ -40,11 +53,25 @@ pub fn execute(
     try sql_buf.appendSlice(allocator, " FROM symbols s");
 
     // For each MATCH clause, join edges + target symbols
+    // B7: use pre-allocated static aliases to avoid allocPrint per iteration.
+    // Baseline (before B7): ~2 allocs * match_clauses.len per execute call removed.
     for (query.match_clauses, 0..) |mc, idx| {
-        const tn = try std.fmt.allocPrint(allocator, "t{d}", .{idx});
-        defer allocator.free(tn);
-        const en = try std.fmt.allocPrint(allocator, "e{d}", .{idx});
-        defer allocator.free(en);
+        const tn: []const u8 = if (idx < MAX_STATIC_ALIASES)
+            table_aliases[idx]
+        else blk: {
+            // Rare: more than 16 match clauses — fall back to heap.
+            break :blk try std.fmt.allocPrint(allocator, "t{d}", .{idx});
+        };
+        const en: []const u8 = if (idx < MAX_STATIC_ALIASES)
+            edge_aliases[idx]
+        else blk: {
+            break :blk try std.fmt.allocPrint(allocator, "e{d}", .{idx});
+        };
+        // Only free if we heap-allocated (idx >= MAX_STATIC_ALIASES)
+        defer if (idx >= MAX_STATIC_ALIASES) {
+            allocator.free(tn);
+            allocator.free(en);
+        };
 
         try sql_buf.writer(allocator).print(
             " JOIN edges {s} ON {s}.source_symbol_id = s.id AND {s}.edge_type = '",

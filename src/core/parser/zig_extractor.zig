@@ -10,6 +10,7 @@
 const std = @import("std");
 const ts = @import("tree_sitter.zig");
 const extractor_mod = @import("extractor.zig");
+const parser_pool = @import("parser_pool.zig");
 
 const ExtractedSymbol = extractor_mod.ExtractedSymbol;
 const ExtractedEdge = extractor_mod.ExtractedEdge;
@@ -21,8 +22,15 @@ const EdgeKind = extractor_mod.EdgeKind;
 // Extraction logic
 // ██████████████████████████████████████████████████████████████████████████
 
-/// Extract all symbols and edges from Zig source code.
-pub fn extract(allocator: std.mem.Allocator, source: []const u8, lang: ts.LanguageId) anyerror!ExtractionResult {
+/// Extract all symbols and edges from Zig source code using an optional pool.
+/// When `pool` is non-null, parsers are acquired from / released to the pool.
+/// When null, a fresh parser is created and destroyed for this call.
+pub fn extractWithPool(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    lang: ts.LanguageId,
+    pool: ?*parser_pool.ParserPool,
+) anyerror!ExtractionResult {
     std.debug.assert(lang == .zig);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -32,11 +40,23 @@ pub fn extract(allocator: std.mem.Allocator, source: []const u8, lang: ts.Langua
     var symbols = std.ArrayList(ExtractedSymbol).initCapacity(allocator, 64) catch @panic("OOM");
     var edges = std.ArrayList(ExtractedEdge).initCapacity(allocator, 32) catch @panic("OOM");
 
-    // Parse with tree-sitter
-    const language = ts.languageForId(.zig) orelse return error.NoGrammarLinked;
-    var parser = ts.Parser.init() catch return error.ParserInitFailed;
-    defer parser.deinit();
-    parser.setLanguage(language) catch return error.IncompatibleLanguageVersion;
+    // Acquire or create a parser for this call.
+    var parser: ts.Parser = if (pool) |p|
+        try p.acquire(lang)
+    else blk: {
+        const language = ts.languageForId(.zig) orelse return error.NoGrammarLinked;
+        var fresh = ts.Parser.init() catch return error.ParserInitFailed;
+        fresh.setLanguage(language) catch {
+            fresh.deinit();
+            return error.IncompatibleLanguageVersion;
+        };
+        break :blk fresh;
+    };
+    defer if (pool) |p| {
+        p.release(lang, parser);
+    } else {
+        parser.deinit();
+    };
 
     var tree = parser.parseString(source) catch return error.ParseFailed;
     defer tree.deinit();
@@ -291,6 +311,13 @@ pub fn extract(allocator: std.mem.Allocator, source: []const u8, lang: ts.Langua
         .language = .zig,
         .errors = error_count,
     };
+}
+
+/// Public extract function matching the ExtractFn signature (no pool).
+/// Calls extractWithPool with pool=null — creates a fresh parser each time.
+/// Use extractWithPool directly when a ParserPool is available.
+pub fn extract(allocator: std.mem.Allocator, source: []const u8, lang: ts.LanguageId) anyerror!ExtractionResult {
+    return extractWithPool(allocator, source, lang, null);
 }
 
 // ██████████████████████████████████████████████████████████████████████████

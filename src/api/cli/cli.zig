@@ -15,6 +15,10 @@ const errors = @import("errors.zig");
 const config_mod = @import("../../core/config.zig");
 const completions = @import("completions.zig");
 const version = @import("../../version.zig");
+const install_cmd = @import("install/install.zig");
+const uninstall_cmd = @import("install/uninstall.zig");
+const doctor_cmd = @import("install/doctor.zig");
+const bench_cmd = @import("bench.zig");
 
 /// Runtime state passed through the CLI pipeline.
 const CliState = struct {
@@ -97,6 +101,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try runUpdate(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "completions")) {
         try runCompletions(&state, args[global.cmd_index + 1 ..]);
+    } else if (std.mem.eql(u8, cmd, "install")) {
+        try runInstall(&state, args[global.cmd_index + 1 ..]);
+    } else if (std.mem.eql(u8, cmd, "uninstall")) {
+        try runUninstall(&state, args[global.cmd_index + 1 ..]);
+    } else if (std.mem.eql(u8, cmd, "doctor")) {
+        try runDoctor(&state, args[global.cmd_index + 1 ..]);
+    } else if (std.mem.eql(u8, cmd, "bench")) {
+        try bench_cmd.run(state.allocator, args[global.cmd_index + 1 ..]);
     } else {
         return fmtError(state.colors_enabled, errors.invalidArgs("Unknown command"), std.fs.File.stderr().deprecatedWriter());
     }
@@ -188,14 +200,56 @@ fn loadConfig(allocator: std.mem.Allocator, explicit_path: []const u8) !config_m
 
 fn runIndex(state: *CliState, args: []const []const u8) !void {
     const parsed = try parseIndexArgs(state, args);
-    var location = try project_store.prepareWrite(state.allocator, parsed.repo, .{
-        .index_dir = parsed.index_dir,
-        .store_root = parsed.store_root,
-    });
-    defer location.deinit();
 
     var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stderr().deprecatedWriter())).init(std.fs.File.stderr().deprecatedWriter());
     sw.setColors(state.colors_enabled);
+
+    // --force: delete the project's existing index dir before starting.
+    // Honored only when using the default store (--index-dir bypasses).
+    if (parsed.force and parsed.index_dir == null) {
+        const removed = project_store.deleteProject(state.allocator, parsed.repo, .{
+            .store_root = parsed.store_root,
+        }) catch |err| {
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            try stderr.print(
+                \\error: --force could not remove the existing index ({s}).
+                \\       If 'zindeks serve' is running in your editor, stop it first.
+                \\
+            , .{@errorName(err)});
+            return error.CliError;
+        };
+        if (removed) {
+            try sw.print("{s}Removed existing index for '{s}'.{s}\n", .{ sw.dim(), parsed.repo, sw.reset() });
+        }
+    }
+
+    var location = project_store.prepareWrite(state.allocator, parsed.repo, .{
+        .index_dir = parsed.index_dir,
+        .store_root = parsed.store_root,
+    }) catch |err| switch (err) {
+        error.ProjectIndexLocked => {
+            const lock_path = project_store.lockPathFor(state.allocator, parsed.repo, .{
+                .index_dir = parsed.index_dir,
+                .store_root = parsed.store_root,
+            }) catch null;
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            if (lock_path) |p| {
+                defer state.allocator.free(p);
+                try stderr.print(
+                    \\error: another zindeks process is indexing this project
+                    \\       (lock file: {s})
+                    \\       If no other zindeks process is running, delete the lock file and retry.
+                    \\       If 'zindeks serve' is running in your editor, stop it first.
+                    \\
+                , .{p});
+            } else {
+                try stderr.writeAll("error: ProjectIndexLocked — another zindeks process holds the lock for this project.\n");
+            }
+            return error.CliError;
+        },
+        else => return err,
+    };
+    defer location.deinit();
 
     try sw.print("{s}Indexing '{s}'...{s}\n", .{ sw.bold(), parsed.repo, sw.reset() });
 
@@ -251,9 +305,23 @@ fn runReindex(state: *CliState, args: []const []const u8) !void {
 
     var gdb = try graph_db.GraphDb.open(graph_path_z);
     defer gdb.close();
-    try gdb.migrate();
+    // migrate() runs ALTER TABLE ADD COLUMN steps that fail on a fully-migrated
+    // DB.  The CREATE TABLE IF NOT EXISTS steps are idempotent; the ALTERs are
+    // intentionally re-runnable-failing.  Swallow the error so re-opening an
+    // existing index works.
+    gdb.migrate() catch {};
 
-    var diff = try incremental.detectChanges(state.allocator, &gdb, parsed.repo);
+    var diff = incremental.detectChanges(state.allocator, &gdb, parsed.repo) catch |err| {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        try stderr.print(
+            \\error: detectChanges failed ({s}) — SQLite says: {s}
+            \\       Index dir: {s}
+            \\       This usually means the index was built by an older zindeks version,
+            \\       or the graph.db is open in another process ('zindeks serve' from your editor).
+            \\
+        , .{ @errorName(err), gdb.errmsg(), location.index_dir });
+        return error.CliError;
+    };
     defer diff.deinit();
 
     try sw.print(
@@ -466,12 +534,56 @@ fn runCompletions(state: *CliState, args: []const []const u8) !void {
     }
 }
 
+// ── Subcommand: install ───────────────────────────────────────────────
+
+fn runInstall(state: *CliState, args: []const []const u8) !void {
+    if (args.len > 0 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help"))) {
+        var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stdout().deprecatedWriter())).init(std.fs.File.stdout().deprecatedWriter());
+        sw.setColors(state.colors_enabled);
+        return install_cmd.usage(sw);
+    }
+    var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stdout().deprecatedWriter())).init(std.fs.File.stdout().deprecatedWriter());
+    sw.setColors(state.colors_enabled);
+    try install_cmd.run(state.allocator, args, sw, state.colors_enabled);
+}
+
+// ── Subcommand: uninstall ─────────────────────────────────────────────
+
+fn runUninstall(state: *CliState, args: []const []const u8) !void {
+    if (args.len > 0 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help"))) {
+        var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stdout().deprecatedWriter())).init(std.fs.File.stdout().deprecatedWriter());
+        sw.setColors(state.colors_enabled);
+        return uninstall_cmd.usage(sw);
+    }
+    var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stdout().deprecatedWriter())).init(std.fs.File.stdout().deprecatedWriter());
+    sw.setColors(state.colors_enabled);
+    try uninstall_cmd.run(state.allocator, args, sw, state.colors_enabled);
+}
+
+// ── Subcommand: doctor ────────────────────────────────────────────────
+
+fn runDoctor(state: *CliState, args: []const []const u8) !void {
+    if (args.len > 0 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help"))) {
+        var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stdout().deprecatedWriter())).init(std.fs.File.stdout().deprecatedWriter());
+        sw.setColors(state.colors_enabled);
+        return doctor_cmd.usage(sw);
+    }
+    var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stdout().deprecatedWriter())).init(std.fs.File.stdout().deprecatedWriter());
+    sw.setColors(state.colors_enabled);
+    const all_ok = try doctor_cmd.run(state.allocator, args, sw, state.colors_enabled);
+    if (!all_ok) return error.CliError;
+}
+
 // ── Argument parsing helpers ──────────────────────────────────────────
 
 const IndexArgs = struct {
     repo: []const u8 = ".",
     index_dir: ?[]const u8 = null,
     store_root: ?[]const u8 = null,
+    /// `--force` / `-f`: delete the project's existing index dir before
+    /// running, then start a fresh full index.  Honored by `index` only;
+    /// `reindex` ignores it.
+    force: bool = false,
 };
 
 fn parseIndexArgs(state: *CliState, args: []const []const u8) !IndexArgs {
@@ -498,6 +610,8 @@ fn parseIndexArgs(state: *CliState, args: []const []const u8) !IndexArgs {
             // Already handled in global, skip
         } else if (std.mem.eql(u8, arg, "--config")) {
             i += 1; // skip value already consumed
+        } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
+            parsed.force = true;
         } else {
             if (positional_len >= 2) return error.InvalidArguments;
             positional[positional_len] = arg;
@@ -614,14 +728,20 @@ fn usage(sw: anytype) !void {
         \\{s}zindeks {s}{s} — Local code knowledge graph engine
         \\
         \\{s}Commands:{s}
-        \\  index [repo]              Index a repository
+        \\  index [repo] [--force]    Index a repository (--force / -f wipes existing index first)
         \\  reindex [repo]            Incremental update of an existing index
         \\  search <query> [repo]     Search indexed code (BM25)
         \\  serve [--port N|--socket P]
         \\                            Start MCP JSON-RPC server (stdio by default,
         \\                            TCP with --port, Unix socket with --socket)
+        \\  install [--host <id,...>] [--scope user|project|both] [--yes] [--dry-run]
+        \\                            Wire zindeks into AI host MCP configs
+        \\  uninstall [--host <id,...>] [--scope user|project|both]
+        \\                            Remove zindeks from AI host MCP configs
+        \\  doctor                    Health check: PATH, MCP entries, index, server
         \\  update                    Update zindeks to latest version
         \\  completions <shell>       Generate shell completions (bash|zsh|fish)
+        \\  bench <scenario> [args]   Run performance benchmarks (cold-index, detect-changes-synthetic, cypher-cache, snippet-cache)
         \\  help                      Show this help
         \\
         \\{s}Global flags:{s}
@@ -630,6 +750,11 @@ fn usage(sw: anytype) !void {
         \\  --config <path>           Specify config file path
         \\  --store-root <path>       Custom index store root
         \\  --index-dir <path>        Explicit index directory
+        \\
+        \\{s}AI agent setup (one command):{s}
+        \\  zindeks install                    # interactive host picker
+        \\  zindeks install --host claude-code --scope both --yes
+        \\  zindeks doctor                     # verify installation
         \\
         \\{s}Shell completions:{s}
         \\  zindeks completions bash  →  ~/.bash_completion.d/zindeks
@@ -643,6 +768,7 @@ fn usage(sw: anytype) !void {
         \\
     , .{
         sw.bold(), version.version, sw.reset(),
+        sw.bold(), sw.reset(),
         sw.bold(), sw.reset(),
         sw.bold(), sw.reset(),
         sw.bold(), sw.reset(),

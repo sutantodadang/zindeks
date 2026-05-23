@@ -17,7 +17,15 @@ pub fn generateBash(writer: anytype) !void {
         \\            COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
         \\            return
         \\            ;;
-        \\        index|search|serve|update|help)
+        \\        install|uninstall)
+        \\            COMPREPLY=($(compgen -W "--host --scope --yes --dry-run --list-hosts" -- "$cur"))
+        \\            return
+        \\            ;;
+        \\        bench)
+        \\            COMPREPLY=($(compgen -W "cold-index detect-changes-synthetic cypher-cache snippet-cache" -- "$cur"))
+        \\            return
+        \\            ;;
+        \\        index|search|serve|update|help|doctor)
         \\            return
         \\            ;;
         \\    esac
@@ -27,7 +35,7 @@ pub fn generateBash(writer: anytype) !void {
         \\        return
         \\    fi
         \\
-        \\    COMPREPLY=($(compgen -W "index search serve update help completions" -- "$cur"))
+        \\    COMPREPLY=($(compgen -W "index search serve install uninstall doctor update help completions bench" -- "$cur"))
         \\}
         \\
         \\complete -F _zindeks_completion zindeks
@@ -46,9 +54,13 @@ pub fn generateZsh(writer: anytype) !void {
         \\        'index:Index a repository'
         \\        'search:Search indexed code'
         \\        'serve:Start MCP JSON-RPC server'
+        \\        'install:Wire zindeks into AI host MCP configs'
+        \\        'uninstall:Remove zindeks from AI host MCP configs'
+        \\        'doctor:Health check for zindeks installation'
         \\        'update:Update zindeks to latest version'
         \\        'help:Show help'
         \\        'completions:Generate shell completions'
+        \\        'bench:Run performance benchmarks'
         \\    )
         \\
         \\    local -a global_opts
@@ -98,14 +110,29 @@ pub fn generateFish(writer: anytype) !void {
         \\complete -c zindeks -n "__fish_use_subcommand" -a index -d "Index a repository"
         \\complete -c zindeks -n "__fish_use_subcommand" -a search -d "Search indexed code"
         \\complete -c zindeks -n "__fish_use_subcommand" -a serve -d "Start MCP JSON-RPC server"
+        \\complete -c zindeks -n "__fish_use_subcommand" -a install -d "Wire zindeks into AI host MCP configs"
+        \\complete -c zindeks -n "__fish_use_subcommand" -a uninstall -d "Remove zindeks from AI host MCP configs"
+        \\complete -c zindeks -n "__fish_use_subcommand" -a doctor -d "Health check for zindeks installation"
         \\complete -c zindeks -n "__fish_use_subcommand" -a update -d "Update zindeks to latest version"
         \\complete -c zindeks -n "__fish_use_subcommand" -a help -d "Show help"
         \\complete -c zindeks -n "__fish_use_subcommand" -a completions -d "Generate shell completions"
+        \\complete -c zindeks -n "__fish_use_subcommand" -a bench -d "Run performance benchmarks"
+        \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a cold-index -d "Time full index of a path"
+        \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a detect-changes-synthetic -d "Time detectChanges over synthetic files"
+        \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a cypher-cache -d "Time repeated Cypher MATCH query (validates B7)"
+        \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a snippet-cache -d "Time repeated search_code (validates B8)"
         \\
         \\# Completions subcommand options
         \\complete -c zindeks -n "__fish_seen_subcommand_from completions" -a bash -d "Bash completion"
         \\complete -c zindeks -n "__fish_seen_subcommand_from completions" -a zsh -d "Zsh completion"
         \\complete -c zindeks -n "__fish_seen_subcommand_from completions" -a fish -d "Fish completion"
+        \\
+        \\# Install/uninstall options
+        \\complete -c zindeks -n "__fish_seen_subcommand_from install uninstall" -l host -d "Host ID(s)" -r
+        \\complete -c zindeks -n "__fish_seen_subcommand_from install uninstall" -l scope -d "Scope: user, project, both" -r
+        \\complete -c zindeks -n "__fish_seen_subcommand_from install" -l yes -d "Skip prompts"
+        \\complete -c zindeks -n "__fish_seen_subcommand_from install" -l dry-run -d "Print changes without writing"
+        \\complete -c zindeks -n "__fish_seen_subcommand_from install" -l list-hosts -d "Show supported hosts"
         \\
     );
 }

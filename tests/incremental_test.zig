@@ -210,7 +210,7 @@ test "applyChanges removeFileFromGraph only deletes the targeted file" {
     };
     defer drop_only.deinit();
 
-    _ = try incremental.applyChanges(allocator, &db, real_path, &drop_only);
+    _ = try incremental.applyChanges(allocator, &db, real_path, &drop_only, null);
 
     const remaining_docs = try db.queryScalar("SELECT COUNT(*) FROM documents");
     try std.testing.expectEqual(@as(i64, 1), remaining_docs);

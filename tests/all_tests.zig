@@ -16,4 +16,5 @@ test {
     _ = @import("search_phase2_test.zig");
     _ = @import("overlay_test.zig");
     _ = @import("mcp_protocol_test.zig");
+    _ = @import("install_test.zig");
 }

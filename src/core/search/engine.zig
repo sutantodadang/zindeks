@@ -107,6 +107,89 @@ const ScoredDoc = struct {
     path: []const u8,
 };
 
+// ── B8: Snippet LRU cache ─────────────────────────────────────────────────
+//
+// Keyed by (doc_id, first 16 bytes of first query term) → content slice.
+// Content slices point into the mmap'd index (stable for the engine lifetime),
+// so no allocation is needed for the values.
+//
+// LRU eviction: 256-entry ring buffer tracks insertion order; on overflow,
+// the oldest key is removed from the hash map.
+//
+// Thread safety: Mutex-protected.
+
+pub const SnippetCacheKey = struct {
+    doc_id: u32,
+    term: [16]u8,
+    term_len: u8,
+
+    pub fn init(doc_id: u32, first_term: []const u8) SnippetCacheKey {
+        var k = SnippetCacheKey{ .doc_id = doc_id, .term = undefined, .term_len = undefined };
+        const n = @min(first_term.len, 16);
+        @memcpy(k.term[0..n], first_term[0..n]);
+        if (n < 16) @memset(k.term[n..], 0);
+        k.term_len = @intCast(n);
+        return k;
+    }
+};
+
+const SNIPPET_LRU_CAP = 256;
+
+pub const SnippetLruCache = struct {
+    mu: std.Thread.Mutex,
+    map: std.AutoHashMapUnmanaged(SnippetCacheKey, []const u8),
+    ring: [SNIPPET_LRU_CAP]SnippetCacheKey,
+    ring_head: usize, // next write position (oldest entry)
+    count: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) SnippetLruCache {
+        return .{
+            .mu = .{},
+            .map = .{},
+            .ring = undefined,
+            .ring_head = 0,
+            .count = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *SnippetLruCache) void {
+        self.map.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Look up cached snippet. Returns null on miss.
+    pub fn get(self: *SnippetLruCache, key: SnippetCacheKey) ?[]const u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.map.get(key);
+    }
+
+    /// Insert a snippet. Evicts the oldest entry when at capacity.
+    pub fn put(self: *SnippetLruCache, key: SnippetCacheKey, value: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        // Already cached?
+        if (self.map.contains(key)) return;
+
+        if (self.count >= SNIPPET_LRU_CAP) {
+            // Evict oldest
+            const evict_key = self.ring[self.ring_head];
+            _ = self.map.remove(evict_key);
+            // count stays the same — we replace
+        } else {
+            self.count += 1;
+        }
+
+        self.ring[self.ring_head] = key;
+        self.ring_head = (self.ring_head + 1) % SNIPPET_LRU_CAP;
+
+        self.map.put(self.allocator, key, value) catch {};
+    }
+};
+
 /// Bounded cache mapping normalized term → (df, postings slice).
 ///
 /// Postings are slices into the mmap'd index file and remain valid for the
@@ -160,6 +243,12 @@ pub const Engine = struct {
     /// scored with their doc-id offset by `base.docCount()` so the merged
     /// result list has unique IDs.
     overlay: ?*overlay_mod.Overlay = null,
+    /// B8: Optional snippet LRU cache. Owned by the Engine when non-null.
+    /// Initialize via Engine.initWithSnippetCache or attach via useSnippetCache.
+    snippet_cache: ?*SnippetLruCache = null,
+    /// Allocator stored for snippet_cache ownership (used in deinit).
+    _snippet_cache_owned: bool = false,
+    _snippet_cache_allocator: std.mem.Allocator = undefined,
 
     pub fn init(index: *const storage.Index) Engine {
         return .{
@@ -168,6 +257,37 @@ pub const Engine = struct {
             .k1 = BM25_DEFAULTS.k1,
             .b = BM25_DEFAULTS.b,
         };
+    }
+
+    /// Create an engine with snippet LRU cache allocated and owned by the engine.
+    pub fn initWithSnippetCache(index: *const storage.Index, allocator: std.mem.Allocator) !Engine {
+        const cache_ptr = try allocator.create(SnippetLruCache);
+        cache_ptr.* = SnippetLruCache.init(allocator);
+        return .{
+            .index = index,
+            .avg_doc_len = index.avgDocLength(),
+            .k1 = BM25_DEFAULTS.k1,
+            .b = BM25_DEFAULTS.b,
+            .snippet_cache = cache_ptr,
+            ._snippet_cache_owned = true,
+            ._snippet_cache_allocator = allocator,
+        };
+    }
+
+    /// Attach an externally managed snippet cache.
+    pub fn useSnippetCache(self: *Engine, cache: *SnippetLruCache) void {
+        self.snippet_cache = cache;
+        self._snippet_cache_owned = false;
+    }
+
+    /// Free owned resources (snippet cache if owned).
+    pub fn deinit(self: *Engine) void {
+        if (self._snippet_cache_owned) {
+            if (self.snippet_cache) |c| {
+                c.deinit();
+                self._snippet_cache_allocator.destroy(c);
+            }
+        }
     }
 
     /// Create an engine with custom BM25 parameters.
@@ -674,11 +794,37 @@ pub const Engine = struct {
     /// Overlay-aware wrapper used by callers that already hold a *merged*
     /// doc id (i.e. ids >= base.docCount() refer to the overlay).
     fn snippetFor(self: *Engine, combined_id: u32, query: []const u8) []const u8 {
+        // B8: check snippet LRU cache before scanning content
+        if (self.snippet_cache) |cache| {
+            const key = SnippetCacheKey.init(combined_id, extractFirstTerm(query));
+            if (cache.get(key)) |hit| return hit;
+            const result = self.snippetFromContent(self.fileContentFor(combined_id), query);
+            cache.put(key, result);
+            return result;
+        }
         return self.snippetFromContent(self.fileContentFor(combined_id), query);
     }
 
     fn snippet(self: *Engine, doc_id: u32, query: []const u8) []const u8 {
+        // B8: check snippet LRU cache before scanning content
+        if (self.snippet_cache) |cache| {
+            const key = SnippetCacheKey.init(doc_id, extractFirstTerm(query));
+            if (cache.get(key)) |hit| return hit;
+            const result = self.snippetFromContent(self.index.fileContent(doc_id), query);
+            cache.put(key, result);
+            return result;
+        }
         return self.snippetFromContent(self.index.fileContent(doc_id), query);
+    }
+
+    /// Extract the first alphanumeric token from a query string.
+    /// Returns a slice into `query` (zero-length on empty/no-token queries).
+    fn extractFirstTerm(query: []const u8) []const u8 {
+        var i: usize = 0;
+        while (i < query.len and !std.ascii.isAlphanumeric(query[i])) i += 1;
+        const start = i;
+        while (i < query.len and std.ascii.isAlphanumeric(query[i])) i += 1;
+        return query[start..i];
     }
 
     fn snippetFromContent(self: *Engine, content: []const u8, query: []const u8) []const u8 {

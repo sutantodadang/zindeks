@@ -175,7 +175,10 @@ pub const Writer = struct {
     pub const StreamHandle = struct {
         doc_id: u32,
         hasher: std.hash.Wyhash,
-        per_doc_arena: std.heap.ArenaAllocator,
+        // Heap-allocated so the arena's address is stable.  per_doc.allocator
+        // captures &per_doc_arena.* — storing the arena by value would dangle
+        // the captured pointer once the StreamHandle was returned/copied.
+        per_doc_arena: *std.heap.ArenaAllocator,
         per_doc: std.AutoHashMap(u32, TokenAccum),
         /// Carry-over for an identifier that started near the end of the
         /// previous chunk and may continue into the next one.  Capped at
@@ -206,7 +209,9 @@ pub const Writer = struct {
             .import_len = 0,
             .token_count = 0,
         } });
-        var per_doc_arena = std.heap.ArenaAllocator.init(self.parent_allocator);
+        const per_doc_arena = try self.parent_allocator.create(std.heap.ArenaAllocator);
+        errdefer self.parent_allocator.destroy(per_doc_arena);
+        per_doc_arena.* = std.heap.ArenaAllocator.init(self.parent_allocator);
         errdefer per_doc_arena.deinit();
         const per_doc = std.AutoHashMap(u32, TokenAccum).init(per_doc_arena.allocator());
         return .{
@@ -296,6 +301,7 @@ pub const Writer = struct {
 
         handle.per_doc.deinit();
         handle.per_doc_arena.deinit();
+        self.parent_allocator.destroy(handle.per_doc_arena);
     }
 
     pub fn addFile(self: *Writer, path: []const u8, hash: u64, mtime: i64, content: []const u8) !u32 {
@@ -379,7 +385,11 @@ pub const Writer = struct {
         try self.string_offsets.append(self.allocator, @intCast(off));
         try self.strings.appendSlice(self.allocator, value);
         try self.strings.append(self.allocator, 0);
-        const key = self.strings.items[off .. off + value.len];
+        // Stable key: slicing into self.strings dangled when the ArrayList
+        // grew, despite living in an arena — repro was the indexer panicking
+        // on duplicate keys during string_ids.grow rehash.  A standalone arena
+        // dupe per unique token is bounded and never reallocated.
+        const key = try self.allocator.dupe(u8, value);
         try self.string_ids.put(self.allocator, key, sid);
         return sid;
     }
@@ -824,7 +834,7 @@ pub const MappedFile = struct {
             return openWindows(allocator, file, size);
         }
 
-        return openPosix(allocator, file, size) catch {
+        return openPosix(allocator, file, size, name) catch {
             try file.seekTo(0);
             const bytes = try file.readToEndAlloc(allocator, 1 << 34);
             return .{ .allocator = allocator, .bytes = bytes, .mode = .allocated };
@@ -846,7 +856,25 @@ pub const MappedFile = struct {
         }
     }
 
-    fn openPosix(allocator: std.mem.Allocator, file: std.fs.File, size: usize) !MappedFile {
+    /// B6: Posix madvise hints based on the index file name.
+    /// - posting.idx  → MADV_RANDOM  (BM25 walks scattered posting lists)
+    /// - content.idx  → MADV_SEQUENTIAL (snippet reads scan forward)
+    /// - other files  → no hint (small / varied access pattern)
+    fn posixMadvise(mapped: []u8, name: []const u8) void {
+        if (comptime builtin.os.tag == .windows) return;
+        if (mapped.len == 0) return;
+
+        const advice: u32 = blk: {
+            if (std.mem.eql(u8, name, "posting.idx")) break :blk std.posix.MADV.RANDOM;
+            if (std.mem.eql(u8, name, "content.idx")) break :blk std.posix.MADV.SEQUENTIAL;
+            // meta.idx, symbol.idx, graph.idx — no hint
+            return;
+        };
+
+        std.posix.madvise(@alignCast(mapped.ptr), mapped.len, advice) catch {};
+    }
+
+    fn openPosix(allocator: std.mem.Allocator, file: std.fs.File, size: usize, name: []const u8) !MappedFile {
         const page_size = std.heap.pageSize();
         const mapped = try std.posix.mmap(
             null,
@@ -856,6 +884,8 @@ pub const MappedFile = struct {
             file.handle,
             0,
         );
+        // B6: advisory hints — mmap result is already page-aligned.
+        posixMadvise(mapped, name);
         return .{ .allocator = allocator, .bytes = mapped, .mode = .posix_mmap };
     }
 

@@ -14,6 +14,8 @@ const graph_db = @import("../storage/graph_db.zig");
 const overlay_mod = @import("../storage/overlay.zig");
 const ts = @import("../parser/tree_sitter.zig");
 const extractor_mod = @import("../parser/extractor.zig");
+pub const parser_pool = @import("../parser/parser_pool.zig");
+pub const ParserPool = parser_pool.ParserPool;
 
 const Registry = extractor_mod.Registry;
 const GraphDb = graph_db.GraphDb;
@@ -68,39 +70,37 @@ pub const UpdateStats = struct {
 // Diff detection
 // ██████████████████████████████████████████████████████████████████████████
 
-/// Compare filesystem metadata against the SQLite documents table.
-/// Returns three lists: added, modified, deleted.
+/// Compare filesystem metadata against the SQLite documents table using a
+/// sorted merge-join.  Avoids materialising two full hash maps — only paths
+/// that actually land in a diff list are allocated.
+///
+/// Algorithm:
+///   1. Scan the filesystem for metadata (path, mtime).
+///   2. Sort the result by path ASC.
+///   3. Walk the SQLite cursor (also ORDER BY path ASC) in lock-step.
+///   4. A standard merge-join emits added/modified/deleted without any
+///      per-stored-path duplicate allocation.
 pub fn detectChanges(
     allocator: std.mem.Allocator,
     gdb: *GraphDb,
     project_path: []const u8,
 ) !DiffResult {
-    // ── Scan current filesystem state (metadata only — fast) ──────────
+    // ── 1. Scan current filesystem state (metadata only — fast) ──────
     const current = try scanner.scanPathMetadata(allocator, project_path);
     defer scanner.freeMetadata(allocator, current);
 
-    // Build a hash map of current files by path
-    var current_map = std.StringHashMap(scanner.FileMetadata).init(allocator);
-    defer current_map.deinit();
-    for (current) |meta| {
-        try current_map.put(meta.path, meta);
-    }
+    // ── 2. Sort filesystem entries by path ASC ────────────────────────
+    std.mem.sort(scanner.FileMetadata, current, {}, struct {
+        fn lessThan(_: void, a: scanner.FileMetadata, b: scanner.FileMetadata) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
 
-    // ── Query stored documents from SQLite ─────────────────────────────
-    var stored_map = std.StringHashMap(struct { mtime: i64 }).init(allocator);
-    defer stored_map.deinit();
-
-    var stmt = try gdb.prepare("SELECT path, mtime FROM documents");
+    // ── 3. Open SQLite cursor sorted by path ASC ──────────────────────
+    var stmt = try gdb.prepare("SELECT path, mtime FROM documents ORDER BY path ASC");
     defer stmt.finalize();
 
-    while (try stmt.step()) {
-        const path = try stmt.columnText(0);
-        const mtime: i64 = try stmt.columnInt(1);
-        const path_owned = try allocator.dupe(u8, path);
-        try stored_map.put(path_owned, .{ .mtime = mtime });
-    }
-
-    // ── Build diff lists ──────────────────────────────────────────────
+    // ── 4. Diff lists — only changed-path allocations ─────────────────
     var added = std.ArrayList(FileChange).initCapacity(allocator, 16) catch @panic("OOM");
     var modified = std.ArrayList(FileChange).initCapacity(allocator, 16) catch @panic("OOM");
     var deleted = std.ArrayList(FileChange).initCapacity(allocator, 16) catch @panic("OOM");
@@ -114,42 +114,59 @@ pub fn detectChanges(
         deleted.deinit(allocator);
     }
 
-    // Files in current but not in stored → added
-    // Files in current and stored with different mtime → modified
-    var current_iter = current_map.iterator();
-    while (current_iter.next()) |kv| {
-        const path = kv.key_ptr.*;
-        const meta = kv.value_ptr.*;
-        if (stored_map.get(path)) |stored| {
-            if (meta.mtime != stored.mtime) {
+    // Merge-join state
+    var ci: usize = 0; // index into sorted `current`
+    var db_has_row: bool = try stmt.step(); // advance to first stored row
+
+    while (ci < current.len and db_has_row) {
+        const cur = current[ci];
+        const stored_path = try stmt.columnText(0);
+        const stored_mtime: i64 = try stmt.columnInt(1);
+
+        const cmp = std.mem.order(u8, cur.path, stored_path);
+        if (cmp == .lt) {
+            // cur.path < stored_path → file only in filesystem → added
+            try added.append(allocator, .{
+                .path = try allocator.dupe(u8, cur.path),
+                .kind = .added,
+            });
+            ci += 1;
+        } else if (cmp == .gt) {
+            // cur.path > stored_path → file only in DB → deleted
+            try deleted.append(allocator, .{
+                .path = try allocator.dupe(u8, stored_path),
+                .kind = .deleted,
+            });
+            db_has_row = try stmt.step();
+        } else {
+            // paths equal → file exists in both; check mtime
+            if (cur.mtime != stored_mtime) {
                 try modified.append(allocator, .{
-                    .path = try allocator.dupe(u8, path),
+                    .path = try allocator.dupe(u8, cur.path),
                     .kind = .modified,
                 });
             }
-        } else {
-            try added.append(allocator, .{
-                .path = try allocator.dupe(u8, path),
-                .kind = .added,
-            });
+            ci += 1;
+            db_has_row = try stmt.step();
         }
     }
 
-    // Files in stored but not in current → deleted
-    var stored_iter = stored_map.iterator();
-    while (stored_iter.next()) |kv| {
-        if (!current_map.contains(kv.key_ptr.*)) {
-            try deleted.append(allocator, .{
-                .path = try allocator.dupe(u8, kv.key_ptr.*),
-                .kind = .deleted,
-            });
-        }
+    // Drain remaining filesystem entries (all added)
+    while (ci < current.len) : (ci += 1) {
+        try added.append(allocator, .{
+            .path = try allocator.dupe(u8, current[ci].path),
+            .kind = .added,
+        });
     }
 
-    // Clean up stored map keys (we own them)
-    var cleanup_iter = stored_map.iterator();
-    while (cleanup_iter.next()) |kv| {
-        allocator.free(kv.key_ptr.*);
+    // Drain remaining DB entries (all deleted)
+    while (db_has_row) {
+        const stored_path = try stmt.columnText(0);
+        try deleted.append(allocator, .{
+            .path = try allocator.dupe(u8, stored_path),
+            .kind = .deleted,
+        });
+        db_has_row = try stmt.step();
     }
 
     return DiffResult{
@@ -168,11 +185,14 @@ pub fn detectChanges(
 /// Apply a diff to the graph database: delete old data for changed files,
 /// then re-extract and re-insert symbols/edges for added and modified files.
 /// Everything runs inside a single SQLite transaction for atomicity.
+/// `pool` is optional: when non-null parsers are reused across files (faster);
+/// when null a fresh parser is created per file (safe for one-shot CLI calls).
 pub fn applyChanges(
     allocator: std.mem.Allocator,
     gdb: *GraphDb,
     project_path: []const u8,
     diff: *const DiffResult,
+    pool: ?*ParserPool,
 ) !UpdateStats {
     const start = std.time.milliTimestamp();
 
@@ -242,11 +262,18 @@ pub fn applyChanges(
             continue;
         };
 
-        // Extract symbols and edges
-        const extraction = extractor.extract(allocator, content, lang_id) catch {
-            stats.errors += 1;
-            continue;
-        };
+        // Extract symbols and edges — reuse pool parser when available.
+        const zig_extractor = @import("../parser/zig_extractor.zig");
+        const extraction = if (pool != null and lang_id == .zig)
+            zig_extractor.extractWithPool(allocator, content, lang_id, pool) catch {
+                stats.errors += 1;
+                continue;
+            }
+        else
+            extractor.extract(allocator, content, lang_id) catch {
+                stats.errors += 1;
+                continue;
+            };
 
         // ── Insert document ────────────────────────────────────────────
         var hash_bytes: [8]u8 = undefined;
@@ -332,7 +359,20 @@ pub fn applyChangesWithOverlay(
     index_path: []const u8,
     diff: *const DiffResult,
 ) !UpdateStats {
-    var stats = try applyChanges(allocator, gdb, project_path, diff);
+    return applyChangesWithOverlayPooled(allocator, gdb, project_path, index_path, diff, null);
+}
+
+/// Like `applyChangesWithOverlay` but accepts an optional parser pool for
+/// reusing TSParser instances across files.
+pub fn applyChangesWithOverlayPooled(
+    allocator: std.mem.Allocator,
+    gdb: *GraphDb,
+    project_path: []const u8,
+    index_path: []const u8,
+    diff: *const DiffResult,
+    pool: ?*ParserPool,
+) !UpdateStats {
+    var stats = try applyChanges(allocator, gdb, project_path, diff, pool);
     const ov_stats = overlay_mod.rebuild(allocator, std.fs.cwd(), index_path, project_path, gdb) catch overlay_mod.RebuildStats{};
     stats.overlay_docs = ov_stats.overlay_docs;
     stats.overlay_tombstoned = ov_stats.tombstoned;

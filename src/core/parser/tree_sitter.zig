@@ -177,6 +177,12 @@ pub const Parser = struct {
         }
     }
 
+    /// Reset internal parser state without deallocating the parser.
+    /// Must be called before re-using a parser for a new source file.
+    pub fn reset(self: *Parser) void {
+        if (self.inner) |p| c.ts_parser_reset(p);
+    }
+
     pub fn parseString(self: *Parser, source: []const u8) !Tree {
         const tree = c.ts_parser_parse_string(self.inner.?, null, source.ptr, @intCast(source.len));
         if (tree == null) return error.ParseFailed;

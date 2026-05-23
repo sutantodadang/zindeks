@@ -1,0 +1,245 @@
+//! Tests for the install subcommand: json_edit, adapters, and CLAUDE.md injection.
+
+const std = @import("std");
+const zindeks = @import("zindeks");
+const je = zindeks.api.cli.install.json_edit;
+const tmpl = zindeks.api.cli.install.templates;
+
+// ── JSON-preserving edit tests ────────────────────────────────────────
+
+test "inject preserves unrelated mcpServers entry" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "settings.json" });
+    defer allocator.free(cfg_path);
+
+    // Write initial JSON with a pre-existing entry.
+    const initial =
+        \\{
+        \\  "mcpServers": {
+        \\    "other": {
+        \\      "command": "other-tool",
+        \\      "args": ["run"]
+        \\    }
+        \\  }
+        \\}
+    ;
+    try je.atomicWrite(allocator, cfg_path, initial);
+
+    // Inject zindeks entry.
+    try je.injectMcpEntry(allocator, cfg_path, "/usr/local/bin/zindeks");
+
+    // Read back and verify.
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    // Both entries must be present.
+    const mcp = parsed.value.object.get("mcpServers") orelse return error.MissingMcpServers;
+    try std.testing.expect(mcp.object.get("other") != null);
+    try std.testing.expect(mcp.object.get("zindeks") != null);
+
+    // zindeks entry must have correct command.
+    const zindeks_entry = mcp.object.get("zindeks").?;
+    const cmd = zindeks_entry.object.get("command").?;
+    try std.testing.expectEqualStrings("/usr/local/bin/zindeks", cmd.string);
+}
+
+test "inject is idempotent — second run produces same result" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "mcp.json" });
+    defer allocator.free(cfg_path);
+
+    // First install.
+    try je.injectMcpEntry(allocator, cfg_path, "/usr/bin/zindeks");
+
+    const first_run = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(first_run);
+
+    // Second install — must produce identical zindeks entry.
+    try je.injectMcpEntry(allocator, cfg_path, "/usr/bin/zindeks");
+
+    const second_run = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(second_run);
+
+    // Parse both and compare the zindeks entry.
+    var parsed1 = try std.json.parseFromSlice(std.json.Value, allocator, first_run, .{ .allocate = .alloc_always });
+    defer parsed1.deinit();
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, allocator, second_run, .{ .allocate = .alloc_always });
+    defer parsed2.deinit();
+
+    const mcp1 = parsed1.value.object.get("mcpServers").?.object.get("zindeks").?;
+    const mcp2 = parsed2.value.object.get("mcpServers").?.object.get("zindeks").?;
+    try std.testing.expectEqualStrings(
+        mcp1.object.get("command").?.string,
+        mcp2.object.get("command").?.string,
+    );
+}
+
+test "uninstall removes zindeks key and leaves siblings" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "mcp.json" });
+    defer allocator.free(cfg_path);
+
+    // Set up a file with two entries.
+    const initial =
+        \\{
+        \\  "mcpServers": {
+        \\    "sibling": {"command": "sibling-tool", "args": []},
+        \\    "zindeks": {"command": "/usr/bin/zindeks", "args": ["serve"]}
+        \\  }
+        \\}
+    ;
+    try je.atomicWrite(allocator, cfg_path, initial);
+
+    // Remove zindeks entry.
+    try je.removeMcpEntry(allocator, cfg_path);
+
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const mcp = parsed.value.object.get("mcpServers") orelse return error.MissingMcpServers;
+    // sibling must survive.
+    try std.testing.expect(mcp.object.get("sibling") != null);
+    // zindeks must be gone.
+    try std.testing.expect(mcp.object.get("zindeks") == null);
+}
+
+test "CLAUDE.md block injection: adds then replaces on second run" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const md_path = try std.fs.path.join(allocator, &.{ dir_path, "CLAUDE.md" });
+    defer allocator.free(md_path);
+
+    // Start with some existing content.
+    const initial_content = "# My Project\n\nSome existing docs.\n";
+    try je.atomicWrite(allocator, md_path, initial_content);
+
+    // Inject block helper.
+    const injectBlock = struct {
+        fn call(alloc: std.mem.Allocator, path: []const u8) !void {
+            const existing = blk: {
+                const f = try std.fs.openFileAbsolute(path, .{});
+                defer f.close();
+                break :blk try f.readToEndAlloc(alloc, 8 * 1024 * 1024);
+            };
+            defer alloc.free(existing);
+
+            var new_content: std.ArrayList(u8) = .{};
+            defer new_content.deinit(alloc);
+
+            const begin = tmpl.begin_marker;
+            const end_marker_str = tmpl.end_marker;
+
+            const begin_pos = std.mem.indexOf(u8, existing, begin);
+            const end_pos = if (begin_pos != null)
+                std.mem.indexOf(u8, existing[begin_pos.?..], end_marker_str)
+            else
+                null;
+
+            if (begin_pos != null and end_pos != null) {
+                const block_start = begin_pos.?;
+                const block_end = begin_pos.? + end_pos.? + end_marker_str.len;
+                try new_content.appendSlice(alloc, existing[0..block_start]);
+                try new_content.appendSlice(alloc, tmpl.claude_md_block);
+                if (block_end < existing.len) {
+                    try new_content.appendSlice(alloc, existing[block_end..]);
+                }
+            } else {
+                try new_content.appendSlice(alloc, existing);
+                if (new_content.items.len > 0 and new_content.items[new_content.items.len - 1] != '\n') {
+                    try new_content.append(alloc, '\n');
+                }
+                try new_content.append(alloc, '\n');
+                try new_content.appendSlice(alloc, tmpl.claude_md_block);
+            }
+
+            try je.atomicWrite(alloc, path, new_content.items);
+        }
+    }.call;
+
+    // First injection.
+    try injectBlock(allocator, md_path);
+
+    const after_first = blk: {
+        const f = try std.fs.openFileAbsolute(md_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(after_first);
+
+    // Must contain the begin marker exactly once.
+    const count1 = std.mem.count(u8, after_first, tmpl.begin_marker);
+    try std.testing.expectEqual(@as(usize, 1), count1);
+
+    // Original content must be preserved.
+    try std.testing.expect(std.mem.indexOf(u8, after_first, "Some existing docs.") != null);
+
+    // Second injection — must replace, not append.
+    try injectBlock(allocator, md_path);
+
+    const after_second = blk: {
+        const f = try std.fs.openFileAbsolute(md_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(after_second);
+
+    // Still exactly one begin marker.
+    const count2 = std.mem.count(u8, after_second, tmpl.begin_marker);
+    try std.testing.expectEqual(@as(usize, 1), count2);
+}
+
+test "hasComments correctly identifies JSONC" {
+    try std.testing.expect(je.hasComments("{ // line comment\n}"));
+    try std.testing.expect(je.hasComments("{ /* block */ }"));
+    try std.testing.expect(!je.hasComments("{\"url\": \"https://x.com\"}"));
+    try std.testing.expect(!je.hasComments("{}"));
+}

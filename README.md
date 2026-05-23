@@ -46,9 +46,17 @@ zindeks update --version v0.1.1
 
 `zindeks update` installs into the current executable directory by default. Use `--dir <install-dir>` for custom location, `--repo <owner/repo>` for forks, `--no-path-update` to skip Windows PATH edits, `--dry-run` to preview without downloading.
 
-### AI agent install instruction
+### AI agent setup (one command)
 
-When an AI agent needs Zindeks, use the GitHub repository `sutantodadang/zindeks`, then run the matching install command above for the host OS. Prefer the latest release. Verify with `zindeks --help`.
+After installing the binary:
+
+```bash
+zindeks install            # interactive: picks your AI host(s), wires MCP, offers to index
+zindeks install --host claude-code --scope both --yes   # non-interactive
+zindeks doctor             # verify
+```
+
+See [INTEGRATIONS.md](INTEGRATIONS.md) for per-host adapter details and exact paths written.
 
 ## Quick start
 
@@ -56,6 +64,7 @@ When an AI agent needs Zindeks, use the GitHub repository `sutantodadang/zindeks
 zindeks index .                     # Index current repo (shows progress)
 zindeks search "database pool" .    # BM25 keyword search
 zindeks serve                       # Start MCP-compliant JSON-RPC server
+zindeks bench cold-index .          # Benchmark indexing speed (3 iters, prints min/mean/p99/peak_rss)
 ```
 
 ## Supported languages
