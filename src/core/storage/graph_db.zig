@@ -259,6 +259,13 @@ const MIGRATIONS = [_][:0]const u8{
     \\CREATE INDEX IF NOT EXISTS idx_embeddings_document ON document_embeddings(document_id);
 };
 
+fn shouldIgnoreMigrationError(sql: [:0]const u8, err_msg: []const u8) bool {
+    // Legacy migrations include ALTER TABLE ADD COLUMN steps that are
+    // expected to fail once the column already exists.
+    if (!std.mem.startsWith(u8, sql, "ALTER TABLE ")) return false;
+    return std.mem.indexOf(u8, err_msg, "duplicate column name") != null;
+}
+
 pub const GraphDb = struct {
     db: *sqlite3.sqlite3,
     statement_cache: ?*cache.StatementCache = null,
@@ -340,7 +347,12 @@ pub const GraphDb = struct {
     /// Run all pending migration SQL.
     pub fn migrate(self: *GraphDb) !void {
         for (MIGRATIONS) |sql| {
-            try self.exec(sql);
+            self.exec(sql) catch |err| {
+                if (err == Error.PrepareFailed and shouldIgnoreMigrationError(sql, self.errmsg())) {
+                    continue;
+                }
+                return err;
+            };
         }
     }
 

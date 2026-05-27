@@ -72,7 +72,10 @@ pub const Pipeline = struct {
         // ── Phase 1: Scan files ──────────────────────────────────────
         const files = try scanner.scanPath(self.allocator, self.project_path);
         defer {
-            for (files) |f| self.allocator.free(f.content);
+            for (files) |f| {
+                self.allocator.free(f.path);
+                self.allocator.free(f.content);
+            }
             self.allocator.free(files);
         }
         result.files_scanned = @intCast(files.len);

@@ -115,22 +115,35 @@ pub fn trace(
     var has_cycle = false;
 
     var visited = std.StringHashMap(void).init(allocator);
-    defer visited.deinit();
+    defer {
+        var it = visited.keyIterator();
+        while (it.next()) |key_ptr| {
+            allocator.free(key_ptr.*);
+        }
+        visited.deinit();
+    }
 
     const QueueItem = struct { name: []const u8, depth: u32 };
     var queue = std.ArrayList(QueueItem).initCapacity(allocator, 32) catch @panic("OOM");
     defer queue.deinit(allocator);
 
-    try queue.append(allocator, .{ .name = symbol_name, .depth = 0 });
+    try queue.append(allocator, .{ .name = try allocator.dupe(u8, symbol_name), .depth = 0 });
 
     while (queue.items.len > 0) {
         const item = queue.orderedRemove(0);
-        if (item.depth > max_depth) continue;
-        if (visited.contains(item.name)) {
-            has_cycle = true;
+        if (item.depth > max_depth) {
+            allocator.free(item.name);
             continue;
         }
-        try visited.put(item.name, {});
+
+        const gop = try visited.getOrPut(item.name);
+        if (gop.found_existing) {
+            has_cycle = true;
+            allocator.free(item.name);
+            continue;
+        }
+        gop.value_ptr.* = {};
+        gop.key_ptr.* = item.name;
 
         var sym_stmt = try gdb.prepare(
             \\SELECT s.id, s.name, s.kind, d.path
@@ -185,7 +198,10 @@ pub fn trace(
                 });
 
                 if (item.depth < max_depth) {
-                    try queue.append(allocator, .{ .name = caller_name, .depth = item.depth + 1 });
+                    try queue.append(allocator, .{
+                        .name = try allocator.dupe(u8, caller_name),
+                        .depth = item.depth + 1,
+                    });
                 }
             }
         }
@@ -215,7 +231,10 @@ pub fn trace(
                 });
 
                 if (item.depth < max_depth) {
-                    try queue.append(allocator, .{ .name = callee_name, .depth = item.depth + 1 });
+                    try queue.append(allocator, .{
+                        .name = try allocator.dupe(u8, callee_name),
+                        .depth = item.depth + 1,
+                    });
                 }
             }
         }

@@ -775,7 +775,9 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 
     // Run binary indexer (for BM25 search)
     try indexer.indexPath(ctx.allocator, repo_path, loc.index_dir);
-    loc.committed = true; // prevent cleanup on deinit
+    // Persist this newly-built segment as the active project snapshot so the
+    // server's post-tool auto-load attaches the same data we just indexed.
+    try loc.commit();
 
     // Open graph DB and run pipeline (for structural knowledge graph)
     var project_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -790,21 +792,11 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 
     var gdb = try graph_db.GraphDb.open(graph_path_z);
     try gdb.migrate();
+    defer gdb.close();
 
     // Run the multi-pass pipeline to extract symbols + edges via tree-sitter
     var pipe = pipeline_mod.Pipeline.init(ctx.allocator, gdb, project_dir);
-    const pipe_result = pipe.run() catch blk: {
-        break :blk pipeline_mod.PipelineResult{
-            .files_scanned = 0,
-            .symbols_extracted = 0,
-            .edges_extracted = 0,
-            .files_with_errors = 0,
-            .files_skipped = 0,
-            .duration_ms = 0,
-        };
-    };
-
-    gdb.close();
+    const pipe_result = try pipe.run();
 
     try writer.print(
         \\{{"project":"{s}","files_indexed":{},"symbols":{},"edges":{},"pipeline_ms":{}}}
@@ -1675,8 +1667,8 @@ fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
         try writer.writeAll("{\"error\":\"Hotspot analysis failed.\"}");
         return;
     };
-    defer for (hotspots) |*h| h.deinit(ctx.allocator);
     defer ctx.allocator.free(hotspots);
+    defer for (hotspots) |*h| h.deinit(ctx.allocator);
 
     const coupling = arch_mod.getModuleCoupling(gdb) catch {
         try writer.writeAll("{\"error\":\"Coupling analysis failed.\"}");

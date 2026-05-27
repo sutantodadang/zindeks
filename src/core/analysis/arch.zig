@@ -19,9 +19,9 @@ pub const ArchSymbol = struct {
     fan_out: u32,
 
     pub fn deinit(self: *ArchSymbol, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.kind);
-        allocator.free(self.file_path);
+        if (self.name.len > 0) allocator.free(self.name);
+        if (self.kind.len > 0) allocator.free(self.kind);
+        if (self.file_path.len > 0) allocator.free(self.file_path);
     }
 };
 
@@ -31,7 +31,7 @@ pub const ArchModule = struct {
     symbol_count: u32,
 
     pub fn deinit(self: *ArchModule, allocator: std.mem.Allocator) void {
-        allocator.free(self.module);
+        if (self.module.len > 0) allocator.free(self.module);
     }
 };
 
@@ -66,9 +66,9 @@ pub const HotSpot = struct {
     total: u32,
 
     pub fn deinit(self: *HotSpot, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.kind);
-        allocator.free(self.file_path);
+        if (self.name.len > 0) allocator.free(self.name);
+        if (self.kind.len > 0) allocator.free(self.kind);
+        if (self.file_path.len > 0) allocator.free(self.file_path);
     }
 };
 

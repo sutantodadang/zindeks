@@ -13,6 +13,14 @@ test "graph_db open and migrate" {
     try std.testing.expectEqual(@as(i64, 6), tables);
 }
 
+test "graph_db migrate is idempotent" {
+    var db = try graph_db.GraphDb.open(":memory:");
+    defer db.close();
+
+    try db.migrate();
+    try db.migrate();
+}
+
 test "graph_db insert document" {
     var db = try graph_db.GraphDb.open(":memory:");
     defer db.close();
