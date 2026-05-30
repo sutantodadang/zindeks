@@ -1,9 +1,9 @@
 <!-- BEGIN zindeks-managed -->
 ## Code-graph tools (zindeks)
 
-This repo is indexed by zindeks. For code-structure questions — symbol lookup,
-"who calls X", "where is Y defined", architecture, impact analysis — call the
-matching MCP tool below before falling back to grep or full-file reads.
+This repo is indexed by zindeks. Use zindeks first for code search and
+code-structure questions before falling back to broad shell search or full-file
+reads.
 
 | Question | Tool |
 |---|---|
@@ -25,4 +25,8 @@ repo. (An already-indexed project also auto-attaches when the server starts, so
 read tools may work immediately — but if any tool returns "No project loaded",
 call `index_repository` with the path.) Refresh with `detect_changes`, then
 `index_repository` again if it reports drift.
+
+Avoid broad shell search (`rg`, `grep`, `git grep`, `findstr`, `Select-String`,
+recursive `Get-ChildItem`/`gci`, or `dir /s`) until zindeks has been tried,
+unless the target is generated/binary content or outside the zindeks index.
 <!-- END zindeks-managed -->

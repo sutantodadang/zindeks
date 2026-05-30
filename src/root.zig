@@ -65,6 +65,7 @@ pub const api = struct {
             pub const adapters = @import("api/cli/install/adapters.zig");
             pub const json_edit = @import("api/cli/install/json_edit.zig");
             pub const templates = @import("api/cli/install/templates.zig");
+            pub const guardrails = @import("api/cli/install/guardrails.zig");
             pub const install_mod = @import("api/cli/install/install.zig");
             pub const uninstall_mod = @import("api/cli/install/uninstall.zig");
             pub const doctor_mod = @import("api/cli/install/doctor.zig");

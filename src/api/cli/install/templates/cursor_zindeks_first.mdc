@@ -1,0 +1,20 @@
+---
+description: Use zindeks before broad shell search
+alwaysApply: true
+---
+
+# Zindeks-First Search
+
+Use zindeks first for codebase search and structural questions in this repo.
+
+- Keyword search: use `zindeks search "<query>"` or MCP `search_code(query)`.
+- Symbols: use MCP `search_graph(name_pattern)`.
+- Callers/callees: use MCP `trace_call_path(name, direction)`.
+- Architecture: use MCP `get_architecture()`.
+
+Avoid broad shell search (`rg`, `grep`, `git grep`, `findstr`, `Select-String`,
+recursive `Get-ChildItem`/`gci`, or `dir /s`) until zindeks has been tried, unless
+the file type is generated/binary or outside the zindeks index.
+
+If the MCP server says no project is loaded, call `index_repository` with the
+absolute repo path or run `zindeks index .` from the repo root.

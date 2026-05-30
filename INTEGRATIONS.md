@@ -41,6 +41,17 @@ When `--scope project` or `--scope both` is used with the `claude-code` adapter,
 
 Re-running `install` replaces the block in-place (idempotent). Running `uninstall` removes only this block.
 
+## Project search guardrails
+
+Project-scope installs also add zindeks-first search guidance without replacing unrelated user content:
+
+- `AGENTS.md`: appends or replaces a managed zindeks-first block for generic agents.
+- Cursor: writes `.cursor/rules/zindeks-first.mdc`, `.cursor/hooks.json`, and `.cursor/hooks/enforce-zindeks-search.js`.
+- VS Code / GitHub Copilot: appends or replaces a managed block in `.github/copilot-instructions.md`.
+- Claude Code: adds a project `.claude/settings.json` `PreToolUse` hook for Bash/Shell commands and reuses `.cursor/hooks/enforce-zindeks-search.js`.
+
+The shared hook script asks before broad shell search commands (`rg`, `grep`, `git grep`, `findstr`, `Select-String`, recursive `Get-ChildItem`/`gci`, or `dir /s`) unless the command invokes zindeks. It is plain Node.js and does not require jq or bash.
+
 ## Commands
 
 ```bash

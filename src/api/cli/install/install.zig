@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const terminal = @import("../terminal.zig");
 const adapters = @import("adapters.zig");
+const guardrails = @import("guardrails.zig");
 const json_edit = @import("json_edit.zig");
 const tmpl = @import("templates.zig");
 
@@ -213,6 +214,13 @@ fn installHost(
                 json_edit.injectMcpEntry(allocator, cfg_path, bin_path) catch |err| {
                     if (err == error.JsoncNotSupported) {
                         try sw.print("  {s}skip{s}: JSONC detected. Merge manually.\n", .{ sw.yellow(), sw.reset() });
+                    } else {
+                        return err;
+                    }
+                };
+                guardrails.installForHost(allocator, cwd, id, cfg_path) catch |err| {
+                    if (err == error.JsoncNotSupported) {
+                        try sw.print("  {s}skip{s}: guardrail JSONC config detected. Merge manually.\n", .{ sw.yellow(), sw.reset() });
                     } else {
                         return err;
                     }

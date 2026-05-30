@@ -4,6 +4,7 @@ const std = @import("std");
 const zindeks = @import("zindeks");
 const je = zindeks.api.cli.install.json_edit;
 const tmpl = zindeks.api.cli.install.templates;
+const guardrails = zindeks.api.cli.install.guardrails;
 
 // ── JSON-preserving edit tests ────────────────────────────────────────
 
@@ -242,4 +243,107 @@ test "hasComments correctly identifies JSONC" {
     try std.testing.expect(je.hasComments("{ /* block */ }"));
     try std.testing.expect(!je.hasComments("{\"url\": \"https://x.com\"}"));
     try std.testing.expect(!je.hasComments("{}"));
+}
+
+test "managed guidance block appends then replaces without duplicating" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const md_path = try std.fs.path.join(allocator, &.{ dir_path, "AGENTS.md" });
+    defer allocator.free(md_path);
+
+    try je.atomicWrite(allocator, md_path, "# Existing\n\nKeep this.\n");
+
+    try guardrails.injectManagedBlock(allocator, md_path, tmpl.agent_guidance_block);
+    try guardrails.injectManagedBlock(allocator, md_path, tmpl.agent_guidance_block);
+
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(md_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "Keep this.") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, tmpl.begin_marker));
+    try std.testing.expect(std.mem.indexOf(u8, content, "Use zindeks first") != null);
+}
+
+test "cursor hook config preserves existing hook and is idempotent" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const hooks_path = try std.fs.path.join(allocator, &.{ dir_path, "hooks.json" });
+    defer allocator.free(hooks_path);
+
+    const initial =
+        \\{
+        \\  "version": 1,
+        \\  "hooks": {
+        \\    "beforeShellExecution": [
+        \\      {"command": ".cursor/hooks/existing.js"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+    try je.atomicWrite(allocator, hooks_path, initial);
+
+    try guardrails.injectCursorHookConfig(allocator, hooks_path);
+    try guardrails.injectCursorHookConfig(allocator, hooks_path);
+
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(hooks_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, ".cursor/hooks/existing.js") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, guardrails.cursor_hook_command));
+}
+
+test "claude hook config preserves permissions and is idempotent" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const settings_path = try std.fs.path.join(allocator, &.{ dir_path, "settings.json" });
+    defer allocator.free(settings_path);
+
+    const initial =
+        \\{
+        \\  "permissions": {
+        \\    "allow": ["Bash(zig build *)"]
+        \\  }
+        \\}
+    ;
+    try je.atomicWrite(allocator, settings_path, initial);
+
+    try guardrails.injectClaudeHookConfig(allocator, settings_path);
+    try guardrails.injectClaudeHookConfig(allocator, settings_path);
+
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(settings_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "Bash(zig build *)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"hooks\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, guardrails.claude_hook_command));
 }
