@@ -16,10 +16,16 @@ pub const Decision = struct {
     reason: []const u8 = "",
 };
 
-const deny_msg =
-    "Grep/Glob blocked for code search. Use zindeks MCP: search_code (BM25 text), " ++
+const grep_deny_msg =
+    "Grep blocked for code search. Use zindeks MCP: search_code (BM25 text), " ++
     "search_graph (symbols/defs), trace_call_path (callers/callees), get_architecture. " ++
-    "Escape hatch for non-code or uncommitted files: Bash `rtk grep` / `rtk find`.";
+    "Read results with read_file; see a file's symbols with file_outline. " ++
+    "Escape hatch for non-code or uncommitted files: Bash `rtk grep`.";
+
+const glob_deny_msg =
+    "Glob blocked. List indexed files with zindeks list_files(pattern, dir). " ++
+    "See a file's symbols with file_outline; read a file with read_file(path, offset, limit). " ++
+    "Escape hatch for non-indexed or uncommitted files: Bash `rtk find`.";
 
 const ask_msg =
     "Use zindeks before broad shell search: `zindeks search \"<query>\"` or the zindeks MCP " ++
@@ -92,8 +98,10 @@ fn usesBroadShellSearch(command: []const u8) bool {
 // ── Pure decision logic (unit-testable, no I/O) ───────────────────────
 
 pub fn decide(tool_name: []const u8, command: []const u8) Decision {
-    if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob"))
-        return .{ .action = .deny, .reason = deny_msg };
+    if (std.mem.eql(u8, tool_name, "Grep"))
+        return .{ .action = .deny, .reason = grep_deny_msg };
+    if (std.mem.eql(u8, tool_name, "Glob"))
+        return .{ .action = .deny, .reason = glob_deny_msg };
 
     if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Shell")) {
         if (command.len == 0) return .{ .action = .allow };

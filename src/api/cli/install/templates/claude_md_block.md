@@ -3,7 +3,8 @@
 
 This repo is indexed by zindeks. Use zindeks first for code search and
 code-structure questions before falling back to broad shell search or full-file
-reads.
+reads. Prefer `read_file` over reading whole files, and `list_files` over `Glob`
+or `dir`.
 
 | Question | Tool |
 |---|---|
@@ -11,6 +12,9 @@ reads.
 | Symbol definition | `search_graph(name_pattern)` |
 | Callers / callees | `trace_call_path(name, direction)` |
 | Source snippet | `get_code_snippet(name)` |
+| Read a file (numbered, paged) | `read_file(path, offset, limit)` |
+| List files (glob) | `list_files(pattern, dir)` |
+| File outline (symbols) | `file_outline(path)` |
 | Architecture | `get_architecture()` |
 | Custom relation | `query_graph("MATCH ...")` |
 

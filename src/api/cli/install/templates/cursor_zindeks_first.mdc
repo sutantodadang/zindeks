@@ -11,6 +11,9 @@ Use zindeks first for codebase search and structural questions in this repo.
 - Symbols: use MCP `search_graph(name_pattern)`.
 - Callers/callees: use MCP `trace_call_path(name, direction)`.
 - Architecture: use MCP `get_architecture()`.
+- Read a file: use MCP `read_file(path, offset, limit)` (numbered, paged).
+- List files: use MCP `list_files(pattern, dir)` instead of Glob/dir.
+- File outline: use MCP `file_outline(path)` for symbols without full content.
 
 Avoid broad shell search (`rg`, `grep`, `git grep`, `findstr`, `Select-String`,
 recursive `Get-ChildItem`/`gci`, or `dir /s`) until zindeks has been tried, unless

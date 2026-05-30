@@ -37,7 +37,7 @@ pub const Descriptor = struct {
     inputSchema: []const u8, // JSON literal
 };
 
-/// All tools registered for Phase 1-6.
+/// All tools registered for Phase 1-6 + Phase 7 (read loop).
 pub const ALL = [_]Descriptor{
     index_repository,
     list_projects,
@@ -66,6 +66,9 @@ pub const ALL = [_]Descriptor{
     explain_query,
     get_config,
     set_config,
+    read_file,
+    list_files,
+    file_outline,
 };
 
 /// Apply detected file changes incrementally: updates the SQLite graph DB
@@ -601,6 +604,73 @@ pub const set_config = Descriptor{
     ,
 };
 
+pub const read_file = Descriptor{
+    .name = "read_file",
+    .description = "Read a file by path with line numbers (compressed cat -n: blank-line runs collapsed, content byte-exact). offset/limit page like Claude's Read. Prefer this over shell cat/Read for indexed repos.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "path": {
+    \\      "type": "string",
+    \\      "description": "File path (absolute, or relative to project root)"
+    \\    },
+    \\    "offset": {
+    \\      "type": "integer",
+    \\      "description": "1-based first line to show (default 1)"
+    \\    },
+    \\    "limit": {
+    \\      "type": "integer",
+    \\      "description": "Max lines to show (default 2000)"
+    \\    }
+    \\  },
+    \\  "required": ["path"]
+    \\}
+    ,
+};
+
+pub const list_files = Descriptor{
+    .name = "list_files",
+    .description = "List indexed files, optionally filtered by glob pattern or directory prefix. Replaces Glob for the indexed repo. Returns paths only (token-cheap).",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "pattern": {
+    \\      "type": "string",
+    \\      "description": "Glob pattern (e.g. *.zig) or substring to filter paths"
+    \\    },
+    \\    "dir": {
+    \\      "type": "string",
+    \\      "description": "Directory prefix filter (e.g. src/api)"
+    \\    },
+    \\    "limit": {
+    \\      "type": "integer",
+    \\      "description": "Max results (default 200)"
+    \\    }
+    \\  },
+    \\  "required": []
+    \\}
+    ,
+};
+
+pub const file_outline = Descriptor{
+    .name = "file_outline",
+    .description = "Structural outline of one file: symbol names, kinds, and line ranges, without full content. Cheapest way to understand a file before reading it.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "path": {
+    \\      "type": "string",
+    \\      "description": "File path (absolute or relative to project root)"
+    \\    }
+    \\  },
+    \\  "required": ["path"]
+    \\}
+    ,
+};
+
 // ██████████████████████████████████████████████████████████████████████████
 // Tool JSON serialization (for tools/list response)
 // ██████████████████████████████████████████████████████████████████████████
@@ -733,6 +803,12 @@ pub fn dispatch(
         try handleGetConfig(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "set_config")) {
         try handleSetConfig(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "read_file")) {
+        try handleReadFile(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "list_files")) {
+        try handleListFiles(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "file_outline")) {
+        try handleFileOutline(ctx, params_obj, writer);
     } else {
         // Propagate as an error so the caller emits an MCP-compliant
         // `result.isError: true` envelope.  Embedding the tool name as a
@@ -2702,4 +2778,528 @@ fn getLimit(params: std.json.ObjectMap, default: usize) usize {
 
 fn symbolKindStr(kind: storage.SymbolKind) []const u8 {
     return @tagName(kind);
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Phase 7 helpers: read_file / list_files / file_outline
+// ██████████████████████████████████████████████████████████████████████████
+
+/// Stats returned by renderNumbered.
+pub const RenderStats = struct {
+    total_lines: usize,
+    shown_start: usize, // 1-based
+    shown_end: usize,   // 1-based, inclusive
+    truncated: bool,
+};
+
+/// Render file content as compressed cat-n output into `out`.
+/// Compresses runs of >=2 consecutive blank lines into a single marker.
+/// Non-blank lines are emitted byte-exactly with their 1-based line number.
+/// `offset`: 1-based first line (clamped to >=1). `limit`: max lines shown.
+pub fn renderNumbered(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    offset_in: usize,
+    limit_in: usize,
+    out: *std.ArrayList(u8),
+) !RenderStats {
+    const offset = if (offset_in < 1) 1 else offset_in;
+    const limit = if (limit_in < 1) 1 else limit_in;
+
+    // Split lines (handle both \n and \r\n)
+    var lines = std.ArrayList([]const u8){};
+    defer lines.deinit(allocator);
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |raw_line| {
+        // Strip trailing \r for \r\n line endings
+        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        try lines.append(allocator, line);
+    }
+    // splitScalar on a file ending with \n produces a trailing empty element —
+    // remove it so "total_lines" matches the human-visible count.
+    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
+        _ = lines.pop();
+    }
+
+    const total = lines.items.len;
+    const win_start = if (offset > total) total else offset - 1; // 0-based
+    const win_end = @min(total, win_start + limit);              // exclusive
+
+    const out_w = out.writer(allocator);
+
+    // Blank-run compression within the window
+    var i = win_start;
+    while (i < win_end) {
+        const line = lines.items[i];
+        const is_blank = std.mem.trim(u8, line, " \t\r").len == 0;
+
+        if (is_blank) {
+            // Count consecutive blank lines from i
+            var run: usize = 0;
+            var j = i;
+            while (j < win_end) : (j += 1) {
+                if (std.mem.trim(u8, lines.items[j], " \t\r").len == 0) {
+                    run += 1;
+                } else break;
+            }
+            if (run >= 2) {
+                // Emit compressed marker
+                try out_w.print("{d}→⋮ ({d} blank lines)\n", .{ i + 1, run });
+                i += run;
+                continue;
+            }
+            // Single blank line — emit normally
+            try out_w.print("{d}→\n", .{i + 1});
+        } else {
+            try out_w.print("{d}→{s}\n", .{ i + 1, line });
+        }
+        i += 1;
+    }
+
+    const shown_start = if (total == 0) 0 else win_start + 1;
+    const shown_end = win_end; // win_end is exclusive so win_end == last+1
+
+    return RenderStats{
+        .total_lines = total,
+        .shown_start = shown_start,
+        .shown_end = shown_end,
+        .truncated = win_end < total,
+    };
+}
+
+/// Simple glob matcher: supports `*` (matches within path component) and
+/// `**` (matches across separators). Pattern and candidate are compared
+/// after normalising separators to forward-slash.
+pub fn globMatch(pattern: []const u8, candidate: []const u8) bool {
+    return globMatchInner(pattern, candidate);
+}
+
+fn globMatchInner(pat: []const u8, str: []const u8) bool {
+    var pi: usize = 0;
+    var si: usize = 0;
+    // Saved positions for backtracking on `*`
+    var star_pi: usize = std.math.maxInt(usize);
+    var star_si: usize = 0;
+
+    while (si < str.len) {
+        if (pi < pat.len and (pat[pi] == '?' or pat[pi] == str[si])) {
+            pi += 1;
+            si += 1;
+        } else if (pi < pat.len and pat[pi] == '*') {
+            // Check for `**` — treat same as `*` for our purposes
+            var end = pi + 1;
+            while (end < pat.len and pat[end] == '*') end += 1;
+            star_pi = end;
+            star_si = si;
+            pi = end;
+        } else if (star_pi != std.math.maxInt(usize)) {
+            // Backtrack: advance the string position for the `*`
+            star_si += 1;
+            si = star_si;
+            pi = star_pi;
+        } else {
+            return false;
+        }
+    }
+    // Consume trailing `*`s
+    while (pi < pat.len and pat[pi] == '*') pi += 1;
+    return pi == pat.len;
+}
+
+/// Normalise path separators to forward-slash.
+fn normSep(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, path);
+    for (out) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return out;
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: read_file
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleReadFile(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const project_path = ctx.project_path orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first.\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing required param: path\"}");
+        return;
+    };
+    const path = getString(params, "path") orelse {
+        try writer.writeAll("{\"error\":\"Missing required param: path\"}");
+        return;
+    };
+
+    const offset: usize = blk: {
+        if (params.get("offset")) |v| switch (v) {
+            .integer => |i| if (i >= 1) break :blk @intCast(i),
+            else => {},
+        };
+        break :blk 1;
+    };
+    const limit: usize = blk: {
+        if (params.get("limit")) |v| switch (v) {
+            .integer => |i| if (i > 0) break :blk @intCast(i),
+            else => {},
+        };
+        break :blk 2000;
+    };
+
+    // Resolve absolute path
+    const abs_path = if (std.fs.path.isAbsolute(path))
+        try ctx.allocator.dupe(u8, path)
+    else
+        try std.fs.path.join(ctx.allocator, &.{ project_path, path });
+    defer ctx.allocator.free(abs_path);
+
+    // Read from disk
+    const content = std.fs.cwd().readFileAlloc(ctx.allocator, abs_path, 10 * 1024 * 1024) catch {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(ctx.allocator);
+        const bw = buf.writer(ctx.allocator);
+        try bw.print("{{\"error\":\"Cannot read file: {f} (not on disk; if it was moved/deleted, re-run index_repository)\"}}", .{std.json.fmt(path, .{})});
+        try writer.writeAll(buf.items);
+        return;
+    };
+    defer ctx.allocator.free(content);
+
+    // Render compressed cat-n output
+    var rendered = std.ArrayList(u8){};
+    defer rendered.deinit(ctx.allocator);
+    const stats = try renderNumbered(ctx.allocator, content, offset, limit, &rendered);
+
+    const shown_str = try std.fmt.allocPrint(ctx.allocator, "{d}-{d}", .{ stats.shown_start, stats.shown_end });
+    defer ctx.allocator.free(shown_str);
+
+    try writer.print(
+        \\{{"path":{f},"total_lines":{d},"shown":{f},"truncated":{},"source":"disk","content":{f}}}
+    , .{
+        std.json.fmt(path, .{}),
+        stats.total_lines,
+        std.json.fmt(shown_str, .{}),
+        stats.truncated,
+        std.json.fmt(rendered.items, .{}),
+    });
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: list_files
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleListFiles(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first.\"}");
+        return;
+    };
+
+    const pattern_raw: ?[]const u8 = if (params_obj) |p| getString(p, "pattern") else null;
+    const dir_raw: ?[]const u8 = if (params_obj) |p| getString(p, "dir") else null;
+    const limit: usize = blk: {
+        if (params_obj) |p| {
+            if (p.get("limit")) |v| switch (v) {
+                .integer => |i| if (i > 0) break :blk @as(usize, @intCast(i)),
+                else => {},
+            };
+        }
+        break :blk 200;
+    };
+
+    // Normalise user-supplied pattern and dir to forward-slash
+    const pattern: ?[]u8 = if (pattern_raw) |pr| try normSep(ctx.allocator, pr) else null;
+    defer if (pattern) |p| ctx.allocator.free(p);
+    const dir: ?[]u8 = if (dir_raw) |dr| try normSep(ctx.allocator, dr) else null;
+    defer if (dir) |d| ctx.allocator.free(d);
+
+    var stmt = try gdb.prepare("SELECT path FROM documents ORDER BY path");
+    defer stmt.finalize();
+
+    var matched: usize = 0;
+    var shown: usize = 0;
+
+    var files = std.ArrayList([]const u8){};
+    defer {
+        for (files.items) |f| ctx.allocator.free(f);
+        files.deinit(ctx.allocator);
+    }
+
+    while (try stmt.step()) {
+        const raw_path = try stmt.columnText(0);
+
+        // Normalise stored path to forward-slash for matching
+        const norm = try normSep(ctx.allocator, raw_path);
+        defer ctx.allocator.free(norm);
+
+        // Dir prefix filter
+        if (dir) |d| {
+            if (!std.mem.startsWith(u8, norm, d)) continue;
+        }
+
+        // Pattern filter
+        if (pattern) |pat| {
+            const keep = blk: {
+                // *.ext -> suffix match
+                if (pat.len > 2 and pat[0] == '*' and pat[1] == '.') {
+                    const ext = pat[1..]; // includes the dot
+                    break :blk std.mem.endsWith(u8, norm, ext);
+                }
+                // contains glob wildcard -> globMatch
+                if (std.mem.indexOfScalar(u8, pat, '*') != null) {
+                    break :blk globMatch(pat, norm);
+                }
+                // plain substring
+                break :blk std.mem.indexOf(u8, norm, pat) != null;
+            };
+            if (!keep) continue;
+        }
+
+        matched += 1;
+        if (shown < limit) {
+            try files.append(ctx.allocator, try ctx.allocator.dupe(u8, norm));
+            shown += 1;
+        }
+    }
+
+    try writer.print("{{\"count\":{d},\"total_matched\":{d},\"truncated\":{},\"files\":[", .{
+        shown,
+        matched,
+        shown < matched,
+    });
+    for (files.items, 0..) |f, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print("{f}", .{std.json.fmt(f, .{})});
+    }
+    try writer.writeAll("]}");
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: file_outline
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleFileOutline(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const gdb = ctx.gdb orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first.\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing required param: path\"}");
+        return;
+    };
+    const path_in = getString(params, "path") orelse {
+        try writer.writeAll("{\"error\":\"Missing required param: path\"}");
+        return;
+    };
+
+    // Normalise: if absolute and starts with project_path, strip prefix.
+    // Convert to OS-native separators for DB lookup.
+    const project_path = ctx.project_path orelse "";
+
+    const rel_path: []u8 = blk: {
+        if (std.fs.path.isAbsolute(path_in) and project_path.len > 0) {
+            // Try to strip project_path prefix
+            var pp = project_path;
+            // Ensure no trailing separator in project_path for comparison
+            if (pp.len > 0 and (pp[pp.len - 1] == '/' or pp[pp.len - 1] == '\\'))
+                pp = pp[0 .. pp.len - 1];
+
+            if (std.ascii.startsWithIgnoreCase(path_in, pp)) {
+                const rest = path_in[pp.len..];
+                const trimmed = if (rest.len > 0 and (rest[0] == '/' or rest[0] == '\\'))
+                    rest[1..]
+                else
+                    rest;
+                break :blk try ctx.allocator.dupe(u8, trimmed);
+            }
+        }
+        break :blk try ctx.allocator.dupe(u8, path_in);
+    };
+    defer ctx.allocator.free(rel_path);
+
+    // Convert separators to OS native for the initial query
+    const os_path = try ctx.allocator.dupe(u8, rel_path);
+    defer ctx.allocator.free(os_path);
+    if (std.fs.path.sep == '\\') {
+        for (os_path) |*c| if (c.* == '/') { c.* = '\\'; };
+    } else {
+        for (os_path) |*c| if (c.* == '\\') { c.* = '/'; };
+    }
+
+    const query =
+        \\SELECT s.name, s.kind, s.line_start, s.line_end
+        \\FROM symbols s JOIN documents d ON d.id = s.document_id
+        \\WHERE d.path = ? ORDER BY s.line_start
+    ;
+
+    const SymbolEntry = struct {
+        name: []u8,
+        kind: []u8,
+        line_start: i64,
+        line_end: i64,
+    };
+    var symbols = std.ArrayList(SymbolEntry){};
+    defer {
+        for (symbols.items) |*s| {
+            ctx.allocator.free(s.name);
+            ctx.allocator.free(s.kind);
+        }
+        symbols.deinit(ctx.allocator);
+    }
+
+    // Helper: run query with a given path string, append results
+    const runQuery = struct {
+        fn run(
+            alloc: std.mem.Allocator,
+            db: *graph_db.GraphDb,
+            q: []const u8,
+            bind_path: []const u8,
+            out: *std.ArrayList(SymbolEntry),
+        ) !bool {
+            const q_z = try alloc.dupeZ(u8, q);
+            defer alloc.free(q_z);
+            var st = try db.prepare(q_z);
+            defer st.finalize();
+            try st.bindText(1, bind_path);
+            var found = false;
+            while (try st.step()) {
+                found = true;
+                try out.append(alloc, .{
+                    .name = try alloc.dupe(u8, try st.columnText(0)),
+                    .kind = try alloc.dupe(u8, try st.columnText(1)),
+                    .line_start = try st.columnInt(2),
+                    .line_end = try st.columnInt(3),
+                });
+            }
+            return found;
+        }
+    }.run;
+
+    const found1 = try runQuery(ctx.allocator, gdb, query, os_path, &symbols);
+
+    if (!found1) {
+        // Retry with swapped separators
+        const alt_path = try ctx.allocator.dupe(u8, os_path);
+        defer ctx.allocator.free(alt_path);
+        if (std.fs.path.sep == '\\') {
+            for (alt_path) |*c| if (c.* == '\\') { c.* = '/'; };
+        } else {
+            for (alt_path) |*c| if (c.* == '/') { c.* = '\\'; };
+        }
+        const found2 = try runQuery(ctx.allocator, gdb, query, alt_path, &symbols);
+
+        if (!found2) {
+            // Suffix / LIKE match using basename
+            const basename = std.fs.path.basename(path_in);
+            const like_pat = try std.fmt.allocPrint(ctx.allocator, "%{s}", .{basename});
+            defer ctx.allocator.free(like_pat);
+            const like_query =
+                \\SELECT s.name, s.kind, s.line_start, s.line_end
+                \\FROM symbols s JOIN documents d ON d.id = s.document_id
+                \\WHERE d.path LIKE ? ORDER BY s.line_start
+            ;
+            _ = try runQuery(ctx.allocator, gdb, like_query, like_pat, &symbols);
+        }
+    }
+
+    try writer.print("{{\"path\":{f},\"count\":{d},\"symbols\":[", .{
+        std.json.fmt(path_in, .{}),
+        symbols.items.len,
+    });
+    for (symbols.items, 0..) |s, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print(
+            \\{{"name":{f},"kind":{f},"line":{d},"end":{d}}}
+        , .{
+            std.json.fmt(s.name, .{}),
+            std.json.fmt(s.kind, .{}),
+            s.line_start,
+            s.line_end,
+        });
+    }
+    if (symbols.items.len == 0) {
+        try writer.writeAll("],\"note\":\"no indexed symbols for this path (check path or re-index)\"}");
+    } else {
+        try writer.writeAll("]}");
+    }
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Phase 7 tests (pure helpers — no MCP round-trip needed)
+// ██████████████████████████████████████████████████████████████████████████
+
+test "renderNumbered: blank-run compression" {
+    const alloc = std.testing.allocator;
+
+    const input =
+        \\line1
+        \\line2
+        \\
+        \\
+        \\
+        \\line6
+        \\line7
+    ;
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(alloc);
+    const stats = try renderNumbered(alloc, input, 1, 2000, &out);
+
+    // total_lines: 7 (line1..line7; trailing newline stripped)
+    try std.testing.expectEqual(@as(usize, 7), stats.total_lines);
+    try std.testing.expect(!stats.truncated);
+
+    const rendered = out.items;
+    // Must contain the 3-blank-line marker
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "⋮ (3 blank lines)") != null);
+    // Non-blank lines must keep exact content
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "1→line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "6→line6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "7→line7") != null);
+    // The 3 blank lines should NOT appear as individual entries
+    const blank_count = blk: {
+        var count: usize = 0;
+        var iter = std.mem.splitSequence(u8, rendered, "\n");
+        while (iter.next()) |line| {
+            // A lone blank line emitted normally would be "N→" (nothing after arrow)
+            if (line.len > 0) {
+                const arrow_pos = std.mem.indexOf(u8, line, "→") orelse continue;
+                const after = line[arrow_pos + "→".len ..];
+                if (after.len == 0) count += 1;
+            }
+        }
+        break :blk count;
+    };
+    // No individual blank-line rows should appear since they were all in a run of 3
+    try std.testing.expectEqual(@as(usize, 0), blank_count);
+}
+
+test "renderNumbered: offset and limit paging" {
+    const alloc = std.testing.allocator;
+    const input = "a\nb\nc\nd\ne";
+    var out = std.ArrayList(u8){};
+    defer out.deinit(alloc);
+    const stats = try renderNumbered(alloc, input, 2, 2, &out);
+    try std.testing.expectEqual(@as(usize, 5), stats.total_lines);
+    try std.testing.expectEqual(@as(usize, 2), stats.shown_start);
+    try std.testing.expectEqual(@as(usize, 4), stats.shown_end);
+    try std.testing.expect(stats.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "2→b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "3→c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "4→d") == null);
+}
+
+test "globMatch: basic patterns" {
+    try std.testing.expect(globMatch("*.zig", "src/main.zig"));
+    try std.testing.expect(!globMatch("*.zig", "a.py"));
+    try std.testing.expect(globMatch("src/**/*.zig", "src/api/mcp/tools.zig"));
+    try std.testing.expect(globMatch("*.py", "a.py"));
+    try std.testing.expect(!globMatch("*.py", "a.zig"));
+    try std.testing.expect(globMatch("tools*", "tools.zig"));
+    try std.testing.expect(globMatch("*tools*", "src/tools/main.zig"));
 }

@@ -7,6 +7,9 @@ Use zindeks first for code search and code-structure questions in this repo.
 - Symbols: MCP `search_graph(name_pattern)`.
 - Callers/callees: MCP `trace_call_path(name, direction)`.
 - Architecture and hotspots: MCP `get_architecture()`.
+- Read a file: MCP `read_file(path, offset, limit)` (numbered, paged — prefer over reading whole files).
+- List files: MCP `list_files(pattern, dir)` (use instead of Glob/dir over the indexed repo).
+- File outline: MCP `file_outline(path)` (symbols + line ranges, no full content).
 
 Only fall back to broad shell search (`rg`, `grep`, `git grep`, `findstr`,
 `Select-String`, recursive `Get-ChildItem`/`gci`, or `dir /s`) after trying
