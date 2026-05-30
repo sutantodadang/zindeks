@@ -19,6 +19,7 @@ const install_cmd = @import("install/install.zig");
 const uninstall_cmd = @import("install/uninstall.zig");
 const doctor_cmd = @import("install/doctor.zig");
 const bench_cmd = @import("bench.zig");
+const hook_cmd = @import("hook.zig");
 
 /// Runtime state passed through the CLI pipeline.
 const CliState = struct {
@@ -109,6 +110,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try runDoctor(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         try bench_cmd.run(state.allocator, args[global.cmd_index + 1 ..]);
+    } else if (std.mem.eql(u8, cmd, "hook")) {
+        try hook_cmd.run(state.allocator, args[global.cmd_index + 1 ..]);
     } else {
         return fmtError(state.colors_enabled, errors.invalidArgs("Unknown command"), std.fs.File.stderr().deprecatedWriter());
     }
@@ -742,6 +745,8 @@ fn usage(sw: anytype) !void {
         \\  update                    Update zindeks to latest version
         \\  completions <shell>       Generate shell completions (bash|zsh|fish)
         \\  bench <scenario> [args]   Run performance benchmarks (cold-index, detect-changes-synthetic, cypher-cache, snippet-cache)
+        \\  hook [--host claude|cursor]
+        \\                            PreToolUse hook: reads stdin JSON, emits allow/ask/deny
         \\  help                      Show this help
         \\
         \\{s}Global flags:{s}

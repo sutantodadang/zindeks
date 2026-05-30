@@ -345,5 +345,124 @@ test "claude hook config preserves permissions and is idempotent" {
 
     try std.testing.expect(std.mem.indexOf(u8, content, "Bash(zig build *)") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"hooks\"") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, guardrails.claude_hook_command));
+    // Must contain "hook --host claude" exactly once (idempotent).
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "hook --host claude"));
+}
+
+test "claude hook config: empty settings gets exactly 1 PreToolUse entry with correct matcher" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "settings.json" });
+    defer allocator.free(cfg_path);
+
+    // Start with empty object.
+    try je.atomicWrite(allocator, cfg_path, "{}");
+
+    // First call.
+    try guardrails.injectClaudeHookConfig(allocator, cfg_path);
+
+    const content1 = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content1);
+
+    var parsed1 = try std.json.parseFromSlice(std.json.Value, allocator, content1, .{ .allocate = .alloc_always });
+    defer parsed1.deinit();
+
+    const hooks1 = parsed1.value.object.get("hooks") orelse return error.MissingHooks;
+    const ptu1 = hooks1.object.get("PreToolUse") orelse return error.MissingPreToolUse;
+    try std.testing.expectEqual(@as(usize, 1), ptu1.array.items.len);
+
+    // Check matcher contains "Grep|Glob".
+    const entry1 = ptu1.array.items[0];
+    const matcher1 = entry1.object.get("matcher") orelse return error.MissingMatcher;
+    try std.testing.expect(std.mem.indexOf(u8, matcher1.string, "Grep|Glob") != null);
+
+    // Check nested hooks[0].command contains "hook --host claude".
+    const inner_hooks1 = entry1.object.get("hooks") orelse return error.MissingInnerHooks;
+    try std.testing.expectEqual(@as(usize, 1), inner_hooks1.array.items.len);
+    const cmd1 = inner_hooks1.array.items[0].object.get("command") orelse return error.MissingCommand;
+    try std.testing.expect(std.mem.indexOf(u8, cmd1.string, "hook --host claude") != null);
+
+    // Second call — must remain idempotent (still exactly 1 entry).
+    try guardrails.injectClaudeHookConfig(allocator, cfg_path);
+
+    const content2 = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content2);
+
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, allocator, content2, .{ .allocate = .alloc_always });
+    defer parsed2.deinit();
+
+    const hooks2 = parsed2.value.object.get("hooks") orelse return error.MissingHooks;
+    const ptu2 = hooks2.object.get("PreToolUse") orelse return error.MissingPreToolUse;
+    try std.testing.expectEqual(@as(usize, 1), ptu2.array.items.len);
+}
+
+test "claude hook config: migrates old Node-based enforce-zindeks-search entry" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "settings.json" });
+    defer allocator.free(cfg_path);
+
+    // Pre-seed with old Node-based hook entry.
+    const initial =
+        \\{
+        \\  "hooks": {
+        \\    "PreToolUse": [
+        \\      {
+        \\        "matcher": "Bash|Shell",
+        \\        "hooks": [
+        \\          {
+        \\            "type": "command",
+        \\            "command": "node .cursor/hooks/enforce-zindeks-search.js --host claude",
+        \\            "timeout": 5
+        \\          }
+        \\        ]
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+    try je.atomicWrite(allocator, cfg_path, initial);
+
+    // Run inject — should migrate: remove old, add new.
+    try guardrails.injectClaudeHookConfig(allocator, cfg_path);
+
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const hooks = parsed.value.object.get("hooks") orelse return error.MissingHooks;
+    const ptu = hooks.object.get("PreToolUse") orelse return error.MissingPreToolUse;
+
+    // Old entry gone, exactly 1 new entry.
+    try std.testing.expectEqual(@as(usize, 1), ptu.array.items.len);
+    // Old Node command must be absent.
+    try std.testing.expect(std.mem.indexOf(u8, content, "enforce-zindeks-search.js") == null);
+    // New binary command must be present.
+    try std.testing.expect(std.mem.indexOf(u8, content, "hook --host claude") != null);
 }

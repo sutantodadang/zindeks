@@ -61,6 +61,7 @@ pub const api = struct {
         pub const terminal = @import("api/cli/terminal.zig");
         pub const errors = @import("api/cli/errors.zig");
         pub const completions = @import("api/cli/completions.zig");
+        pub const hook = @import("api/cli/hook.zig");
         pub const install = struct {
             pub const adapters = @import("api/cli/install/adapters.zig");
             pub const json_edit = @import("api/cli/install/json_edit.zig");

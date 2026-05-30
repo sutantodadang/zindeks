@@ -4,6 +4,7 @@ zig-out/
 .vscode/
 .sisyphus/
 .claude/
+.cursor/
 
 # Exclude upstream CI/config from vendored dependencies
 vendor/**/.github/

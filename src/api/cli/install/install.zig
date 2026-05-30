@@ -200,6 +200,14 @@ fn installHost(
                         return err;
                     }
                 };
+                if (id == .claude_code) {
+                    guardrails.injectClaudeHookConfig(allocator, cfg_path) catch |err| {
+                        if (err == error.JsoncNotSupported) {
+                            try sw.print("  {s}skip{s}: hook JSONC config detected. Merge manually.\n", .{ sw.yellow(), sw.reset() });
+                        } else return err;
+                    };
+                    try sw.print("  enforcement hook: Grep/Glob -> zindeks (deny), shell grep -> ask\n", .{});
+                }
             }
         }
     }

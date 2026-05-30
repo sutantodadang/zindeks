@@ -1,4 +1,5 @@
 const std = @import("std");
+const gitignore = @import("gitignore.zig");
 
 /// Absolute upper bound for files we will index.  Anything larger is skipped
 /// with a warning.  64 MB is high enough to cover legitimate-but-large
@@ -68,7 +69,9 @@ pub fn scanPathStreaming(
 ) !void {
     var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
     defer root.close();
-    try scanDirStreaming(@TypeOf(context), allocator, root, "", context, on_file);
+    var rules = gitignore.collect(allocator, root_path) catch gitignore.RuleSet{ .allocator = allocator };
+    defer rules.deinit();
+    try scanDirStreaming(@TypeOf(context), allocator, root, "", context, on_file, &rules);
     if (progress_enabled) {
         std.debug.print("\r  {d} source files scanned.\n", .{progress_count});
     }
@@ -97,7 +100,9 @@ pub fn scanPathChunked(
 ) !void {
     var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
     defer root.close();
-    try scanDirChunked(@TypeOf(context), allocator, root, "", context, on_event);
+    var rules = gitignore.collect(allocator, root_path) catch gitignore.RuleSet{ .allocator = allocator };
+    defer rules.deinit();
+    try scanDirChunked(@TypeOf(context), allocator, root, "", context, on_event, &rules);
     if (progress_enabled) {
         std.debug.print("\r  {d} source files scanned.\n", .{progress_count});
     }
@@ -110,6 +115,7 @@ fn scanDirChunked(
     prefix: []const u8,
     context: Context,
     comptime on_event: fn (Context, ChunkEvent) anyerror!void,
+    rules: *const gitignore.RuleSet,
 ) !void {
     var it = dir.iterate();
     while (try it.next()) |entry| {
@@ -120,11 +126,16 @@ fn scanDirChunked(
             try std.fs.path.join(allocator, &.{ prefix, entry.name });
         errdefer allocator.free(rel);
 
+        if (ignoredByRules(allocator, rules, rel)) {
+            allocator.free(rel);
+            continue;
+        }
+
         switch (entry.kind) {
             .directory => {
                 var child = try dir.openDir(entry.name, .{ .iterate = true });
                 defer child.close();
-                try scanDirChunked(Context, allocator, child, rel, context, on_event);
+                try scanDirChunked(Context, allocator, child, rel, context, on_event, rules);
                 allocator.free(rel);
             },
             .file => {
@@ -200,7 +211,9 @@ pub fn scanPathMetadata(allocator: std.mem.Allocator, root_path: []const u8) ![]
 
     var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
     defer root.close();
-    try scanDirMetadata(allocator, root, "", &list);
+    var rules = gitignore.collect(allocator, root_path) catch gitignore.RuleSet{ .allocator = allocator };
+    defer rules.deinit();
+    try scanDirMetadata(allocator, root, "", &list, &rules);
     return list.toOwnedSlice(allocator);
 }
 
@@ -209,6 +222,7 @@ fn scanDirMetadata(
     dir: std.fs.Dir,
     prefix: []const u8,
     list: *std.ArrayList(FileMetadata),
+    rules: *const gitignore.RuleSet,
 ) !void {
     var it = dir.iterate();
     while (try it.next()) |entry| {
@@ -219,11 +233,16 @@ fn scanDirMetadata(
             try std.fs.path.join(allocator, &.{ prefix, entry.name });
         errdefer allocator.free(rel);
 
+        if (ignoredByRules(allocator, rules, rel)) {
+            allocator.free(rel);
+            continue;
+        }
+
         switch (entry.kind) {
             .directory => {
                 var child = try dir.openDir(entry.name, .{ .iterate = true });
                 defer child.close();
-                try scanDirMetadata(allocator, child, rel, list);
+                try scanDirMetadata(allocator, child, rel, list, rules);
                 allocator.free(rel);
             },
             .file => {
@@ -267,6 +286,7 @@ fn scanDirStreaming(
     prefix: []const u8,
     context: Context,
     comptime on_file: fn (Context, FileEntry) anyerror!void,
+    rules: *const gitignore.RuleSet,
 ) !void {
     var it = dir.iterate();
     while (try it.next()) |entry| {
@@ -277,11 +297,16 @@ fn scanDirStreaming(
             try std.fs.path.join(allocator, &.{ prefix, entry.name });
         errdefer allocator.free(rel);
 
+        if (ignoredByRules(allocator, rules, rel)) {
+            allocator.free(rel);
+            continue;
+        }
+
         switch (entry.kind) {
             .directory => {
                 var child = try dir.openDir(entry.name, .{ .iterate = true });
                 defer child.close();
-                try scanDirStreaming(Context, allocator, child, rel, context, on_file);
+                try scanDirStreaming(Context, allocator, child, rel, context, on_file, rules);
                 allocator.free(rel);
             },
             .file => {
@@ -332,6 +357,19 @@ fn shouldSkip(name: []const u8) bool {
     return false;
 }
 
+/// Match `rel` against gitignore rules.  Paths are built with the native
+/// separator ('\' on Windows) but gitignore patterns are always '/'-separated,
+/// so normalize before matching multi-component rules like `external/test262`.
+fn ignoredByRules(allocator: std.mem.Allocator, rules: *const gitignore.RuleSet, rel: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, rel, '\\') == null) return rules.matches(rel);
+    const norm = allocator.dupe(u8, rel) catch return rules.matches(rel);
+    defer allocator.free(norm);
+    for (norm) |*ch| {
+        if (ch.* == '\\') ch.* = '/';
+    }
+    return rules.matches(norm);
+}
+
 fn looksLikeSource(path: []const u8) bool {
     const exts = [_][]const u8{
         ".zig", ".zon", ".c",    ".h",  ".cpp", ".hpp", ".rs",  ".go", ".py",   ".js",   ".ts",
@@ -340,4 +378,41 @@ fn looksLikeSource(path: []const u8) bool {
     };
     for (exts) |ext| if (std.mem.endsWith(u8, path, ext)) return true;
     return false;
+}
+
+test "scanPathMetadata respects .gitignore" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Includes a multi-component rule (`nested/deep/`) — this is the case that
+    // requires separator normalization on Windows where rel paths use '\'.
+    try tmp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "skipme/\nnested/deep/\n" });
+    try tmp.dir.makePath("skipme");
+    try tmp.dir.writeFile(.{ .sub_path = "skipme/a.zig", .data = "const x = 1;" });
+    try tmp.dir.makePath("nested/deep");
+    try tmp.dir.writeFile(.{ .sub_path = "nested/deep/c.zig", .data = "const z = 3;" });
+    try tmp.dir.writeFile(.{ .sub_path = "nested/keep2.zig", .data = "const w = 4;" });
+    try tmp.dir.writeFile(.{ .sub_path = "keep.zig", .data = "const y = 2;" });
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_path = try tmp.dir.realpath(".", &buf);
+
+    const entries = try scanPathMetadata(allocator, real_path);
+    defer freeMetadata(allocator, entries);
+
+    var found_keep = false;
+    var found_keep2 = false;
+    var found_skipme = false;
+    var found_deep = false;
+    for (entries) |e| {
+        if (std.mem.endsWith(u8, e.path, "keep.zig")) found_keep = true;
+        if (std.mem.endsWith(u8, e.path, "keep2.zig")) found_keep2 = true;
+        if (std.mem.indexOf(u8, e.path, "skipme") != null) found_skipme = true;
+        if (std.mem.indexOf(u8, e.path, "deep") != null) found_deep = true;
+    }
+    try std.testing.expect(found_keep);
+    try std.testing.expect(found_keep2);
+    try std.testing.expect(!found_skipme);
+    try std.testing.expect(!found_deep);
 }

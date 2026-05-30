@@ -67,12 +67,12 @@ pub fn collect(allocator: std.mem.Allocator, root: []const u8) !RuleSet {
     var set = RuleSet{ .allocator = allocator };
 
     // Gather path components so we can walk upward.
-    var dirs = std.ArrayList([]const u8){};
+    var dirs = std.ArrayListUnmanaged([]const u8){};
     defer dirs.deinit(allocator);
 
     var cur = root;
     while (true) {
-        try dirs.append(cur);
+        try dirs.append(allocator, cur);
         const parent = std.fs.path.dirname(cur) orelse break;
         if (std.mem.eql(u8, parent, cur)) break;
         cur = parent;
@@ -82,7 +82,7 @@ pub fn collect(allocator: std.mem.Allocator, root: []const u8) !RuleSet {
     var i: usize = dirs.items.len;
     while (i > 0) {
         i -= 1;
-        const d = try std.fs.cwd().openDir(dirs.items[i], .{});
+        var d = try std.fs.cwd().openDir(dirs.items[i], .{});
         defer d.close();
 
         for ([_][]const u8{ ".gitignore", ".cbmignore" }) |name| {

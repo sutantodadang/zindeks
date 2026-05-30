@@ -6,7 +6,6 @@ const json_edit = @import("json_edit.zig");
 const tmpl = @import("templates.zig");
 
 pub const cursor_hook_command = "node .cursor/hooks/enforce-zindeks-search.js --host cursor";
-pub const claude_hook_command = "node .cursor/hooks/enforce-zindeks-search.js --host claude";
 
 const cursor_hook_matcher =
     "rg|grep|git\\s+grep|findstr|Select-String|Get-ChildItem|\\bgci\\b|\\bdir\\s+/s";
@@ -112,7 +111,7 @@ pub fn injectManagedBlock(
 
 pub fn injectCursorHookConfig(allocator: std.mem.Allocator, path: []const u8) !void {
     var root = try readJsonObject(allocator, path);
-    defer root.arena.deinit();
+    defer root.deinit();
 
     const aa = root.arena.allocator();
     if (root.value.object.getPtr("version") == null) {
@@ -134,36 +133,88 @@ pub fn injectCursorHookConfig(allocator: std.mem.Allocator, path: []const u8) !v
 
 pub fn injectClaudeHookConfig(allocator: std.mem.Allocator, path: []const u8) !void {
     var root = try readJsonObject(allocator, path);
-    defer root.arena.deinit();
+    defer root.deinit();
 
     const aa = root.arena.allocator();
+
+    // Resolve binary path and build the hook command string.
+    const bin = try adapters.selfExePath(aa);
+    const needs_quotes = std.mem.indexOfScalar(u8, bin, ' ') != null;
+    const q: []const u8 = if (needs_quotes) "\"" else "";
+    const command = try std.fmt.allocPrint(aa, "{s}{s}{s} hook --host claude", .{ q, bin, q });
+
     const hooks = try ensureObjectField(aa, &root.value, "hooks");
     const pre_tool_use = try ensureArrayField(aa, hooks, "PreToolUse");
-    if (!arrayContainsNestedHookCommand(pre_tool_use, claude_hook_command)) {
-        var command_hook = std.json.ObjectMap.init(aa);
-        try command_hook.put("type", .{ .string = "command" });
-        try command_hook.put("command", .{ .string = claude_hook_command });
-        try command_hook.put("timeout", .{ .integer = 5 });
 
-        var inner_hooks = std.json.Array.init(aa);
-        try inner_hooks.append(.{ .object = command_hook });
-
-        var pre_hook = std.json.ObjectMap.init(aa);
-        try pre_hook.put("matcher", .{ .string = "Bash|Shell" });
-        try pre_hook.put("hooks", .{ .array = inner_hooks });
-        try pre_tool_use.array.append(.{ .object = pre_hook });
+    // MIGRATE/IDEMPOTENT: remove any pre-existing zindeks-managed entries
+    // (old Node-based hooks or previous binary hooks) before appending.
+    var filtered = std.json.Array.init(aa);
+    for (pre_tool_use.array.items) |entry| {
+        if (nestedHookCommandContains(entry, "zindeks") or
+            nestedHookCommandContains(entry, "enforce-zindeks-search"))
+        {
+            continue; // drop old zindeks hook entry
+        }
+        try filtered.append(entry);
     }
+    pre_tool_use.array = filtered;
+
+    // Append the new binary-based entry.
+    var command_hook = std.json.ObjectMap.init(aa);
+    try command_hook.put("type", .{ .string = "command" });
+    try command_hook.put("command", .{ .string = command });
+    try command_hook.put("timeout", .{ .integer = 5 });
+
+    var inner_hooks = std.json.Array.init(aa);
+    try inner_hooks.append(.{ .object = command_hook });
+
+    var pre_hook = std.json.ObjectMap.init(aa);
+    try pre_hook.put("matcher", .{ .string = "Grep|Glob|Bash" });
+    try pre_hook.put("hooks", .{ .array = inner_hooks });
+    try pre_tool_use.array.append(.{ .object = pre_hook });
 
     try writeJsonObject(allocator, aa, path, root.value);
 }
 
+/// Returns true if the nested hooks[].command of `entry` contains `needle`.
+fn nestedHookCommandContains(entry: std.json.Value, needle: []const u8) bool {
+    if (entry != .object) return false;
+    const hooks_val = entry.object.get("hooks") orelse return false;
+    if (hooks_val != .array) return false;
+    for (hooks_val.array.items) |hook| {
+        if (hook != .object) continue;
+        const cmd_val = hook.object.get("command") orelse continue;
+        if (cmd_val != .string) continue;
+        if (std.mem.indexOf(u8, cmd_val.string, needle) != null) return true;
+    }
+    return false;
+}
+
+/// ArenaAllocator is heap-allocated so its address is stable when JsonRoot
+/// is returned by value.  The ObjectMaps inside `value` store the arena's
+/// `Allocator` (which has a pointer to the arena struct), so the arena must
+/// not move after those ObjectMaps are created.
 const JsonRoot = struct {
-    arena: std.heap.ArenaAllocator,
+    /// Heap-allocated so the address is stable; caller must call arena.deinit()
+    /// then free this pointer via the original allocator.
+    arena: *std.heap.ArenaAllocator,
+    _alloc: std.mem.Allocator, // original allocator used to create `arena`
     value: std.json.Value,
+
+    pub fn deinit(self: *JsonRoot) void {
+        self.arena.deinit();
+        self._alloc.destroy(self.arena);
+    }
 };
 
 fn readJsonObject(allocator: std.mem.Allocator, path: []const u8) !JsonRoot {
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    // Heap-allocate the arena so its address is stable when JsonRoot is
+    // returned by value.  ObjectMaps store an Allocator whose ptr points to
+    // this arena; if the arena were on the stack it would become dangling
+    // after the return.
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const aa = arena.allocator();
 
@@ -178,23 +229,18 @@ fn readJsonObject(allocator: std.mem.Allocator, path: []const u8) !JsonRoot {
 
     if (json_edit.hasComments(existing)) return error.JsoncNotSupported;
 
-    var value: std.json.Value = blk: {
-        const parsed = std.json.parseFromSlice(
-            std.json.Value,
-            aa,
-            existing,
-            .{ .allocate = .alloc_always },
-        ) catch {
-            break :blk .{ .object = std.json.ObjectMap.init(aa) };
-        };
-        break :blk parsed.value;
-    };
+    var value: std.json.Value = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        aa,
+        existing,
+        .{ .allocate = .alloc_always },
+    ) catch .{ .object = std.json.ObjectMap.init(aa) };
 
     if (value != .object) {
         value = .{ .object = std.json.ObjectMap.init(aa) };
     }
 
-    return .{ .arena = arena, .value = value };
+    return .{ .arena = arena, ._alloc = allocator, .value = value };
 }
 
 fn writeJsonObject(
@@ -245,17 +291,6 @@ fn arrayContainsHookCommand(array_value: *const std.json.Value, command: []const
         if (item != .object) continue;
         const command_value = item.object.get("command") orelse continue;
         if (command_value == .string and std.mem.eql(u8, command_value.string, command)) return true;
-    }
-    return false;
-}
-
-fn arrayContainsNestedHookCommand(array_value: *const std.json.Value, command: []const u8) bool {
-    if (array_value.* != .array) return false;
-    for (array_value.array.items) |item| {
-        if (item != .object) continue;
-        const hooks_value = item.object.get("hooks") orelse continue;
-        if (hooks_value != .array) continue;
-        if (arrayContainsHookCommand(&hooks_value, command)) return true;
     }
     return false;
 }

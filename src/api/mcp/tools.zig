@@ -85,7 +85,7 @@ pub const update_index = Descriptor{
 
 pub const index_repository = Descriptor{
     .name = "index_repository",
-    .description = "Index a repository into the knowledge graph. BM25 full-text search (search_code) works across 20+ languages. AST-level symbol and edge extraction (calls, imports, types — powering search_graph, trace_call_path, get_architecture) is available for Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, and C++.",
+    .description = "Index a repository into the knowledge graph. BM25 full-text search (search_code) works across 20+ languages. AST-level symbol and edge extraction (calls, imports, types — powering search_graph, trace_call_path, get_architecture) is available for Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, and C++. If the repo is already indexed, only changed files are re-processed (fast); pass force:true for a full rebuild.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -93,6 +93,10 @@ pub const index_repository = Descriptor{
     \\    "path": {
     \\      "type": "string",
     \\      "description": "Absolute path to the repository root directory"
+    \\    },
+    \\    "force": {
+    \\      "type": "boolean",
+    \\      "description": "Force a full re-index even if the repo is already indexed (default: incremental update of changed files only)"
     \\    }
     \\  },
     \\  "required": ["path"]
@@ -768,18 +772,49 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
         try writer.writeAll("{\"error\":\"Missing required param: path\"}");
         return;
     };
+    const force = getBool(params, "force") orelse false;
 
-    // Prepare project store write location
+    // Incremental path: if already indexed and not forced, apply only changes.
+    var read_loc = project_store.resolveRead(ctx.allocator, repo_path, .{}) catch null;
+    if (!force) {
+        if (read_loc) |*rl| {
+            var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+            const project_path = try std.fs.cwd().realpath(repo_path, &pbuf);
+            const graph_path = try std.fs.path.join(ctx.allocator, &.{ rl.index_dir, "graph.db" });
+            defer ctx.allocator.free(graph_path);
+            const graph_path_z = try ctx.allocator.dupeZ(u8, graph_path);
+            defer ctx.allocator.free(graph_path_z);
+            var gdb = try graph_db.GraphDb.open(graph_path_z);
+            try gdb.migrate();
+            defer gdb.close();
+            var diff = incremental.detectChanges(ctx.allocator, &gdb, project_path) catch {
+                rl.deinit();
+                try writer.writeAll("{\"error\":\"Failed to detect changes.\"}");
+                return;
+            };
+            defer diff.deinit();
+            const stats = incremental.applyChangesWithOverlayPooled(ctx.allocator, &gdb, project_path, rl.index_dir, &diff, ctx.parser_pool) catch |err| {
+                rl.deinit();
+                try writer.print("{{\"error\":\"applyChangesWithOverlay failed: {s}\"}}", .{@errorName(err)});
+                return;
+            };
+            try writer.print(
+                \\{{"project":"{s}","mode":"incremental","added":{},"modified":{},"deleted":{},"symbols_added":{},"edges_added":{},"errors":{},"duration_ms":{}}}
+            , .{ project_path, stats.added, stats.modified, stats.deleted, stats.symbols_added, stats.edges_added, stats.errors, stats.duration_ms });
+            rl.deinit();
+            return;
+        }
+    } else {
+        if (read_loc) |*rl| rl.deinit();
+    }
+
+    // Full build path (force=true or not yet indexed).
     var loc = try project_store.prepareWrite(ctx.allocator, repo_path, .{});
     defer loc.deinit();
 
-    // Run binary indexer (for BM25 search)
     try indexer.indexPath(ctx.allocator, repo_path, loc.index_dir);
-    // Persist this newly-built segment as the active project snapshot so the
-    // server's post-tool auto-load attaches the same data we just indexed.
     try loc.commit();
 
-    // Open graph DB and run pipeline (for structural knowledge graph)
     var project_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_dir = try std.fs.cwd().realpath(repo_path, &project_dir_buf);
     var index_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -794,12 +829,11 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
     try gdb.migrate();
     defer gdb.close();
 
-    // Run the multi-pass pipeline to extract symbols + edges via tree-sitter
     var pipe = pipeline_mod.Pipeline.init(ctx.allocator, gdb, project_dir);
     const pipe_result = try pipe.run();
 
     try writer.print(
-        \\{{"project":"{s}","files_indexed":{},"symbols":{},"edges":{},"pipeline_ms":{}}}
+        \\{{"project":"{s}","mode":"full","files_indexed":{},"symbols":{},"edges":{},"pipeline_ms":{}}}
     , .{ project_dir, pipe_result.files_scanned, pipe_result.symbols_extracted, pipe_result.edges_extracted, pipe_result.duration_ms });
 }
 
@@ -2646,6 +2680,14 @@ fn getString(params: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = params.get(key) orelse return null;
     return switch (value) {
         .string => |s| s,
+        else => null,
+    };
+}
+
+fn getBool(params: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = params.get(key) orelse return null;
+    return switch (value) {
+        .bool => |b| b,
         else => null,
     };
 }
