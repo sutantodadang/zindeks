@@ -725,6 +725,8 @@ pub const Context = struct {
     /// Resolved index directory for the currently loaded project.  Required
     /// by `update_index` to know where to rebuild the overlay sub-index.
     index_dir: ?[]const u8 = null,
+    /// Custom store root override, forwarded from the CLI `--store-root` flag.
+    store_root: ?[]const u8 = null,
     /// Optional transport pointer.  When present, handlers that support
     /// streaming may emit JSON-RPC notifications via the transport so the
     /// client sees partial results before the final tool response.  Nil
@@ -851,7 +853,7 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
     const force = getBool(params, "force") orelse false;
 
     // Incremental path: if already indexed and not forced, apply only changes.
-    var read_loc = project_store.resolveRead(ctx.allocator, repo_path, .{}) catch null;
+    var read_loc = project_store.resolveRead(ctx.allocator, repo_path, .{ .store_root = ctx.store_root }) catch null;
     if (!force) {
         if (read_loc) |*rl| {
             var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -885,7 +887,7 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
     }
 
     // Full build path (force=true or not yet indexed).
-    var loc = try project_store.prepareWrite(ctx.allocator, repo_path, .{});
+    var loc = try project_store.prepareWrite(ctx.allocator, repo_path, .{ .store_root = ctx.store_root });
     defer loc.deinit();
 
     try indexer.indexPath(ctx.allocator, repo_path, loc.index_dir);
@@ -920,7 +922,7 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 fn handleListProjects(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     _ = params_obj;
 
-    const store_root = try project_store.defaultStoreRoot(ctx.allocator, null);
+    const store_root = try project_store.defaultStoreRoot(ctx.allocator, ctx.store_root);
     defer ctx.allocator.free(store_root);
 
     const projects_dir = try std.fs.path.join(ctx.allocator, &.{ store_root, "projects" });
@@ -1111,7 +1113,7 @@ fn handleGetGraphSchema(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
         if (!first) try writer.writeByte(',');
         first = false;
         try writer.print(
-            \\{{"name":{any},"row_count":{}}}
+            \\{{"name":{f},"row_count":{}}}
         , .{ std.json.fmt(table_name, .{}), count });
     }
     try writer.writeAll("]}");
@@ -1634,7 +1636,7 @@ fn handleDeleteProject(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
     const project_id = try std.fmt.allocPrint(ctx.allocator, "{s}-{x:0>16}", .{ safe_base, hash });
     defer ctx.allocator.free(project_id);
 
-    const store_root = try project_store.defaultStoreRoot(ctx.allocator, null);
+    const store_root = try project_store.defaultStoreRoot(ctx.allocator, ctx.store_root);
     defer ctx.allocator.free(store_root);
 
     const project_dir = try std.fs.path.join(ctx.allocator, &.{ store_root, "projects", project_id });

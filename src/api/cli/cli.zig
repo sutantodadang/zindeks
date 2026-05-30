@@ -6,6 +6,7 @@ const project_store = @import("../../core/project_store.zig");
 const storage = @import("../../core/storage/index.zig");
 const search = @import("../../core/search/engine.zig");
 const graph_db = @import("../../core/storage/graph_db.zig");
+const pipeline_mod = @import("../../core/parser/pipeline.zig");
 const mcp = @import("../mcp/server.zig");
 const protocol = @import("../mcp/protocol.zig");
 const update = @import("update.zig");
@@ -268,11 +269,42 @@ fn runIndex(state: *CliState, args: []const []const u8) !void {
         return err;
     };
 
+    // Extract symbols + edges into the graph DB — the same tree-sitter pipeline
+    // the MCP `index_repository` runs.  Without this, `index` would build only
+    // the BM25 search index and leave the graph empty (search_graph,
+    // trace_call_path, get_architecture, file_outline would all return nothing).
+    runGraphPipeline(state.allocator, parsed.repo, location.index_dir) catch |err| {
+        spin.done(false);
+        return err;
+    };
+
     spin.done(true);
 
     try location.commit();
 
     try sw.print("{s}Done.{s}\n", .{ sw.green(), sw.reset() });
+}
+
+/// Run the tree-sitter symbol/edge extraction pipeline against the freshly
+/// built index segment.  Mirrors the full-build path of the MCP
+/// `index_repository` handler so CLI `index` produces a complete graph.
+fn runGraphPipeline(allocator: std.mem.Allocator, repo: []const u8, index_dir: []const u8) !void {
+    var project_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const project_dir = try std.fs.cwd().realpath(repo, &project_dir_buf);
+    var index_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_index_dir = try std.fs.cwd().realpath(index_dir, &index_dir_buf);
+
+    const graph_path = try std.fs.path.join(allocator, &.{ abs_index_dir, "graph.db" });
+    defer allocator.free(graph_path);
+    const graph_path_z = try allocator.dupeZ(u8, graph_path);
+    defer allocator.free(graph_path_z);
+
+    var gdb = try graph_db.GraphDb.open(graph_path_z);
+    try gdb.migrate();
+    defer gdb.close();
+
+    var pipe = pipeline_mod.Pipeline.init(allocator, gdb, project_dir);
+    _ = try pipe.run();
 }
 
 // ── Subcommand: reindex ───────────────────────────────────────────────
@@ -439,7 +471,7 @@ fn runServe(state: *CliState, args: []const []const u8) !void {
 
     switch (mode) {
         .stdio => {
-            var server = mcp.Server.init(state.allocator, .{});
+            var server = mcp.Server.init(state.allocator, .{ .store_root = state.cfg.store_root });
             defer server.deinit();
             try server.serve();
         },
@@ -488,7 +520,7 @@ fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
             std.log.err("accept failed: {s}", .{@errorName(err)});
             continue;
         };
-        const thread = std.Thread.spawn(.{}, sessionThread, .{ state.allocator, conn.stream }) catch |err| {
+        const thread = std.Thread.spawn(.{}, sessionThread, .{ state.allocator, conn.stream, state.cfg.store_root }) catch |err| {
             std.log.err("spawn session thread failed: {s}", .{@errorName(err)});
             conn.stream.close();
             continue;
@@ -497,9 +529,9 @@ fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
     }
 }
 
-fn sessionThread(allocator: std.mem.Allocator, stream: std.net.Stream) void {
+fn sessionThread(allocator: std.mem.Allocator, stream: std.net.Stream, store_root: ?[]const u8) void {
     const transport = protocol.Transport.initSocket(allocator, stream);
-    var server = mcp.Server.initWithTransport(allocator, .{}, transport);
+    var server = mcp.Server.initWithTransport(allocator, .{ .store_root = store_root }, transport);
     defer server.deinit();
     server.serve() catch |err| {
         std.log.warn("session ended with error: {s}", .{@errorName(err)});

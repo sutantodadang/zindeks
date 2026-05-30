@@ -19,6 +19,7 @@ const ParserPool = incremental.ParserPool;
 const ServerInfo = struct {
     name: []const u8 = "zindeks",
     version: []const u8 = version.version,
+    store_root: ?[]const u8 = null,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +116,7 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     transport: protocol.Transport,
     info: ServerInfo,
+    store_root: ?[]const u8,
     initialized: bool,
     // ── Guarded by meta_lock ─────────────────────────────────────────────
     project_path: ?[]const u8,
@@ -187,6 +189,7 @@ pub const Server = struct {
             .allocator = allocator,
             .transport = transport,
             .info = info,
+            .store_root = info.store_root,
             .initialized = false,
             .project_path = null,
             .index_dir = null,
@@ -347,7 +350,7 @@ pub const Server = struct {
 
         // Probe the project store; if no warm index, leave the server in
         // its no-project state and let the agent call index_repository.
-        var probe = project_store.resolveRead(self.allocator, project_path, .{}) catch return;
+        var probe = project_store.resolveRead(self.allocator, project_path, .{ .store_root = self.store_root }) catch return;
         probe.deinit();
 
         // Auto-attach at initialize time: acquire all sub-locks exclusively
@@ -529,6 +532,7 @@ pub const Server = struct {
             .gdb = if (self.gdb != null) &self.gdb.? else null,
             .project_path = self.project_path,
             .index_dir = self.index_dir,
+            .store_root = self.store_root,
             .transport = &self.transport,
             .request_id = req.id,
             .parser_pool = &self.parser_pool,
@@ -597,6 +601,7 @@ pub const Server = struct {
             .gdb = gdb_ptr,
             .project_path = self.project_path,
             .index_dir = self.index_dir,
+            .store_root = self.store_root,
             .transport = &self.transport,
             .request_id = id,
             .parser_pool = &self.parser_pool,
@@ -706,7 +711,7 @@ pub const Server = struct {
     /// the auto-detect path on `initialize`.  Tears down any currently
     /// loaded project, opens the new one, and primes the engine + overlay.
     fn openProjectByPath(self: *Server, path: []const u8) !void {
-        var loc = project_store.resolveRead(self.allocator, path, .{}) catch {
+        var loc = project_store.resolveRead(self.allocator, path, .{ .store_root = self.store_root }) catch {
             return;
         };
         defer loc.deinit();
