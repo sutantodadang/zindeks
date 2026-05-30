@@ -47,7 +47,11 @@ pub const Pipeline = struct {
         var reg = Registry.init();
         // Register built-in extractors
         reg.register(.zig, @import("zig_extractor.zig").extractor) catch {};
-        // Future: register C, Go, JS, Python, Rust extractors here
+        // Generic config-driven extractors for all other supported languages
+        const generic = @import("generic_extractor.zig");
+        inline for ([_]ts.LanguageId{ .python, .javascript, .typescript, .tsx, .go, .rust, .java, .c, .cpp }) |gid| {
+            reg.register(gid, generic.extractorFor(gid)) catch {};
+        }
         return .{
             .allocator = allocator,
             .gdb = gdb,

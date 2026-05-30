@@ -207,6 +207,11 @@ pub fn applyChanges(
     // Set up extractor registry
     var reg = Registry.init();
     reg.register(.zig, @import("../parser/zig_extractor.zig").extractor) catch {};
+    // Generic config-driven extractors for all other supported languages
+    const generic = @import("../parser/generic_extractor.zig");
+    inline for ([_]ts.LanguageId{ .python, .javascript, .typescript, .tsx, .go, .rust, .java, .c, .cpp }) |gid| {
+        reg.register(gid, generic.extractorFor(gid)) catch {};
+    }
 
     // ── Begin transaction ──────────────────────────────────────────────
     try gdb.exec("BEGIN TRANSACTION");

@@ -213,3 +213,107 @@ test "zig extractor extracts functions and types from source" {
     try testing.expect(found_struct);
     try testing.expect(found_enum);
 }
+
+test "python extractor: function, class, method, call edge" {
+    const source =
+        \\def helper():
+        \\    pass
+        \\
+        \\def foo():
+        \\    helper()
+        \\
+        \\class Bar:
+        \\    def baz(self):
+        \\        helper()
+    ;
+
+    const result = try zindeks.parser.generic_extractor.extract(testing.allocator, source, .python);
+    defer {
+        var mut_result = result;
+        mut_result.deinit(testing.allocator);
+    }
+
+    var found_function = false;
+    var found_class = false;
+    var found_method = false;
+    for (result.symbols) |sym| {
+        if (sym.kind == .function) found_function = true;
+        if (sym.kind == .struct_type) found_class = true;
+        if (sym.kind == .method) found_method = true;
+    }
+    try testing.expect(found_function);
+    try testing.expect(found_class);
+    try testing.expect(found_method);
+
+    var found_call = false;
+    for (result.edges) |edge| {
+        if (edge.edge_type == .calls) found_call = true;
+    }
+    try testing.expect(found_call);
+}
+
+test "go extractor: func, struct type, method" {
+    const source =
+        \\package main
+        \\
+        \\func Foo() {}
+        \\
+        \\type Point struct {
+        \\    X int
+        \\}
+        \\
+        \\func (p Point) Dist() int {
+        \\    return p.X
+        \\}
+    ;
+
+    const result = try zindeks.parser.generic_extractor.extract(testing.allocator, source, .go);
+    defer {
+        var mut_result = result;
+        mut_result.deinit(testing.allocator);
+    }
+
+    var found_func = false;
+    var found_struct = false;
+    var found_method = false;
+    for (result.symbols) |sym| {
+        if (std.mem.eql(u8, sym.name, "Foo") and sym.kind == .function) found_func = true;
+        if (std.mem.eql(u8, sym.name, "Point") and sym.kind == .struct_type) found_struct = true;
+        if (sym.kind == .method) found_method = true;
+    }
+    try testing.expect(found_func);
+    try testing.expect(found_struct);
+    try testing.expect(found_method);
+}
+
+test "typescript extractor: interface, class, method" {
+    const source =
+        \\interface Shape {
+        \\    area(): number;
+        \\}
+        \\
+        \\class Circle implements Shape {
+        \\    area(): number {
+        \\        return 1;
+        \\    }
+        \\}
+    ;
+
+    const result = try zindeks.parser.generic_extractor.extract(testing.allocator, source, .typescript);
+    defer {
+        var mut_result = result;
+        mut_result.deinit(testing.allocator);
+    }
+
+    var found_interface = false;
+    var found_class = false;
+    var found_method = false;
+    for (result.symbols) |sym| {
+        if (sym.kind == .interface) found_interface = true;
+        if (std.mem.eql(u8, sym.name, "Circle") and sym.kind == .struct_type) found_class = true;
+        if (sym.kind == .method) found_method = true;
+    }
+    try testing.expect(found_interface);
+    try testing.expect(found_class);
+    try testing.expect(found_method);
+}

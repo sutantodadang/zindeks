@@ -44,6 +44,7 @@ pub const parser = struct {
     pub const tree_sitter = @import("core/parser/tree_sitter.zig");
     pub const extractor = @import("core/parser/extractor.zig");
     pub const zig_extractor = @import("core/parser/zig_extractor.zig");
+    pub const generic_extractor = @import("core/parser/generic_extractor.zig");
     pub const pipeline = @import("core/parser/pipeline.zig");
     pub const http_routes = @import("core/parser/http_routes.zig");
 };

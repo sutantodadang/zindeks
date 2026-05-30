@@ -85,7 +85,7 @@ pub const update_index = Descriptor{
 
 pub const index_repository = Descriptor{
     .name = "index_repository",
-    .description = "Index a repository into the knowledge graph. Supports Zig source files with AST-level symbol and import extraction.",
+    .description = "Index a repository into the knowledge graph. BM25 full-text search (search_code) works across 20+ languages. AST-level symbol and edge extraction (calls, imports, types — powering search_graph, trace_call_path, get_architecture) is available for Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, and C++.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -860,7 +860,7 @@ fn handleListProjects(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 
 fn handleSearchCode(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -979,7 +979,7 @@ fn handleGetGraphSchema(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
     _ = params_obj;
 
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1013,7 +1013,7 @@ fn handleGetGraphSchema(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 
 fn handleSearchGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1096,7 +1096,7 @@ fn handleSearchGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
 
 fn handleGetCodeSnippet(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1210,7 +1210,7 @@ fn handleGetCodeSnippet(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 
 fn handleQueryGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1315,12 +1315,12 @@ fn handleQueryGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
 
 fn handleDetectChanges(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
     const project_path = ctx.project_path orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1368,11 +1368,11 @@ fn handleDetectChanges(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 fn handleUpdateIndex(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     _ = params_obj;
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
     const project_path = ctx.project_path orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
     const index_dir = ctx.index_dir orelse {
@@ -1414,7 +1414,7 @@ fn handleIndexStatus(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     _ = params_obj;
 
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1458,7 +1458,7 @@ fn handleHealthCheck(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     _ = params_obj;
 
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1552,7 +1552,7 @@ fn handleDeleteProject(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 
 fn handleTraceCallPath(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
     const params = params_obj orelse {
@@ -1643,7 +1643,7 @@ fn handleTraceCallPath(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 
 fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1735,7 +1735,7 @@ fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 
 fn handleManageAdr(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1826,7 +1826,7 @@ fn handleManageAdr(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyty
 
 fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1875,7 +1875,7 @@ fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, write
 
 fn handleListCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -1936,7 +1936,7 @@ fn handleListCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 
 fn handleGetSymbolCommunity(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -2003,7 +2003,7 @@ fn isCypherQuery(query: []const u8) bool {
 
 fn handleRenameSymbol(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -2170,7 +2170,7 @@ fn replaceWord(allocator: std.mem.Allocator, haystack: []const u8, old_word: []c
 
 fn handleIngestTraces(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -2206,7 +2206,7 @@ fn handleIngestTraces(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 
 fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
@@ -2248,7 +2248,7 @@ fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 
 fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
     const gdb = ctx.gdb orelse {
@@ -2297,7 +2297,7 @@ fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 
 fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
     const gdb = ctx.gdb orelse {
@@ -2392,7 +2392,7 @@ fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
 
 fn handleSummarizeSymbol(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository first.\"}");
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
         return;
     };
 
