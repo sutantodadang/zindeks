@@ -2708,6 +2708,21 @@ pub const RenderStats = struct {
     truncated: bool,
 };
 
+/// Max bytes emitted per line before truncation, mirroring Claude's native Read
+/// tool. Guards against minified/bundled files where a single line can be
+/// megabytes long and would otherwise blow up the response.
+const MAX_LINE_BYTES = 2000;
+
+/// Largest length <= `limit` that does not split a UTF-8 multi-byte sequence,
+/// so the truncated slice stays valid UTF-8 for JSON encoding. Backs off over
+/// any trailing continuation bytes (0b10xxxxxx) and the lead byte they follow.
+fn utf8SafeCut(bytes: []const u8, limit: usize) usize {
+    if (limit >= bytes.len) return bytes.len;
+    var cut = limit;
+    while (cut > 0 and (bytes[cut] & 0xC0) == 0x80) cut -= 1;
+    return cut;
+}
+
 /// Emit a pending run of blank lines and reset the counter.  A run of >=2 is
 /// collapsed into a single `⋮` marker; a lone blank line is emitted as an
 /// empty numbered row.  No-op when the counter is zero.
@@ -2782,7 +2797,12 @@ pub fn renderNumbered(
                 blank_count += 1;
             } else {
                 try flushBlankRun(out_w, blank_start, &blank_count);
-                try out_w.print("{d}\t{s}\n", .{ idx + 1, line });
+                if (line.len > MAX_LINE_BYTES) {
+                    const cut = utf8SafeCut(line, MAX_LINE_BYTES);
+                    try out_w.print("{d}\t{s}… (+{d} chars)\n", .{ idx + 1, line[0..cut], line.len - cut });
+                } else {
+                    try out_w.print("{d}\t{s}\n", .{ idx + 1, line });
+                }
             }
         } else if (idx >= win_end and blank_count > 0) {
             // First line past the window — flush any run that ended at the
@@ -3281,6 +3301,38 @@ test "renderNumbered: blank run at window end is flushed" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "2\t⋮ (2 blank lines)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "4\ty") == null);
     try std.testing.expect(stats.truncated == true);
+}
+
+test "renderNumbered: over-long line is truncated at MAX_LINE_BYTES" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    // One line of 2050 'a's — 50 bytes over the cap.
+    const long = "a" ** (MAX_LINE_BYTES + 50);
+    const stats = try renderNumbered(allocator, long, 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 1), stats.total_lines);
+    // Exactly MAX_LINE_BYTES content bytes emitted, then the overflow marker.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "… (+50 chars)") != null);
+    // Body must not contain all 2050 'a's: the rendered slice is the prefix only.
+    const expected_prefix = "1\t" ++ ("a" ** MAX_LINE_BYTES) ++ "…";
+    try std.testing.expect(std.mem.indexOf(u8, out.items, expected_prefix) != null);
+}
+
+test "renderNumbered: truncation backs off to a UTF-8 boundary" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    // (MAX_LINE_BYTES - 1) ASCII bytes, then a 3-byte char (€ = E2 82 AC) that
+    // straddles the cap. The cut must back off to before €, not split it.
+    const line = ("a" ** (MAX_LINE_BYTES - 1)) ++ "€" ++ "tail";
+    const stats = try renderNumbered(allocator, line, 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 1), stats.total_lines);
+    // Output remains valid UTF-8 (no split multi-byte sequence).
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out.items));
+    // The € (3 bytes) plus "tail" (4 bytes) = 7 dropped bytes.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "… (+7 chars)") != null);
 }
 
 test "globMatch: basic patterns" {
