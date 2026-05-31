@@ -340,13 +340,11 @@ pub const Server = struct {
     /// warm index exists, attach via `openProjectByPath`.  If not, do
     /// nothing; the agent's first `index_repository` call will create one.
     fn tryAutoAttach(self: *Server, params: ?std.json.ObjectMap) !void {
-        const project_path = (try self.resolveInitialProject(params)) orelse return;
+        // Resolve a path that actually has a warm index.  If none is found,
+        // leave the server in its no-project state and let the agent call
+        // index_repository.
+        const project_path = (try self.resolveWarmProject(params)) orelse return;
         defer self.allocator.free(project_path);
-
-        // Probe the project store; if no warm index, leave the server in
-        // its no-project state and let the agent call index_repository.
-        var probe = project_store.resolveRead(self.allocator, project_path, .{ .store_root = self.store_root }) catch return;
-        probe.deinit();
 
         // Auto-attach at initialize time: acquire all sub-locks exclusively
         // in documented order (no in-flight workers yet at this point, so
@@ -361,6 +359,60 @@ pub const Server = struct {
         self.gdb_rwlock.lock();
         defer self.gdb_rwlock.unlock();
         try self.openProjectByPath(project_path);
+    }
+
+    /// Pick a project path that has a warm index in the store.  Resolution:
+    ///   1. The explicit candidate (params / ZINDEKS_PROJECT env / git-walk)
+    ///      — used only if it actually has a warm index.
+    ///   2. Otherwise the nearest indexed ancestor of cwd.  This handles an
+    ///      umbrella directory that holds several child repos but is not a
+    ///      git repo itself: cwd resolves to a child via git-walk (no warm
+    ///      index there), so we walk up cwd until we hit the indexed umbrella.
+    /// Returns an owned path with a confirmed warm index, or null.
+    fn resolveWarmProject(self: *Server, params: ?std.json.ObjectMap) !?[]u8 {
+        if (try self.resolveInitialProject(params)) |candidate| {
+            if (self.hasWarmIndex(candidate)) return candidate;
+            self.allocator.free(candidate);
+        }
+        return self.findWarmAncestor();
+    }
+
+    /// Return true when `path` resolves to a warm (indexed) project in the
+    /// store.  Cheap probe — reads the project's `current` marker.
+    fn hasWarmIndex(self: *Server, path: []const u8) bool {
+        var loc = project_store.resolveRead(
+            self.allocator,
+            path,
+            .{ .store_root = self.store_root },
+        ) catch return false;
+        loc.deinit();
+        return true;
+    }
+
+    /// Walk upward from cwd, returning the nearest ancestor directory that has
+    /// a warm index in the store.  Returns an owned path, or null if no
+    /// ancestor up to the filesystem root is indexed.
+    fn findWarmAncestor(self: *Server) !?[]u8 {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.fs.cwd().realpath(".", &buf) catch return null;
+        var current = try self.allocator.dupe(u8, cwd);
+        errdefer self.allocator.free(current);
+
+        while (true) {
+            if (self.hasWarmIndex(current)) return current; // ownership transferred
+
+            const parent = std.fs.path.dirname(current) orelse {
+                self.allocator.free(current);
+                return null;
+            };
+            if (std.mem.eql(u8, parent, current)) {
+                self.allocator.free(current);
+                return null;
+            }
+            const parent_owned = try self.allocator.dupe(u8, parent);
+            self.allocator.free(current);
+            current = parent_owned;
+        }
     }
 
     fn resolveInitialProject(self: *Server, params: ?std.json.ObjectMap) !?[]u8 {
@@ -387,6 +439,16 @@ pub const Server = struct {
                 }
             }
         }
+        // Explicit override via environment.  Needed when the indexed root
+        // is NOT a git repo itself — e.g. an umbrella directory holding
+        // several child repos.  Without this, `walkUpForGit` resolves to a
+        // child `.git` (or nothing), the store probe misses the umbrella's
+        // warm index, and every session is forced to re-run the exclusive
+        // `index_repository` attach.  `ZINDEKS_PROJECT` is the preferred
+        // name; `ZINDEKS_ROOT` is accepted as an alias.
+        if (envOwnedNonEmpty(self.allocator, "ZINDEKS_PROJECT")) |path| return path;
+        if (envOwnedNonEmpty(self.allocator, "ZINDEKS_ROOT")) |path| return path;
+
         // Fall back to walking up cwd for a `.git` marker.
         return try walkUpForGit(self.allocator);
     }
@@ -846,6 +908,17 @@ fn fileUriToPath(allocator: std.mem.Allocator, uri: []const u8) ![]u8 {
         rest = rest[1..];
     }
     return try allocator.dupe(u8, rest);
+}
+
+/// Read an environment variable into an owned slice, returning null when it
+/// is unset or empty.  Caller owns the returned memory.
+fn envOwnedNonEmpty(allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
+    const val = std.process.getEnvVarOwned(allocator, key) catch return null;
+    if (val.len == 0) {
+        allocator.free(val);
+        return null;
+    }
+    return val;
 }
 
 /// Walk upward from cwd looking for a directory containing `.git`.  Returns
