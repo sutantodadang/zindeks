@@ -3,7 +3,9 @@
 
 For this repository, use zindeks before broad shell search.
 
-- Start with `zindeks search "<query>"` or the zindeks MCP `search_code` tool.
+- Start with `zindeks search "<query>"` or the zindeks MCP `search(query)` tool
+  (mode defaults to "hybrid" — BM25 + semantic RRF; use mode="keyword" for
+  pure BM25 or mode="semantic" for embedding-only).
 - Use zindeks graph tools for symbols, callers, callees, dependencies, and
   architecture before reading many files manually.
 - Read files with `read_file(path, offset, limit)` and list them with

@@ -8,7 +8,9 @@ or `dir`.
 
 | Question | Tool |
 |---|---|
-| Keyword search (any language) | `search_code(query)` |
+| Search (hybrid BM25+semantic, default) | `search(query)` |
+| Keyword search only | `search(query, mode="keyword")` |
+| Semantic search only | `search(query, mode="semantic")` |
 | Symbol definition | `search_graph(name_pattern)` |
 | Callers / callees | `trace_call_path(name, direction)` |
 | Source snippet | `get_code_snippet(name)` |
@@ -18,11 +20,12 @@ or `dir`.
 | Architecture | `get_architecture()` |
 | Custom relation | `query_graph("MATCH ...")` |
 
-`search_code` (BM25) works across 20+ languages. The graph-edge tools
-(`search_graph`, `trace_call_path`, `get_architecture`, `query_graph`) need a
-language with AST extraction: Zig, Python, JavaScript, TypeScript, TSX, Go,
-Rust, Java, C, C++. For other languages, lead with `search_code` — graph
-results will be sparse.
+`search` (mode="hybrid" default) fuses BM25 keyword ranking and semantic
+embeddings via RRF. It works across 20+ languages; falls back to keyword when
+no embeddings are available. The graph-edge tools (`search_graph`,
+`trace_call_path`, `get_architecture`, `query_graph`) need a language with AST
+extraction: Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, C++.
+For other languages, lead with `search` — graph results will be sparse.
 
 First call each session: `index_repository` with an absolute `path` to this
 repo. (An already-indexed project also auto-attaches when the server starts, so

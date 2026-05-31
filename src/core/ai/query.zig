@@ -326,13 +326,13 @@ fn extractConstraints(
 /// Return suggested MCP tools for a given intent.
 pub fn suggestedTools(allocator: std.mem.Allocator, intent: QueryIntent) ![]const []const u8 {
     const tools: []const []const u8 = switch (intent) {
-        .find_definition => &.{ "search_code", "search_graph", "get_code_snippet" },
+        .find_definition => &.{ "search", "search_graph", "get_code_snippet" },
         .find_usage => &.{ "trace_call_path", "search_graph" },
-        .explain => &.{ "search_code", "get_code_snippet", "search_graph", "get_architecture" },
+        .explain => &.{ "search", "get_code_snippet", "search_graph", "get_architecture" },
         .refactor => &.{ "trace_call_path", "get_architecture", "search_graph" },
-        .debug => &.{ "search_code", "trace_call_path", "get_code_snippet" },
+        .debug => &.{ "search", "trace_call_path", "get_code_snippet" },
         .explore => &.{ "get_architecture", "detect_communities", "search_graph" },
-        .search => &.{ "search_code", "hybrid_search", "semantic_search" },
+        .search => &.{ "search" },
     };
 
     var result = std.ArrayList([]const u8){};

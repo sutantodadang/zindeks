@@ -120,7 +120,7 @@ pub fn generateFish(writer: anytype) !void {
         \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a cold-index -d "Time full index of a path"
         \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a detect-changes-synthetic -d "Time detectChanges over synthetic files"
         \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a cypher-cache -d "Time repeated Cypher MATCH query (validates B7)"
-        \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a snippet-cache -d "Time repeated search_code (validates B8)"
+        \\complete -c zindeks -n "__fish_seen_subcommand_from bench" -a snippet-cache -d "Time repeated BM25 search (validates B8)"
         \\
         \\# Completions subcommand options
         \\complete -c zindeks -n "__fish_seen_subcommand_from completions" -a bash -d "Bash completion"

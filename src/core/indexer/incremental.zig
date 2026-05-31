@@ -14,11 +14,13 @@ const graph_db = @import("../storage/graph_db.zig");
 const overlay_mod = @import("../storage/overlay.zig");
 const ts = @import("../parser/tree_sitter.zig");
 const extractor_mod = @import("../parser/extractor.zig");
+const edge_resolver = @import("../parser/edge_resolver.zig");
 pub const parser_pool = @import("../parser/parser_pool.zig");
 pub const ParserPool = parser_pool.ParserPool;
 
 const Registry = extractor_mod.Registry;
 const GraphDb = graph_db.GraphDb;
+const PendingEdge = edge_resolver.PendingEdge;
 
 // ██████████████████████████████████████████████████████████████████████████
 // Diff result types
@@ -187,6 +189,14 @@ pub fn detectChanges(
 /// Everything runs inside a single SQLite transaction for atomicity.
 /// `pool` is optional: when non-null parsers are reused across files (faster);
 /// when null a fresh parser is created per file (safe for one-shot CLI calls).
+///
+/// Two-phase edge resolution:
+///   Phase A — insert all documents + symbols for the delta, buffering edges.
+///   Phase B — resolve + insert edges after all delta symbols exist.
+///             Uses same-file-first + globally-unique cross-file logic so
+///             unambiguous cross-file calls produce a CALLS edge even when
+///             the target file was not part of this delta (it is already in
+///             the global symbols table from a previous index run).
 pub fn applyChanges(
     allocator: std.mem.Allocator,
     gdb: *GraphDb,
@@ -216,7 +226,7 @@ pub fn applyChanges(
     // ── Begin transaction ──────────────────────────────────────────────
     try gdb.exec("BEGIN TRANSACTION");
 
-    // ── Phase 1: Remove old data for changed/deleted files ─────────────
+    // ── Remove old data for changed/deleted files ──────────────────────
     for (diff.modified) |change| {
         try removeFileFromGraph(gdb, change.path);
         stats.modified += 1;
@@ -226,8 +236,7 @@ pub fn applyChanges(
         stats.deleted += 1;
     }
 
-    // ── Phase 2: Re-extract and insert for added/modified files ────────
-    // Read content, parse with tree-sitter, insert into graph DB
+    // ── Build list of files to (re-)extract ───────────────────────────
     var re_extract_files = std.ArrayList([]const u8).initCapacity(allocator, diff.added.len + diff.modified.len) catch @panic("OOM");
     defer re_extract_files.deinit(allocator);
 
@@ -238,6 +247,28 @@ pub fn applyChanges(
         try re_extract_files.append(allocator, change.path);
     }
 
+    // ── Arena for pending-edge string copies (freed after phase B) ─────
+    var edge_arena = std.heap.ArenaAllocator.init(allocator);
+    defer edge_arena.deinit();
+    const edge_alloc = edge_arena.allocator();
+
+    var pending_edges = std.ArrayList(PendingEdge).initCapacity(allocator, 64) catch @panic("OOM");
+    defer pending_edges.deinit(allocator);
+
+    // ── Prepare reusable statements ────────────────────────────────────
+    var doc_insert = try gdb.prepare(
+        \\INSERT OR REPLACE INTO documents (path, content_hash, language, mtime)
+        \\VALUES (?, ?, ?, ?)
+    );
+    defer doc_insert.finalize();
+
+    var sym_insert = try gdb.prepare(
+        \\INSERT INTO symbols (document_id, name, kind, line_start, line_end, col_start, col_end)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?)
+    );
+    defer sym_insert.finalize();
+
+    // ── Phase A: Insert documents + symbols, buffer edges ─────────────
     for (re_extract_files.items) |rel_path| {
         const full_path = try std.fs.path.join(allocator, &.{ project_path, rel_path });
         defer allocator.free(full_path);
@@ -280,31 +311,20 @@ pub fn applyChanges(
                 continue;
             };
 
-        // ── Insert document ────────────────────────────────────────────
+        // Insert document
         var hash_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &hash_bytes, hash, .little);
-
-        var doc_insert = try gdb.prepare(
-            \\INSERT OR REPLACE INTO documents (path, content_hash, language, mtime)
-            \\VALUES (?, ?, ?, ?)
-        );
-        defer doc_insert.finalize();
 
         try doc_insert.bindText(1, rel_path);
         try doc_insert.bindBlob(2, &hash_bytes);
         try doc_insert.bindText(3, @tagName(lang_id));
         try doc_insert.bindInt(4, @intCast(stat.mtime));
         _ = try doc_insert.step();
+        try doc_insert.reset();
 
         const doc_id = gdb.lastInsertRowid();
 
-        // ── Insert symbols ──────────────────────────────────────────────
-        var sym_insert = try gdb.prepare(
-            \\INSERT INTO symbols (document_id, name, kind, line_start, line_end, col_start, col_end)
-            \\VALUES (?, ?, ?, ?, ?, ?, ?)
-        );
-        defer sym_insert.finalize();
-
+        // Insert symbols
         for (extraction.symbols) |sym| {
             try sym_insert.bindInt(1, doc_id);
             try sym_insert.bindText(2, sym.name);
@@ -318,33 +338,29 @@ pub fn applyChanges(
         }
         stats.symbols_added += @intCast(extraction.symbols.len);
 
-        // ── Insert edges ───────────────────────────────────────────────
-        var edge_insert = try gdb.prepare(
-            \\INSERT INTO edges (source_symbol_id, target_symbol_id, edge_type, confidence)
-            \\SELECT s1.id, s2.id, ?, ?
-            \\FROM symbols s1, symbols s2
-            \\WHERE s1.name = ? AND s2.name = ?
-        );
-        defer edge_insert.finalize();
-
+        // Buffer edges for phase B
         for (extraction.edges) |edge| {
-            try edge_insert.bindText(1, @tagName(edge.edge_type));
-            try edge_insert.bindFloat(2, edge.confidence);
-            try edge_insert.bindText(3, edge.source_name);
-            try edge_insert.bindText(4, edge.target_name);
-            _ = try edge_insert.step();
-            try edge_insert.reset();
+            try edge_resolver.bufferEdge(
+                allocator,
+                edge_alloc,
+                &pending_edges,
+                doc_id,
+                edge.source_name,
+                edge.target_name,
+                edge.edge_type,
+                edge.confidence,
+            );
         }
         stats.edges_added += @intCast(extraction.edges.len);
 
-        // Clean up
         var mut_extraction = extraction;
         mut_extraction.deinit(allocator);
-
-        if (diff.added.len > 0) stats.added += 1;
     }
-    // More accurate: track added separately
+
     stats.added = @intCast(diff.added.len);
+
+    // ── Phase B: Resolve + insert edges (all delta symbols now present) ─
+    _ = try edge_resolver.resolveEdges(gdb, pending_edges.items);
 
     // ── Commit transaction ────────────────────────────────────────────
     try gdb.exec("COMMIT");

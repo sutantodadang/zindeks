@@ -19,6 +19,40 @@ const SymbolKind = extractor_mod.SymbolKind;
 const EdgeKind = extractor_mod.EdgeKind;
 
 // ██████████████████████████████████████████████████████████████████████████
+// Small helpers (mirrored from generic_extractor — kept local to avoid a
+// circular import; if refactored into a shared file update both callers)
+// ██████████████████████████████████████████████████████████████████████████
+
+/// True if `c` can start a bare identifier.
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+/// Strip dotted/scoped prefixes and trailing `(` from a callee text.
+/// `"foo.bar.baz("` → `"baz"`, `"pay.chargeCard"` → `"chargeCard"`,
+/// `"a::b"` → `"b"`.  Mirrors generic_extractor.lastSegment.
+fn lastSegment(s: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, s, " \t\n\r");
+    // Strip trailing `(` and spaces
+    var end = trimmed.len;
+    while (end > 0 and (trimmed[end - 1] == '(' or trimmed[end - 1] == ' ')) {
+        end -= 1;
+    }
+    const work = trimmed[0..end];
+    // Find last `.` `:` `>`
+    var last: usize = 0;
+    var found = false;
+    for (work, 0..) |ch, i| {
+        if (ch == '.' or ch == ':' or ch == '>') {
+            last = i;
+            found = true;
+        }
+    }
+    if (found and last + 1 < work.len) return work[last + 1 ..];
+    return work;
+}
+
+// ██████████████████████████████████████████████████████████████████████████
 // Extraction logic
 // ██████████████████████████████████████████████████████████████████████████
 
@@ -267,10 +301,18 @@ pub fn extractWithPool(
 
         // Get called function name from the "function" field
         const func_node = node.fieldChild("function") orelse continue;
-        const called_name = func_node.text(source);
-        if (called_name.len == 0) continue;
+        const raw_called = func_node.text(source);
+        if (raw_called.len == 0) continue;
         // Skip builtin calls like @import, @intCast etc.
-        if (called_name[0] == '@') continue;
+        if (raw_called[0] == '@') continue;
+
+        // Strip dotted/scoped qualifiers: `pay.chargeCard` → `chargeCard`,
+        // `self.foo` → `foo`, `std.debug.print` → `print`.
+        // Mirrors generic_extractor's lastSegment helper.
+        const called_name = lastSegment(raw_called);
+        if (called_name.len == 0) continue;
+        // After stripping, skip if it still starts with a non-identifier char
+        if (!isIdentStart(called_name[0])) continue;
 
         // Walk up to find enclosing function_declaration
         var parent_node = node.parent();

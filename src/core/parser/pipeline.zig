@@ -12,6 +12,7 @@ const scanner = @import("../scanner/scanner.zig");
 const ts = @import("tree_sitter.zig");
 const extractor_mod = @import("extractor.zig");
 const graph_db = @import("../storage/graph_db.zig");
+const edge_resolver = @import("edge_resolver.zig");
 
 const ExtractedSymbol = extractor_mod.ExtractedSymbol;
 const ExtractedEdge = extractor_mod.ExtractedEdge;
@@ -19,6 +20,7 @@ const ExtractionResult = extractor_mod.ExtractionResult;
 const SymbolKind = extractor_mod.SymbolKind;
 const EdgeKind = extractor_mod.EdgeKind;
 const Registry = extractor_mod.Registry;
+const PendingEdge = edge_resolver.PendingEdge;
 
 // ██████████████████████████████████████████████████████████████████████████
 // Pipeline result
@@ -61,6 +63,13 @@ pub const Pipeline = struct {
     }
 
     /// Run the full pipeline: scan → extract → store.
+    ///
+    /// Two-phase edge resolution:
+    ///   Phase 1 — insert all documents + symbols, buffer edges with their
+    ///             source document id.
+    ///   Phase 2 — resolve + insert edges now that ALL symbols exist.
+    ///             Uses same-file-first + globally-unique cross-file logic
+    ///             so unambiguous cross-file calls produce a CALLS edge.
     pub fn run(self: *Pipeline) !PipelineResult {
         const start = std.time.milliTimestamp();
 
@@ -73,7 +82,7 @@ pub const Pipeline = struct {
             .duration_ms = 0,
         };
 
-        // ── Phase 1: Scan files ──────────────────────────────────────
+        // ── Scan files ───────────────────────────────────────────────
         const files = try scanner.scanPath(self.allocator, self.project_path);
         defer {
             for (files) |f| {
@@ -84,7 +93,28 @@ pub const Pipeline = struct {
         }
         result.files_scanned = @intCast(files.len);
 
-        // ── Phase 2 & 3: Extract and store ───────────────────────────
+        // ── Arena for pending-edge string copies (freed after phase 2) ─
+        var edge_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer edge_arena.deinit();
+        const edge_alloc = edge_arena.allocator();
+
+        var pending_edges = std.ArrayList(PendingEdge).initCapacity(self.allocator, 64) catch @panic("OOM");
+        defer pending_edges.deinit(self.allocator);
+
+        // ── Prepare reusable statements ──────────────────────────────
+        var doc_insert = try self.gdb.prepare(
+            \\INSERT OR REPLACE INTO documents (path, content_hash, language, mtime)
+            \\VALUES (?, ?, ?, ?)
+        );
+        defer doc_insert.finalize();
+
+        var sym_insert = try self.gdb.prepare(
+            \\INSERT INTO symbols (document_id, name, kind, line_start, line_end, col_start, col_end)
+            \\VALUES (?, ?, ?, ?, ?, ?, ?)
+        );
+        defer sym_insert.finalize();
+
+        // ── Phase 1: Extract and store documents + symbols ───────────
         for (files) |entry| {
             const ext = std.fs.path.extension(entry.path);
             const lang_id = ts.LanguageId.fromExtension(ext) orelse {
@@ -92,27 +122,17 @@ pub const Pipeline = struct {
                 continue;
             };
 
-            // Check if we have an extractor for this language
             const ext_ptr = self.registry.get(lang_id) orelse {
                 result.files_skipped += 1;
                 continue;
             };
 
-            // Extract symbols and edges
             const extraction = ext_ptr.extract(self.allocator, entry.content, lang_id) catch {
                 result.files_with_errors += 1;
                 continue;
             };
 
-            // ── Phase 3: Store in graph DB ────────────────────────────
-            // Insert document with content hash for incremental change detection
-            var doc_insert = try self.gdb.prepare(
-                \\INSERT OR REPLACE INTO documents (path, content_hash, language, mtime)
-                \\VALUES (?, ?, ?, ?)
-            );
-            defer doc_insert.finalize();
-
-            // Convert u64 hash to 8-byte blob
+            // Insert document
             var hash_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &hash_bytes, entry.hash, .little);
 
@@ -121,18 +141,11 @@ pub const Pipeline = struct {
             try doc_insert.bindText(3, @tagName(lang_id));
             try doc_insert.bindInt(4, @intCast(entry.mtime));
             _ = try doc_insert.step();
-            // Reset for next use
             try doc_insert.reset();
 
             const doc_id = self.gdb.lastInsertRowid();
 
             // Insert symbols
-            var sym_insert = try self.gdb.prepare(
-                \\INSERT INTO symbols (document_id, name, kind, line_start, line_end, col_start, col_end)
-                \\VALUES (?, ?, ?, ?, ?, ?, ?)
-            );
-            defer sym_insert.finalize();
-
             for (extraction.symbols) |sym| {
                 try sym_insert.bindInt(1, doc_id);
                 try sym_insert.bindText(2, sym.name);
@@ -141,35 +154,33 @@ pub const Pipeline = struct {
                 try sym_insert.bindInt(5, @intCast(sym.line_end));
                 try sym_insert.bindInt(6, @intCast(sym.col_start));
                 try sym_insert.bindInt(7, @intCast(sym.col_end));
-                const stepped = try sym_insert.step();
-                _ = stepped;
+                _ = try sym_insert.step();
                 try sym_insert.reset();
             }
             result.symbols_extracted += @intCast(extraction.symbols.len);
 
-            // Insert edges
-            var edge_insert = try self.gdb.prepare(
-                \\INSERT INTO edges (source_symbol_id, target_symbol_id, edge_type, confidence)
-                \\SELECT s1.id, s2.id, ?, ?
-                \\FROM symbols s1, symbols s2
-                \\WHERE s1.name = ? AND s2.name = ?
-            );
-            defer edge_insert.finalize();
-
+            // Buffer edges — strings are duped into the edge arena so the
+            // extraction result can be freed before phase 2.
             for (extraction.edges) |edge| {
-                try edge_insert.bindText(1, @tagName(edge.edge_type));
-                try edge_insert.bindFloat(2, edge.confidence);
-                try edge_insert.bindText(3, edge.source_name);
-                try edge_insert.bindText(4, edge.target_name);
-                _ = try edge_insert.step();
-                try edge_insert.reset();
+                try edge_resolver.bufferEdge(
+                    self.allocator,
+                    edge_alloc,
+                    &pending_edges,
+                    doc_id,
+                    edge.source_name,
+                    edge.target_name,
+                    edge.edge_type,
+                    edge.confidence,
+                );
             }
             result.edges_extracted += @intCast(extraction.edges.len);
 
-            // Clean up extraction result
             var mut_extraction = extraction;
             mut_extraction.deinit(self.allocator);
         }
+
+        // ── Phase 2: Resolve + insert edges (all symbols now present) ─
+        _ = try edge_resolver.resolveEdges(&self.gdb, pending_edges.items);
 
         const end = std.time.milliTimestamp();
         result.duration_ms = @intCast(end - start);

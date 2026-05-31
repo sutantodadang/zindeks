@@ -17,7 +17,7 @@ pub const Decision = struct {
 };
 
 const grep_deny_msg =
-    "Grep blocked for code search. Use zindeks MCP: search_code (BM25 text), " ++
+    "Grep blocked for code search. Use zindeks MCP: search (BM25/hybrid/semantic), " ++
     "search_graph (symbols/defs), trace_call_path (callers/callees), get_architecture. " ++
     "Read results with read_file; see a file's symbols with file_outline. " ++
     "Escape hatch for non-code or uncommitted files: Bash `rtk grep`.";

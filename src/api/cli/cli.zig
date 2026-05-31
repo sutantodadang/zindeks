@@ -776,7 +776,7 @@ fn usage(sw: anytype) !void {
         \\  doctor                    Health check: PATH, MCP entries, index, server
         \\  update                    Update zindeks to latest version
         \\  completions <shell>       Generate shell completions (bash|zsh|fish)
-        \\  bench <scenario> [args]   Run performance benchmarks (cold-index, detect-changes-synthetic, cypher-cache, snippet-cache)
+        \\  bench <scenario> [args]   Run performance benchmarks (cold-index, detect-changes-synthetic, cypher-cache, snippet-cache, answer-quality)
         \\  hook [--host claude|cursor]
         \\                            PreToolUse hook: reads stdin JSON, emits allow/ask/deny
         \\  help                      Show this help

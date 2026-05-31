@@ -3,7 +3,8 @@
 
 Use zindeks first for code search and code-structure questions in this repo.
 
-- Keyword search: `zindeks search "<query>"` or MCP `search_code(query)`.
+- Search (hybrid BM25+semantic, default): `zindeks search "<query>"` or MCP `search(query)`.
+  - Keyword only: `search(query, mode="keyword")`. Semantic only: `search(query, mode="semantic")`.
 - Symbols: MCP `search_graph(name_pattern)`.
 - Callers/callees: MCP `trace_call_path(name, direction)`.
 - Architecture and hotspots: MCP `get_architecture()`.

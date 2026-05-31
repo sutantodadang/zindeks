@@ -2,7 +2,7 @@
 
 Dependency-light code knowledge graph engine in Zig. One-time index, many low-latency readers. AI agents share a long-lived `zindeks serve` process over stdin/stdout JSON-RPC (MCP-compliant). Single static binary: ~3.4 MB, zero runtime dependencies.
 
-**Current status:** 20+ languages (tree-sitter), 14 MCP tools, SQLite graph database, BM25 search, call graph tracing, Leiden community detection, incremental indexing, cross-platform (6 targets).
+**Current status:** 20+ languages (tree-sitter), 23 MCP tools, SQLite graph database, BM25 + semantic + hybrid search (RRF), document embeddings, call graph tracing, Leiden community detection, incremental indexing, cross-platform (6 targets). AST-level symbol/edge extraction for 10 languages; BM25 across all.
 
 ## Install from GitHub releases
 
@@ -65,6 +65,7 @@ zindeks index .                     # Index current repo (shows progress)
 zindeks search "database pool" .    # BM25 keyword search
 zindeks serve                       # Start MCP-compliant JSON-RPC server
 zindeks bench cold-index .          # Benchmark indexing speed (3 iters, prints min/mean/p99/peak_rss)
+zindeks bench answer-quality        # Retrieval quality: precision/recall/F1 vs grep baseline (see ANSWER_QUALITY.md)
 ```
 
 ## Supported languages
@@ -73,7 +74,13 @@ zindeks bench cold-index .          # Benchmark indexing speed (3 iters, prints 
 
 C, C++, C#, CSS, Dart, Elixir, Go, Haskell, Java, JavaScript, JSON, Lua, Python, Rust, Scala, Swift, TOML, TypeScript, TSX, YAML, Zig
 
-Automatic language detection by file extension. Symbol extraction currently implemented for Zig; other languages use the binary indexer for BM25 search and the SQLite graph for symbol storage.
+Automatic language detection by file extension.
+
+**AST symbol + edge extraction** (functions, methods, types, and `CALLS`/`CONTAINS`/`IMPORTS` edges — powering `search_graph`, `trace_call_path`, `get_architecture`, `query_graph`) is implemented for 10 languages: Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, C++. Zig uses a dedicated extractor; the other nine use a config-driven tree-sitter extractor (`generic_extractor.zig`).
+
+**Call edge coverage**: intra-file calls and unambiguous cross-file calls are resolved. A cross-file `CALLS` edge is created when the callee name is defined exactly once across the indexed repo (confidence 0.9). Calls to names with multiple definitions (e.g. `init`, `new`) are deliberately left unresolved to preserve precision. Import-scope disambiguation (tracking `const alias = @import(...)`) is future work.
+
+The remaining languages are still fully indexed for **BM25 keyword search** (`search` with mode="keyword") and stored in the SQLite graph, but graph-edge results for them are sparse.
 
 ## Indexing pipeline
 
@@ -142,7 +149,13 @@ Single `graph.db` file with 5 tables:
 
 ## Search engine
 
-Full BM25+ with IDF normalization:
+Single `search` tool with a `mode` parameter:
+
+- **`search` (mode="keyword")** — Full BM25+ with IDF normalization. Streams results as `notifications/zindeks/searchResult` notifications when `stream:true`.
+- **`search` (mode="semantic")** — Document-embedding cosine similarity (natural-language queries).
+- **`search` (mode="hybrid", default)** — BM25 + semantic fused via Reciprocal Rank Fusion (RRF), with per-source scores. Falls back to keyword when no embeddings are available.
+
+BM25 internals:
 
 - **IDF:** `log(1 + (N - df + 0.5) / (df + 0.5))`
 - **TF:** `tf * (k1 + 1) / (tf + k1 * (1 - b + b * doc_len / avg_doc_len))`
@@ -150,6 +163,8 @@ Full BM25+ with IDF normalization:
 - **Query-aware snippets** with newline-aligned context expansion
 - **CamelCase splitting** for tokenization
 - Deterministic sort by score then path
+
+Embeddings are generated at index time and stored alongside the graph; `health_check` reports the embedding count.
 
 ## Knowledge graph
 
@@ -168,42 +183,75 @@ Full BM25+ with IDF normalization:
 
 `zindeks serve` starts a JSON-RPC 2.0 server over stdin/stdout with MCP-compliant protocol framing (Content-Length headers, initialize handshake, capability negotiation).
 
-### 14 tools
+### 23 tools
+
+**Indexing & projects**
 
 | Tool | Description |
 | --- | --- |
-| `index_repository` | Index a repo: binary + tree-sitter pipeline |
+| `index_repository` | Index a repo: binary + tree-sitter pipeline (incremental by default, `force` for full rebuild) |
+| `update_index` | Apply added/modified/deleted files to graph DB + rebuild BM25 overlay (fast on small deltas) |
+| `detect_changes` | Find added/modified/deleted files vs index without re-indexing |
 | `list_projects` | List indexed projects in store |
-| `search_code` | BM25 keyword search with scored snippets |
-| `get_graph_schema` | Table counts and schema overview |
-| `search_graph` | Symbol search with kind/degree filters |
-| `get_code_snippet` | Source snippet by symbol name |
-| `query_graph` | Read-only SQL or Cypher against graph DB |
-| `detect_changes` | Find added/modified/deleted files vs index |
-| `index_status` | File-level staleness report |
 | `delete_project` | Remove project from store |
-| `trace_call_path` | BFS trace from a symbol (inbound/outbound/both) |
-| `get_architecture` | Fan-in/out, entry points, module stats |
-| `manage_adr` | Create/read/list Architecture Decision Records |
-| `detect_communities` | Run Leiden community detection |
+| `get_graph_schema` | Node/edge types with current counts |
+| `health_check` | Document/symbol/edge/embedding/community counts, last-indexed time, uptime |
+
+**Search**
+
+| Tool | Description |
+| --- | --- |
+| `search` | Unified search: mode="keyword" (BM25, optional streaming), "semantic" (embeddings), "hybrid" (default, RRF fusion) |
+| `search_graph` | Symbol search by name pattern, kind, or degree |
+| `get_code_snippet` | Source snippet by symbol name |
+| `query_graph` | Read-only SQL or Cypher (`MATCH ... RETURN`) against graph DB |
+
+**Read & navigation**
+
+| Tool | Description |
+| --- | --- |
+| `read_file` | Read a file by path, numbered + paged (offset/limit) |
+| `list_files` | List indexed files by glob/dir (replaces Glob) |
+| `file_outline` | Symbol names/kinds/line-ranges for one file, no full content |
+| `get_context` | Assemble token-budgeted AI context from search + call graph + architecture |
+| `summarize_symbol` | Signature, purpose, key ops, deps, complexity for a symbol |
+
+**Graph analysis**
+
+| Tool | Description |
+| --- | --- |
+| `trace_call_path` | BFS trace from a symbol (inbound/outbound/both), cycle-safe |
+| `get_architecture` | Fan-in/out, entry points, hotspots, module coupling |
+| `detect_communities` | Community operations: action="run" (Leiden detection), "list" (all communities), "get" (symbol's community) |
+
+**Editing, records & config**
+
+| Tool | Description |
+| --- | --- |
 | `rename_symbol` | In-place symbol rename across files (dry-run default) |
+| `manage_adr` | Create/read/list Architecture Decision Records |
 | `ingest_traces` | Ingest runtime trace data (JSON) |
+| `config` | Get or set configuration — no params returns current config; any param updates + persists |
 
 Example tool calls:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"database pool","limit":10}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"database pool","limit":10}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"database pool","mode":"keyword","limit":10}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":{"pattern":"%Handler%","kind":"function"}}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"trace_call_path","arguments":{"name":"main","direction":"outbound","max_depth":5}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_architecture","arguments":{}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query_graph","arguments":{"query":"MATCH (a)-[r:CALLS]->(b) RETURN a.name, b.name LIMIT 20"}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"detect_communities","arguments":{}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"detect_communities","arguments":{"action":"list","limit":20}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"detect_communities","arguments":{"action":"get","symbol_name":"handleSearch"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"config","arguments":{}}}
 ```
 
 ## Incremental indexing
 
 - `detect_changes` compares file metadata (size, mtime) against the SQLite documents table — returns added/modified/deleted sets without re-reading files
-- `index_status` shows per-file staleness
+- `health_check` reports document/symbol/edge/embedding/community counts and last-indexed timestamp
 - File watcher (`PollWatcher`) uses background thread polling for automatic re-index triggers
 - Changed files are transactionally deleted and re-inserted; unchanged files kept untouched
 
@@ -232,6 +280,9 @@ Requires Zig 0.15.2. All dependencies vendored — no network access needed to b
 - BM25: posting slice scans, score-then-snippet (only top-k snippets built)
 - Scanner: single-pass file walk, streaming content, 256 MB file skip threshold
 - Cross-compiles to 6 targets from any host OS
+
+Speed benchmarks: `zindeks bench cold-index .` — see `BENCHMARKS.md`.
+Answer-quality benchmarks (precision/recall/F1 vs grep): `zindeks bench answer-quality` — see `ANSWER_QUALITY.md`.
 
 ## Architecture Decision Records
 

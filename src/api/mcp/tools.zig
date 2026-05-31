@@ -1,11 +1,12 @@
 //! MCP tool definitions and handlers.
 //!
-//! Phase 1 tools: index_repository, list_projects, search_code, get_graph_schema.
+//! Phase 1 tools: index_repository, list_projects, search, get_graph_schema.
 //! Phase 2 tools: search_graph, get_code_snippet, query_graph.
-//! Phase 3 tools: detect_changes, index_status, delete_project.
+//! Phase 3 tools: detect_changes, delete_project.
 //! Phase 4 tools: trace_call_path, get_architecture, manage_adr.
 //! Phase 5 tools: detect_communities, rename_symbol, ingest_traces.
-//! Phase 6 tools: semantic_search, hybrid_search.
+//! Phase 6 tools: (merged into search with mode param).
+//! v0.6.0: consolidated 30 -> 23 tools.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -13,7 +14,7 @@ const indexer = @import("../../core/indexer/indexer.zig");
 const incremental = @import("../../core/indexer/incremental.zig");
 const scanner = @import("../../core/scanner/scanner.zig");
 const storage = @import("../../core/storage/index.zig");
-const search = @import("../../core/search/engine.zig");
+const search_engine = @import("../../core/search/engine.zig");
 const graph_db = @import("../../core/storage/graph_db.zig");
 const project_store = @import("../../core/project_store.zig");
 const pipeline_mod = @import("../../core/parser/pipeline.zig");
@@ -37,38 +38,31 @@ pub const Descriptor = struct {
     inputSchema: []const u8, // JSON literal
 };
 
-/// All tools registered for Phase 1-6 + Phase 7 (read loop).
+/// All tools registered (v0.6.0 — 23 tools).
 pub const ALL = [_]Descriptor{
     index_repository,
+    update_index,
+    detect_changes,
     list_projects,
-    search_code,
+    delete_project,
     get_graph_schema,
+    health_check,
+    search,
     search_graph,
     get_code_snippet,
     query_graph,
-    detect_changes,
-    update_index,
-    index_status,
-    delete_project,
-    trace_call_path,
-    get_architecture,
-    manage_adr,
-    rename_symbol,
-    ingest_traces,
-    detect_communities,
-    list_communities,
-    get_symbol_community,
-    semantic_search,
-    hybrid_search,
-    health_check,
-    get_context,
-    summarize_symbol,
-    explain_query,
-    get_config,
-    set_config,
     read_file,
     list_files,
     file_outline,
+    get_context,
+    summarize_symbol,
+    trace_call_path,
+    get_architecture,
+    detect_communities,
+    rename_symbol,
+    manage_adr,
+    ingest_traces,
+    config,
 };
 
 /// Apply detected file changes incrementally: updates the SQLite graph DB
@@ -88,7 +82,7 @@ pub const update_index = Descriptor{
 
 pub const index_repository = Descriptor{
     .name = "index_repository",
-    .description = "Index a repository into the knowledge graph. BM25 full-text search (search_code) works across 20+ languages. AST-level symbol and edge extraction (calls, imports, types — powering search_graph, trace_call_path, get_architecture) is available for Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, and C++. If the repo is already indexed, only changed files are re-processed (fast); pass force:true for a full rebuild.",
+    .description = "Index a repository into the knowledge graph. BM25 full-text search (the `search` tool, mode=keyword) works across 20+ languages. AST-level symbol and edge extraction (calls, imports, types — powering search_graph, trace_call_path, get_architecture) is available for Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java, C, and C++. If the repo is already indexed, only changed files are re-processed (fast); pass force:true for a full rebuild.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -118,9 +112,9 @@ pub const list_projects = Descriptor{
     ,
 };
 
-pub const search_code = Descriptor{
-    .name = "search_code",
-    .description = "Search indexed source files using BM25 keyword ranking. Returns matching files with relevance scores and snippets. Optional stream:true emits results as `notifications/zindeks/searchResult` notifications followed by a small summary in the tool response.",
+pub const search = Descriptor{
+    .name = "search",
+    .description = "Search indexed source files. mode=\"keyword\" uses BM25 ranking with scored snippets (optional stream); mode=\"semantic\" uses document-embedding cosine similarity; mode=\"hybrid\" (default) fuses BM25 + semantic via Reciprocal Rank Fusion. Falls back to keyword when no embeddings are available.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -129,16 +123,22 @@ pub const search_code = Descriptor{
     \\      "type": "string",
     \\      "description": "Search query string"
     \\    },
+    \\    "mode": {
+    \\      "type": "string",
+    \\      "enum": ["keyword", "semantic", "hybrid"],
+    \\      "description": "Search mode: keyword (BM25), semantic (embeddings), or hybrid (default, RRF fusion)"
+    \\    },
     \\    "limit": {
     \\      "type": "integer",
     \\      "description": "Maximum number of results (default 10, max 100)"
     \\    },
     \\    "stream": {
     \\      "type": "boolean",
-    \\      "description": "When true, server emits batched JSON-RPC notifications (notifications/zindeks/searchResult) and replies with {streamed:true,total,query}."
+    \\      "description": "When true (keyword/hybrid only), server emits batched JSON-RPC notifications and replies with {streamed:true,total,query}."
     \\    }
     \\  },
-    \\  "required": ["query"]
+    \\  "required": ["query"],
+    \\  "additionalProperties": false
     \\}
     ,
 };
@@ -202,14 +202,14 @@ pub const get_code_snippet = Descriptor{
 
 pub const query_graph = Descriptor{
     .name = "query_graph",
-    .description = "Run a read-only SQL query against the knowledge graph database. Tables: documents, symbols, edges. Only SELECT queries are allowed.",
+    .description = "Run a read-only query against the knowledge graph database. Accepts either a SQL SELECT (tables: documents, symbols, edges) or a Cypher query starting with MATCH (e.g. MATCH (a)-[r:CALLS]->(b) RETURN a.name, b.name LIMIT 20). Queries beginning with MATCH are routed to the Cypher executor; everything else is treated as SQL. Only read-only queries are allowed.",
     .inputSchema =
     \\{
     \\  "type": "object",
     \\  "properties": {
     \\    "query": {
     \\      "type": "string",
-    \\      "description": "SQL SELECT query against documents, symbols, or edges tables"
+    \\      "description": "SQL SELECT against documents/symbols/edges, or a Cypher MATCH ... RETURN query"
     \\    },
     \\    "limit": {
     \\      "type": "integer",
@@ -234,17 +234,6 @@ pub const detect_changes = Descriptor{
     \\    }
     \\  },
     \\  "required": []
-    \\}
-    ,
-};
-
-pub const index_status = Descriptor{
-    .name = "index_status",
-    .description = "Return current indexing statistics: document count, symbol count, edge count, last indexed timestamp.",
-    .inputSchema =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {}
     \\}
     ,
 };
@@ -394,91 +383,30 @@ pub const ingest_traces = Descriptor{
 
 pub const detect_communities = Descriptor{
     .name = "detect_communities",
-    .description = "Run Leiden community detection on the symbol graph. Assigns community_id to each symbol. Returns community count, modularity score, and top communities with member counts.",
+    .description = "Community operations on the symbol graph. action=\"run\" (default) runs Leiden detection and assigns community_id to each symbol; action=\"list\" lists detected communities with member counts and samples; action=\"get\" returns the community and members for a specific symbol.",
     .inputSchema =
     \\{
     \\  "type": "object",
     \\  "properties": {
+    \\    "action": {
+    \\      "type": "string",
+    \\      "enum": ["run", "list", "get"],
+    \\      "description": "Action to perform: run (detect), list (all communities), get (symbol's community). Default: run."
+    \\    },
     \\    "resolution": {
     \\      "type": "number",
-    \\      "description": "Resolution parameter for community granularity (default 1.0, higher = more communities)"
-    \\    }
-    \\  }
-    \\}
-    ,
-};
-
-pub const list_communities = Descriptor{
-    .name = "list_communities",
-    .description = "List all detected communities with member counts and sample member symbols. Requires detect_communities to have been run first.",
-    .inputSchema =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {
-    \\    "limit": {
-    \\      "type": "integer",
-    \\      "description": "Maximum number of communities to return (default 20)"
-    \\    }
-    \\  }
-    \\}
-    ,
-};
-
-pub const get_symbol_community = Descriptor{
-    .name = "get_symbol_community",
-    .description = "Return the community ID and member symbols for a given symbol. Requires detect_communities to have been run first.",
-    .inputSchema =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {
+    \\      "description": "Resolution parameter for community granularity (default 1.0, higher = more communities). Used by action=run."
+    \\    },
     \\    "symbol_name": {
     \\      "type": "string",
-    \\      "description": "Exact symbol name to look up"
-    \\    }
-    \\  },
-    \\  "required": ["symbol_name"]
-    \\}
-    ,
-};
-
-pub const semantic_search = Descriptor{
-    .name = "semantic_search",
-    .description = "Search indexed code by semantic similarity using document embeddings. Returns ranked results with cosine similarity scores.",
-    .inputSchema =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {
-    \\    "query": {
-    \\      "type": "string",
-    \\      "description": "Natural language query describing what to search for"
+    \\      "description": "Exact symbol name to look up. Required for action=get."
     \\    },
     \\    "limit": {
     \\      "type": "integer",
-    \\      "description": "Maximum number of results (default 10, max 100)"
+    \\      "description": "Maximum number of communities to return (default 20). Used by action=list."
     \\    }
     \\  },
-    \\  "required": ["query"]
-    \\}
-    ,
-};
-
-pub const hybrid_search = Descriptor{
-    .name = "hybrid_search",
-    .description = "Combined BM25 keyword and semantic search using Reciprocal Rank Fusion. Returns fused results with per-source scores.",
-    .inputSchema =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {
-    \\    "query": {
-    \\      "type": "string",
-    \\      "description": "Search query string"
-    \\    },
-    \\    "limit": {
-    \\      "type": "integer",
-    \\      "description": "Maximum number of results (default 10, max 100)"
-    \\    }
-    \\  },
-    \\  "required": ["query"]
+    \\  "additionalProperties": false
     \\}
     ,
 };
@@ -544,37 +472,9 @@ pub const summarize_symbol = Descriptor{
     ,
 };
 
-pub const explain_query = Descriptor{
-    .name = "explain_query",
-    .description = "Parse a natural-language query and return the detected intent, extracted target symbols, constraints, and suggested MCP tools to use.",
-    .inputSchema =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {
-    \\    "query": {
-    \\      "type": "string",
-    \\      "description": "The natural-language query to analyse"
-    \\    }
-    \\  },
-    \\  "required": ["query"]
-    \\}
-    ,
-};
-
-pub const get_config = Descriptor{
-    .name = "get_config",
-    .description = "Return the current zindeks configuration as JSON.",
-    .inputSchema =
-    \\{
-    \\  "type": "object",
-    \\  "properties": {}
-    \\}
-    ,
-};
-
-pub const set_config = Descriptor{
-    .name = "set_config",
-    .description = "Update zindeks configuration values and persist to file. Pass key-value pairs as string params.",
+pub const config = Descriptor{
+    .name = "config",
+    .description = "Get or set zindeks configuration. When called with no params, returns the current configuration. When any param is provided, updates those fields, persists to file, and returns the updated configuration.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -599,7 +499,8 @@ pub const set_config = Descriptor{
     \\      "type": "string",
     \\      "description": "Custom index store root path"
     \\    }
-    \\  }
+    \\  },
+    \\  "additionalProperties": false
     \\}
     ,
 };
@@ -719,7 +620,7 @@ fn writeCompactJson(writer: anytype, raw: []const u8) !void {
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
-    engine: ?*search.Engine = null,
+    engine: ?*search_engine.Engine = null,
     gdb: ?*graph_db.GraphDb = null,
     project_path: ?[]const u8 = null,
     /// Resolved index directory for the currently loaded project.  Required
@@ -755,8 +656,8 @@ pub fn dispatch(
         try handleIndexRepository(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "list_projects")) {
         try handleListProjects(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "search_code")) {
-        try handleSearchCode(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "search")) {
+        try handleSearch(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "get_graph_schema")) {
         try handleGetGraphSchema(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "search_graph")) {
@@ -769,8 +670,6 @@ pub fn dispatch(
         try handleDetectChanges(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "update_index")) {
         try handleUpdateIndex(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "index_status")) {
-        try handleIndexStatus(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "delete_project")) {
         try handleDeleteProject(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "trace_call_path")) {
@@ -785,26 +684,14 @@ pub fn dispatch(
         try handleIngestTraces(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "detect_communities")) {
         try handleDetectCommunities(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "list_communities")) {
-        try handleListCommunities(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "get_symbol_community")) {
-        try handleGetSymbolCommunity(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "semantic_search")) {
-        try handleSemanticSearch(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "hybrid_search")) {
-        try handleHybridSearch(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "health_check")) {
         try handleHealthCheck(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "get_context")) {
         try handleGetContext(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "summarize_symbol")) {
         try handleSummarizeSymbol(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "explain_query")) {
-        try handleExplainQuery(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "get_config")) {
-        try handleGetConfig(ctx, params_obj, writer);
-    } else if (std.mem.eql(u8, tool_name, "set_config")) {
-        try handleSetConfig(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "config")) {
+        try handleConfig(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "read_file")) {
         try handleReadFile(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "list_files")) {
@@ -967,7 +854,29 @@ fn handleListProjects(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: search_code
+// Tool: search  (unified — routes to keyword/semantic/hybrid by mode param)
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.query\"}");
+        return;
+    };
+    const mode = getString(params, "mode") orelse "hybrid";
+
+    if (std.mem.eql(u8, mode, "keyword")) {
+        try handleSearchCode(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, mode, "semantic")) {
+        try handleSemanticSearch(ctx, params_obj, writer);
+    } else {
+        // "hybrid" (default) — try hybrid; gracefully fall back to keyword
+        // when the engine has no embeddings (hybridSearch degrades internally).
+        try handleHybridSearch(ctx, params_obj, writer);
+    }
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: search_code (internal — called by handleSearch)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleSearchCode(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -1033,7 +942,7 @@ const STREAM_BATCH_SIZE: usize = 20;
 /// carrying up to `STREAM_BATCH_SIZE` result items plus a `request_id` /
 /// `batch_index` for client-side demux.  Writes go straight through the
 /// transport's write mutex — no shared response buffer involvement.
-fn emitSearchStream(ctx: *Context, query: []const u8, items: []const search.Result) !void {
+fn emitSearchStream(ctx: *Context, query: []const u8, items: []const search_engine.Result) !void {
     const transport = ctx.transport.?;
     var batch_buf = std.ArrayList(u8).initCapacity(ctx.allocator, 4096) catch @panic("OOM");
     defer batch_buf.deinit(ctx.allocator);
@@ -1519,7 +1428,7 @@ fn handleUpdateIndex(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: index_status
+// index_status (internal only — MCP tool removed in v0.6.0; use health_check)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleIndexStatus(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -1933,7 +1842,7 @@ fn handleManageAdr(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyty
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: detect_communities
+// Tool: detect_communities  (routes on action: run | list | get)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -1942,6 +1851,21 @@ fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, write
         return;
     };
 
+    const action = if (params_obj) |p| getString(p, "action") orelse "run" else "run";
+
+    if (std.mem.eql(u8, action, "list")) {
+        // Delegate to the existing list-communities logic.
+        try handleListCommunities(ctx, params_obj, writer);
+        return;
+    }
+
+    if (std.mem.eql(u8, action, "get")) {
+        // Delegate to the existing get-symbol-community logic.
+        try handleGetSymbolCommunity(ctx, params_obj, writer);
+        return;
+    }
+
+    // action == "run" (default): Leiden detection.
     const resolution: f64 = blk: {
         if (params_obj) |p| {
             if (p.get("resolution")) |v| switch (v) {
@@ -1982,7 +1906,7 @@ fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, write
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: list_communities
+// Tool: list_communities (internal — called by handleDetectCommunities action=list)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleListCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -2043,7 +1967,7 @@ fn handleListCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: get_symbol_community
+// Tool: get_symbol_community (internal — called by handleDetectCommunities action=get)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleGetSymbolCommunity(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -2313,7 +2237,7 @@ fn handleIngestTraces(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: semantic_search
+// Tool: semantic_search (internal — called by handleSearch mode=semantic)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -2355,7 +2279,7 @@ fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: hybrid_search
+// Tool: hybrid_search (internal — called by handleSearch mode=hybrid/default)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -2582,7 +2506,7 @@ fn handleSummarizeSymbol(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: explain_query
+// explain_query (internal only — MCP tool removed in v0.6.0; module kept)
 // ██████████████████████████████████████████████████████████████████████████
 
 fn handleExplainQuery(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
@@ -2659,19 +2583,28 @@ fn handleExplainQuery(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 }
 
 // ██████████████████████████████████████████████████████████████████████████
-// Tool: get_config
+// Tool: config  (unified get+set — no params = get, any param = set+return)
 // ██████████████████████████████████████████████████████████████████████████
 
-fn handleGetConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
-    _ = params_obj;
-
-    // Load config from default path (or return defaults)
+fn handleConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    // Determine config path
     const config_path = config_mod.getDefaultPath(ctx.allocator) catch {
         try writer.writeAll("{\"error\":\"Cannot determine config path\"}");
         return;
     };
     defer ctx.allocator.free(config_path);
 
+    // Check whether any settable param was provided.
+    const has_updates: bool = if (params_obj) |p|
+        p.get("store_root") != null or
+        p.get("default_repo") != null or
+        p.get("embedding_model") != null or
+        p.get("colors_enabled") != null or
+        p.get("max_results") != null
+    else
+        false;
+
+    // Load existing config (or defaults)
     var cfg = config_mod.Config.load(ctx.allocator, config_path) catch |err| switch (err) {
         error.FileNotFound => config_mod.Config{},
         else => {
@@ -2681,6 +2614,35 @@ fn handleGetConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyty
     };
     defer cfg.deinit(ctx.allocator);
 
+    if (has_updates) {
+        // Apply provided updates using handleGetConfig internals via set path.
+        const params = params_obj.?;
+        if (getString(params, "store_root")) |v| {
+            if (cfg.store_root) |old| ctx.allocator.free(old);
+            cfg.store_root = try ctx.allocator.dupe(u8, v);
+        }
+        if (getString(params, "default_repo")) |v| {
+            if (cfg.default_repo.len > 0) ctx.allocator.free(cfg.default_repo);
+            cfg.default_repo = try ctx.allocator.dupe(u8, v);
+        }
+        if (getString(params, "embedding_model")) |v| {
+            if (cfg.embedding_model.len > 0) ctx.allocator.free(cfg.embedding_model);
+            cfg.embedding_model = try ctx.allocator.dupe(u8, v);
+        }
+        if (getString(params, "colors_enabled")) |v| {
+            cfg.colors_enabled = std.mem.eql(u8, v, "true");
+        }
+        if (getString(params, "max_results")) |v| {
+            cfg.max_results = std.fmt.parseUnsigned(u32, v, 10) catch cfg.max_results;
+        }
+        // Persist
+        cfg.save(config_path) catch {
+            try writer.writeAll("{\"error\":\"Failed to save config\"}");
+            return;
+        };
+    }
+
+    // Return current (possibly updated) config.
     const store_root_str = cfg.store_root orelse "null";
     const index_dir_str = cfg.index_dir orelse "null";
 
@@ -2697,61 +2659,13 @@ fn handleGetConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyty
     });
 }
 
-// ██████████████████████████████████████████████████████████████████████████
-// Tool: set_config
-// ██████████████████████████████████████████████████████████████████████████
+// handleGetConfig and handleSetConfig kept as thin aliases for any internal callers.
+fn handleGetConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    try handleConfig(ctx, params_obj, writer);
+}
 
 fn handleSetConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
-
-    const params = params_obj orelse {
-        try writer.writeAll("{\"error\":\"Missing params\"}");
-        return;
-    };
-
-    // Determine config path
-    const config_path = config_mod.getDefaultPath(ctx.allocator) catch {
-        try writer.writeAll("{\"error\":\"Cannot determine config path\"}");
-        return;
-    };
-    defer ctx.allocator.free(config_path);
-
-    // Load existing config
-    var cfg = config_mod.Config.load(ctx.allocator, config_path) catch |err| switch (err) {
-        error.FileNotFound => config_mod.Config{},
-        else => {
-            try writer.writeAll("{\"error\":\"Failed to load config\"}");
-            return;
-        },
-    };
-    defer cfg.deinit(ctx.allocator);
-
-    // Apply updates
-    if (getString(params, "store_root")) |v| {
-        if (cfg.store_root) |old| ctx.allocator.free(old);
-        cfg.store_root = try ctx.allocator.dupe(u8, v);
-    }
-    if (getString(params, "default_repo")) |v| {
-        if (cfg.default_repo.len > 0) ctx.allocator.free(cfg.default_repo);
-        cfg.default_repo = try ctx.allocator.dupe(u8, v);
-    }
-    if (getString(params, "embedding_model")) |v| {
-        if (cfg.embedding_model.len > 0) ctx.allocator.free(cfg.embedding_model);
-        cfg.embedding_model = try ctx.allocator.dupe(u8, v);
-    }
-    if (getString(params, "colors_enabled")) |v| {
-        cfg.colors_enabled = std.mem.eql(u8, v, "true");
-    }
-    if (getString(params, "max_results")) |v| {
-        cfg.max_results = std.fmt.parseUnsigned(u32, v, 10) catch cfg.max_results;
-    }
-
-    // Persist
-    cfg.save(config_path) catch {
-        try writer.writeAll("{\"error\":\"Failed to save config\"}");
-        return;
-    };
-
-    try writer.writeAll("{\"success\":true}");
+    try handleConfig(ctx, params_obj, writer);
 }
 
 fn getString(params: std.json.ObjectMap, key: []const u8) ?[]const u8 {

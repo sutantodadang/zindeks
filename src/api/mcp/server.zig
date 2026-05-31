@@ -83,20 +83,15 @@ fn lockMode(name: []const u8) LockMode {
     if (std.mem.eql(u8, name, "ingest_traces")) {
         return .{ .gdb = .exclusive };
     }
-    // ── BM25 search (engine/overlay readers) ─────────────────────────────
-    if (std.mem.eql(u8, name, "search_code") or
-        std.mem.eql(u8, name, "semantic_search"))
-    {
-        return .{ .overlay = .shared };
-    }
-    // ── Hybrid: needs both overlay + gdb (shared) ─────────────────────────
-    if (std.mem.eql(u8, name, "hybrid_search")) {
+    // ── search: keyword/semantic (overlay reader), hybrid (overlay+gdb) ──
+    if (std.mem.eql(u8, name, "search")) {
+        // Hybrid needs both; keyword/semantic only need overlay.
+        // Use overlay+gdb shared to cover all modes conservatively.
         return .{ .overlay = .shared, .gdb = .shared };
     }
     // ── Pure meta reads (no DB, no engine) ───────────────────────────────
     if (std.mem.eql(u8, name, "list_projects") or
-        std.mem.eql(u8, name, "get_config") or
-        std.mem.eql(u8, name, "set_config") or
+        std.mem.eql(u8, name, "config") or
         std.mem.eql(u8, name, "health_check"))
     {
         return .{ .meta = .shared };
@@ -153,7 +148,7 @@ pub const Server = struct {
     meta_lock: std.Thread.Mutex,
     // overlay_rwlock: guards idx, overlay, engine (BM25 search path).
     //   Writers: update_index, index_repository, delete_project.
-    //   Readers: search_code, semantic_search, hybrid_search.
+    //   Readers: search (all modes: keyword, semantic, hybrid).
     overlay_rwlock: std.Thread.RwLock,
     // gdb_rwlock: guards gdb, pool (graph DB path).
     //   Writers: rename_symbol, manage_adr, ingest_traces, index_repository,
@@ -175,7 +170,7 @@ pub const Server = struct {
     parser_pool: ParserPool,
 
     /// Per-call pool size — small enough to stay light, big enough to let
-    /// a few concurrent search_code calls actually overlap.  Bumped up by
+    /// a few concurrent search calls actually overlap.  Bumped up by
     /// daemon mode if needed.
     pub const DEFAULT_POOL_CONNS: usize = 4;
     pub const DEFAULT_WORKER_THREADS: usize = 4;
