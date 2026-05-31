@@ -507,7 +507,7 @@ pub const config = Descriptor{
 
 pub const read_file = Descriptor{
     .name = "read_file",
-    .description = "Read a file by path with line numbers (compressed cat -n: blank-line runs collapsed, content byte-exact). offset/limit page like Claude's Read. Prefer this over shell cat/Read for indexed repos.",
+    .description = "Read a file by path with line numbers (compressed cat -n: tab-delimited line numbers, blank-line runs collapsed, content byte-exact). offset/limit page like Claude's Read. Prefer this over shell cat/Read for indexed repos.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -2708,10 +2708,49 @@ pub const RenderStats = struct {
     truncated: bool,
 };
 
+/// Max bytes emitted per line before truncation, mirroring Claude's native Read
+/// tool. Guards against minified/bundled files where a single line can be
+/// megabytes long and would otherwise blow up the response.
+const MAX_LINE_BYTES = 2000;
+
+/// Largest length <= `limit` that does not split a UTF-8 multi-byte sequence,
+/// so the truncated slice stays valid UTF-8 for JSON encoding. Backs off over
+/// any trailing continuation bytes (0b10xxxxxx) and the lead byte they follow.
+fn utf8SafeCut(bytes: []const u8, limit: usize) usize {
+    if (limit >= bytes.len) return bytes.len;
+    var cut = limit;
+    while (cut > 0 and (bytes[cut] & 0xC0) == 0x80) cut -= 1;
+    return cut;
+}
+
+/// Emit a pending run of blank lines and reset the counter.  A run of >=2 is
+/// collapsed into a single `⋮` marker; a lone blank line is emitted as an
+/// empty numbered row.  No-op when the counter is zero.
+fn flushBlankRun(out_w: anytype, start_line: usize, count: *usize) !void {
+    if (count.* == 0) return;
+    if (count.* >= 2) {
+        try out_w.print("{d}\t⋮ ({d} blank lines)\n", .{ start_line, count.* });
+    } else {
+        try out_w.print("{d}\t\n", .{start_line});
+    }
+    count.* = 0;
+}
+
 /// Render file content as compressed cat-n output into `out`.
-/// Compresses runs of >=2 consecutive blank lines into a single marker.
-/// Non-blank lines are emitted byte-exactly with their 1-based line number.
-/// `offset`: 1-based first line (clamped to >=1). `limit`: max lines shown.
+///
+/// Format mirrors Claude's native Read tool: a 1-based line number, a single
+/// TAB delimiter, then the byte-exact line.  TAB (one byte) is used instead of
+/// a multi-byte arrow so the delimiter is cheap and matches the convention the
+/// model already expects.  Runs of >=2 consecutive blank lines collapse into a
+/// single marker.
+///
+/// `offset`: 1-based first line (clamped to >=1).  `limit`: max lines shown.
+///
+/// Streaming, single-pass: only the requested window is rendered and no
+/// per-line slice table is retained, so auxiliary memory is O(1) in the file's
+/// line count rather than O(N).  A one-element lookahead drops the trailing
+/// empty element that `splitScalar` produces for files ending in '\n' (and for
+/// the empty file), keeping `total_lines` aligned with the human-visible count.
 pub fn renderNumbered(
     allocator: std.mem.Allocator,
     content: []const u8,
@@ -2722,67 +2761,68 @@ pub fn renderNumbered(
     const offset = if (offset_in < 1) 1 else offset_in;
     const limit = if (limit_in < 1) 1 else limit_in;
 
-    // Split lines (handle both \n and \r\n)
-    var lines = std.ArrayList([]const u8){};
-    defer lines.deinit(allocator);
-    var iter = std.mem.splitScalar(u8, content, '\n');
-    while (iter.next()) |raw_line| {
-        // Strip trailing \r for \r\n line endings
-        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
-            raw_line[0 .. raw_line.len - 1]
-        else
-            raw_line;
-        try lines.append(allocator, line);
-    }
-    // splitScalar on a file ending with \n produces a trailing empty element —
-    // remove it so "total_lines" matches the human-visible count.
-    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
-        _ = lines.pop();
-    }
-
-    const total = lines.items.len;
-    const win_start = if (offset > total) total else offset - 1; // 0-based
-    const win_end = @min(total, win_start + limit);              // exclusive
+    const win_start = offset - 1; // 0-based, inclusive
+    const win_end = win_start +| limit; // 0-based, exclusive (saturating)
 
     const out_w = out.writer(allocator);
 
-    // Blank-run compression within the window
-    var i = win_start;
-    while (i < win_end) {
-        const line = lines.items[i];
-        const is_blank = std.mem.trim(u8, line, " \t\r").len == 0;
+    // Pending blank-run state — only ever accumulated inside the window.
+    var blank_start: usize = 0; // 1-based line number where the run began
+    var blank_count: usize = 0;
 
-        if (is_blank) {
-            // Count consecutive blank lines from i
-            var run: usize = 0;
-            var j = i;
-            while (j < win_end) : (j += 1) {
-                if (std.mem.trim(u8, lines.items[j], " \t\r").len == 0) {
-                    run += 1;
-                } else break;
+    var total: usize = 0;
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    var pending = iter.next();
+    while (pending) |raw| {
+        const next = iter.next();
+        const is_last = next == null;
+
+        // Strip a trailing \r for \r\n line endings.
+        const line = if (raw.len > 0 and raw[raw.len - 1] == '\r')
+            raw[0 .. raw.len - 1]
+        else
+            raw;
+
+        // Drop the trailing empty element splitScalar yields for a file ending
+        // in '\n' (and the lone element of the empty file).
+        if (is_last and line.len == 0) break;
+
+        const idx = total; // 0-based index of the current line
+        total += 1;
+
+        if (idx >= win_start and idx < win_end) {
+            const is_blank = std.mem.trim(u8, line, " \t\r").len == 0;
+            if (is_blank) {
+                if (blank_count == 0) blank_start = idx + 1;
+                blank_count += 1;
+            } else {
+                try flushBlankRun(out_w, blank_start, &blank_count);
+                if (line.len > MAX_LINE_BYTES) {
+                    const cut = utf8SafeCut(line, MAX_LINE_BYTES);
+                    try out_w.print("{d}\t{s}… (+{d} chars)\n", .{ idx + 1, line[0..cut], line.len - cut });
+                } else {
+                    try out_w.print("{d}\t{s}\n", .{ idx + 1, line });
+                }
             }
-            if (run >= 2) {
-                // Emit compressed marker
-                try out_w.print("{d}→⋮ ({d} blank lines)\n", .{ i + 1, run });
-                i += run;
-                continue;
-            }
-            // Single blank line — emit normally
-            try out_w.print("{d}→\n", .{i + 1});
-        } else {
-            try out_w.print("{d}→{s}\n", .{ i + 1, line });
+        } else if (idx >= win_end and blank_count > 0) {
+            // First line past the window — flush any run that ended at the
+            // window boundary, then keep counting for total_lines only.
+            try flushBlankRun(out_w, blank_start, &blank_count);
         }
-        i += 1;
-    }
 
-    const shown_start = if (total == 0) 0 else win_start + 1;
-    const shown_end = win_end; // win_end is exclusive so win_end == last+1
+        pending = next;
+    }
+    // Flush a run that reached the end of the window or EOF.
+    try flushBlankRun(out_w, blank_start, &blank_count);
+
+    const ws = if (offset > total) total else offset - 1;
+    const we = @min(total, ws + limit);
 
     return RenderStats{
         .total_lines = total,
-        .shown_start = shown_start,
-        .shown_end = shown_end,
-        .truncated = win_end < total,
+        .shown_start = if (total == 0) 0 else ws + 1,
+        .shown_end = we,
+        .truncated = we < total,
     };
 }
 
@@ -3173,26 +3213,16 @@ test "renderNumbered: blank-run compression" {
     const rendered = out.items;
     // Must contain the 3-blank-line marker
     try std.testing.expect(std.mem.indexOf(u8, rendered, "⋮ (3 blank lines)") != null);
-    // Non-blank lines must keep exact content
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "1→line1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "6→line6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "7→line7") != null);
-    // The 3 blank lines should NOT appear as individual entries
-    const blank_count = blk: {
-        var count: usize = 0;
-        var iter = std.mem.splitSequence(u8, rendered, "\n");
-        while (iter.next()) |line| {
-            // A lone blank line emitted normally would be "N→" (nothing after arrow)
-            if (line.len > 0) {
-                const arrow_pos = std.mem.indexOf(u8, line, "→") orelse continue;
-                const after = line[arrow_pos + "→".len ..];
-                if (after.len == 0) count += 1;
-            }
-        }
-        break :blk count;
-    };
-    // No individual blank-line rows should appear since they were all in a run of 3
-    try std.testing.expectEqual(@as(usize, 0), blank_count);
+    // Non-blank lines must keep exact content, tab-delimited.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "1\tline1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "6\tline6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "7\tline7") != null);
+    // The 3 blank lines (3,4,5) collapse into one marker — no lone blank rows.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "3\t\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "4\t\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "5\t\n") == null);
+    // The marker is anchored at the first blank line of the run.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "3\t⋮ (3 blank lines)") != null);
 }
 
 test "renderNumbered: offset and limit paging" {
@@ -3205,9 +3235,104 @@ test "renderNumbered: offset and limit paging" {
     try std.testing.expectEqual(@as(usize, 2), stats.shown_start);
     try std.testing.expectEqual(@as(usize, 4), stats.shown_end);
     try std.testing.expect(stats.truncated);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "2→b") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "3→c") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "4→d") == null);
+    // Window = lines 2-3 (tab-delimited); lines outside must not appear.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "2\tb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "3\tc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "1\ta") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "4\td") == null);
+}
+
+test "renderNumbered: trailing newline does not add a phantom line" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    // "a\nb\n" is two lines, not three.
+    const stats = try renderNumbered(allocator, "a\nb\n", 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 2), stats.total_lines);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "2\tb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "3\t") == null);
+
+    // No trailing newline: still two lines.
+    out.clearRetainingCapacity();
+    const stats2 = try renderNumbered(allocator, "a\nb", 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 2), stats2.total_lines);
+}
+
+test "renderNumbered: empty file yields zero lines" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const stats = try renderNumbered(allocator, "", 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 0), stats.total_lines);
+    try std.testing.expectEqual(@as(usize, 0), stats.shown_start);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    try std.testing.expect(stats.truncated == false);
+}
+
+test "renderNumbered: a single newline is one blank line" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const stats = try renderNumbered(allocator, "\n", 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 1), stats.total_lines);
+    // One blank line is emitted as "1\t\n" (not collapsed — needs >=2).
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "1\t\n") != null);
+}
+
+test "renderNumbered: offset past EOF renders nothing" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const stats = try renderNumbered(allocator, "a\nb\nc\n", 99, 10, &out);
+    try std.testing.expectEqual(@as(usize, 3), stats.total_lines);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    try std.testing.expect(stats.truncated == false);
+}
+
+test "renderNumbered: blank run at window end is flushed" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    // Lines: x(1) blank(2) blank(3) y(4).  Window = lines 1-3, so the run of
+    // two blanks ends exactly at the window boundary and must still flush.
+    const stats = try renderNumbered(allocator, "x\n\n\ny\n", 1, 3, &out);
+    try std.testing.expectEqual(@as(usize, 4), stats.total_lines);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "2\t⋮ (2 blank lines)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "4\ty") == null);
+    try std.testing.expect(stats.truncated == true);
+}
+
+test "renderNumbered: over-long line is truncated at MAX_LINE_BYTES" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    // One line of 2050 'a's — 50 bytes over the cap.
+    const long = "a" ** (MAX_LINE_BYTES + 50);
+    const stats = try renderNumbered(allocator, long, 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 1), stats.total_lines);
+    // Exactly MAX_LINE_BYTES content bytes emitted, then the overflow marker.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "… (+50 chars)") != null);
+    // Body must not contain all 2050 'a's: the rendered slice is the prefix only.
+    const expected_prefix = "1\t" ++ ("a" ** MAX_LINE_BYTES) ++ "…";
+    try std.testing.expect(std.mem.indexOf(u8, out.items, expected_prefix) != null);
+}
+
+test "renderNumbered: truncation backs off to a UTF-8 boundary" {
+    const allocator = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+
+    // (MAX_LINE_BYTES - 1) ASCII bytes, then a 3-byte char (€ = E2 82 AC) that
+    // straddles the cap. The cut must back off to before €, not split it.
+    const line = ("a" ** (MAX_LINE_BYTES - 1)) ++ "€" ++ "tail";
+    const stats = try renderNumbered(allocator, line, 1, 100, &out);
+    try std.testing.expectEqual(@as(usize, 1), stats.total_lines);
+    // Output remains valid UTF-8 (no split multi-byte sequence).
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out.items));
+    // The € (3 bytes) plus "tail" (4 bytes) = 7 dropped bytes.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "… (+7 chars)") != null);
 }
 
 test "globMatch: basic patterns" {
