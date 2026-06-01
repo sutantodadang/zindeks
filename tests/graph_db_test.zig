@@ -10,7 +10,7 @@ test "graph_db open and migrate" {
     const tables = try db.queryScalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     );
-    try std.testing.expectEqual(@as(i64, 6), tables);
+    try std.testing.expectEqual(@as(i64, 7), tables);
 }
 
 test "graph_db migrate is idempotent" {

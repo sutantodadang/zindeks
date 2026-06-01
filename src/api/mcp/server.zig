@@ -87,6 +87,10 @@ fn lockMode(name: []const u8) LockMode {
     if (std.mem.eql(u8, name, "ingest_traces")) {
         return .{ .gdb = .exclusive };
     }
+    // ── save_reasoning — graph writer (inserts a reasoning row) ──────────
+    if (std.mem.eql(u8, name, "save_reasoning")) {
+        return .{ .gdb = .exclusive };
+    }
     // ── search: keyword/semantic (overlay reader), hybrid (overlay+gdb) ──
     if (std.mem.eql(u8, name, "search")) {
         // Hybrid needs both; keyword/semantic only need overlay.
@@ -826,6 +830,14 @@ pub const Server = struct {
         var gdb = graph_db.GraphDb.open(gpz) catch {
             idx.close();
             return;
+        };
+
+        // Apply migrations on attach so schema added in newer zindeks versions
+        // (e.g. the `reasoning` thinking-cache table) self-heals onto projects
+        // indexed by an older binary, without requiring a full re-index.
+        // Idempotent (CREATE ... IF NOT EXISTS); non-fatal on failure.
+        gdb.migrate() catch |err| {
+            std.log.warn("migrate on attach failed: {s}", .{@errorName(err)});
         };
 
         const projected_path = self.allocator.dupe(u8, path) catch {

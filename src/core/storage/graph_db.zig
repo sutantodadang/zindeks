@@ -267,6 +267,19 @@ const MIGRATIONS = [_][:0]const u8{
     \\);
     ,
     \\CREATE INDEX IF NOT EXISTS idx_embeddings_document ON document_embeddings(document_id);
+    ,
+    \\CREATE TABLE IF NOT EXISTS reasoning (
+    \\    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\    problem      TEXT    NOT NULL,
+    \\    reasoning    TEXT    NOT NULL,
+    \\    files        TEXT    NOT NULL DEFAULT '',
+    \\    confidence   REAL    NOT NULL DEFAULT 0.5,
+    \\    vector       BLOB,
+    \\    dimensions   INTEGER NOT NULL DEFAULT 0,
+    \\    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    \\);
+    ,
+    \\CREATE INDEX IF NOT EXISTS idx_reasoning_created ON reasoning(created_at);
 };
 
 fn shouldIgnoreMigrationError(sql: [:0]const u8, err_msg: []const u8) bool {

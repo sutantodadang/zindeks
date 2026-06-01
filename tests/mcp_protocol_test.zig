@@ -146,3 +146,25 @@ test "score_relevance dispatch returns No project loaded when engine is null" {
 
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "No project loaded") != null);
 }
+
+test "save_reasoning dispatch returns No project loaded when gdb is null" {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+
+    var ctx = tools.Context{ .allocator = std.testing.allocator };
+    try tools.dispatch(&ctx, "save_reasoning", null, w);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "No project loaded") != null);
+}
+
+test "recall_reasoning dispatch returns No project loaded when gdb is null" {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+
+    var ctx = tools.Context{ .allocator = std.testing.allocator };
+    try tools.dispatch(&ctx, "recall_reasoning", null, w);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "No project loaded") != null);
+}
