@@ -19,6 +19,7 @@
 const std = @import("std");
 const zindeks = @import("zindeks");
 const protocol = zindeks.api.mcp.protocol;
+const tools = zindeks.api.mcp.tools;
 
 test "negotiateProtocolVersion echoes a supported request" {
     try std.testing.expectEqualStrings("2024-11-05", protocol.negotiateProtocolVersion("2024-11-05"));
@@ -133,4 +134,15 @@ test "parseRequest rejects missing jsonrpc field" {
     const raw = "{\"id\":1,\"method\":\"ping\"}";
     const result = try protocol.parseRequest(std.testing.allocator, raw);
     try std.testing.expect(result == null);
+}
+
+test "score_relevance dispatch returns No project loaded when engine is null" {
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+
+    var ctx = tools.Context{ .allocator = std.testing.allocator };
+    try tools.dispatch(&ctx, "score_relevance", null, w);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "No project loaded") != null);
 }

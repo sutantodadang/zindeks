@@ -93,6 +93,9 @@ fn lockMode(name: []const u8) LockMode {
         // Use overlay+gdb shared to cover all modes conservatively.
         return .{ .overlay = .shared, .gdb = .shared };
     }
+    if (std.mem.eql(u8, name, "score_relevance")) {
+        return .{ .overlay = .shared, .gdb = .shared };
+    }
     // ── Pure meta reads (no DB, no engine) ───────────────────────────────
     if (std.mem.eql(u8, name, "list_projects") or
         std.mem.eql(u8, name, "config") or

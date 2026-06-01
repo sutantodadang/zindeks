@@ -1,13 +1,19 @@
-//! `zindeks hook` — PreToolUse hook for Claude Code / Cursor.
+//! `zindeks hook` — PreToolUse and UserPromptSubmit hook for Claude Code / Cursor.
 //!
-//! Reads a JSON event from stdin, decides allow/ask/deny, emits JSON to stdout.
+//! Reads a JSON event from stdin, decides allow/ask/deny (PreToolUse) or injects
+//! an attention map (UserPromptSubmit), emits JSON to stdout.
 //! Designed to run as a zero-dependency binary hook (no Node, no JS file).
 //!
 //! Usage (injected by `zindeks install`):
-//!   zindeks hook --host claude    (default)
+//!   zindeks hook --host claude              (default, PreToolUse)
+//!   zindeks hook --event userpromptsubmit   (UserPromptSubmit attention map)
 //!   zindeks hook --host cursor
 
 const std = @import("std");
+const project_store = @import("../../core/project_store.zig");
+const storage = @import("../../core/storage/index.zig");
+const search = @import("../../core/search/engine.zig");
+const attention = @import("../../core/ai/attention.zig");
 
 // ── Decision types ────────────────────────────────────────────────────
 
@@ -123,8 +129,9 @@ pub fn decide(tool_name: []const u8, command: []const u8) Decision {
 // ── I/O wrapper ───────────────────────────────────────────────────────
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    // Parse --host flag.
+    // Parse --host and --event flags.
     var host: []const u8 = "claude";
+    var explicit_event: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -133,6 +140,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             if (i < args.len) host = args[i];
         } else if (std.mem.startsWith(u8, a, "--host=")) {
             host = a["--host=".len..];
+        } else if (std.mem.eql(u8, a, "--event")) {
+            i += 1;
+            if (i < args.len) explicit_event = args[i];
+        } else if (std.mem.startsWith(u8, a, "--event=")) {
+            explicit_event = a["--event=".len..];
         }
     }
 
@@ -153,7 +165,37 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer parsed.deinit();
 
-    // Extract tool_name and command.
+    // Determine effective event: explicit --event > hook_event_name JSON field > "pretooluse".
+    var effective_event_buf: [64]u8 = undefined;
+    const effective_event: []const u8 = blk: {
+        if (explicit_event) |e| {
+            const lower = std.ascii.lowerString(effective_event_buf[0..@min(e.len, 64)], e[0..@min(e.len, 64)]);
+            break :blk lower;
+        }
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("hook_event_name")) |hen| {
+                if (hen == .string and hen.string.len <= 64) {
+                    const lower = std.ascii.lowerString(effective_event_buf[0..hen.string.len], hen.string);
+                    break :blk lower;
+                }
+            }
+        }
+        break :blk "pretooluse";
+    };
+
+    // Route to UserPromptSubmit handler if applicable.
+    if (std.mem.eql(u8, effective_event, "userpromptsubmit")) {
+        runUserPromptSubmit(allocator, host, parsed.value) catch {
+            // Last-resort fail-open: if our handler itself errors, emit empty context.
+            const stdout = std.fs.File.stdout().deprecatedWriter();
+            stdout.writeAll(
+                \\{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":""}}
+            ) catch {};
+        };
+        return;
+    }
+
+    // ── PreToolUse path (unchanged) ───────────────────────────────────
     var tool_name: []const u8 = "";
     var command: []const u8 = "";
 
@@ -172,6 +214,94 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const d = decide(tool_name, command);
     try emitDecision(host, d);
+}
+
+fn runUserPromptSubmit(allocator: std.mem.Allocator, host: []const u8, root_json: std.json.Value) !void {
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+
+    // Fail-open emitter for early returns.
+    const emitEmpty = struct {
+        fn call(w: @TypeOf(stdout)) void {
+            w.writeAll(
+                \\{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":""}}
+            ) catch {};
+        }
+    }.call;
+
+    // Cursor has no UserPromptSubmit equivalent — no-op.
+    if (std.mem.eql(u8, host, "cursor")) {
+        try stdout.writeAll("{}");
+        return;
+    }
+
+    // 1. Extract cwd from JSON; fall back to process cwd.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd: []const u8 = blk: {
+        if (root_json == .object) {
+            if (root_json.object.get("cwd")) |cv| {
+                if (cv == .string and cv.string.len > 0) break :blk cv.string;
+            }
+        }
+        break :blk std.fs.cwd().realpath(".", &cwd_buf) catch ".";
+    };
+
+    // 2. Derive working set from git.
+    const working_set = attention.gitWorkingSet(allocator, cwd) catch {
+        emitEmpty(stdout);
+        return;
+    };
+    defer {
+        for (working_set) |p| allocator.free(p);
+        allocator.free(working_set);
+    }
+
+    if (working_set.len == 0) {
+        emitEmpty(stdout);
+        return;
+    }
+
+    // 3. Load engine for cwd (fail-open if repo not indexed).
+    var location = project_store.resolveRead(allocator, cwd, .{}) catch {
+        emitEmpty(stdout);
+        return;
+    };
+    defer location.deinit();
+
+    var idx = storage.Index.open(allocator, std.fs.cwd(), location.index_dir) catch {
+        emitEmpty(stdout);
+        return;
+    };
+    defer idx.close();
+
+    var engine = search.Engine.init(&idx);
+
+    // 4. Score — fail-open to empty slice.
+    var scored_owned: ?[]attention.Scored = null;
+    defer if (scored_owned) |s| attention.freeScored(allocator, s);
+    const scored: []attention.Scored = if (attention.score(allocator, &engine, working_set, "", 12)) |s| blk: {
+        scored_owned = s;
+        break :blk s;
+    } else |_| &.{};
+
+    // 5. Build additionalContext text.
+    var ctx_buf = std.ArrayList(u8){};
+    defer ctx_buf.deinit(allocator);
+
+    if (scored.len > 0) {
+        try ctx_buf.appendSlice(allocator,
+            "Zindeks attention \u{2014} indexed files most relevant to current uncommitted changes " ++
+                "(relevance 0..1). Prefer these when you need code context:\n",
+        );
+        for (scored) |s| {
+            try ctx_buf.writer(allocator).print("  {s}  {d:.2}\n", .{ s.path, s.score });
+        }
+    }
+
+    // 6. Emit UserPromptSubmit JSON.
+    try stdout.print(
+        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":{f}}}}}",
+        .{std.json.fmt(ctx_buf.items, .{})},
+    );
 }
 
 fn emitAllow(host: []const u8) !void {

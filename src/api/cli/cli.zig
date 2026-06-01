@@ -5,6 +5,7 @@ const incremental = @import("../../core/indexer/incremental.zig");
 const project_store = @import("../../core/project_store.zig");
 const storage = @import("../../core/storage/index.zig");
 const search = @import("../../core/search/engine.zig");
+const attention = @import("../../core/ai/attention.zig");
 const graph_db = @import("../../core/storage/graph_db.zig");
 const pipeline_mod = @import("../../core/parser/pipeline.zig");
 const semantic = @import("../../core/search/semantic.zig");
@@ -99,6 +100,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try runReindex(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "search")) {
         try runSearch(&state, args[global.cmd_index + 1 ..]);
+    } else if (std.mem.eql(u8, cmd, "attention")) {
+        try runAttention(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "serve")) {
         try runServe(&state, args[global.cmd_index + 1 ..]);
     } else if (std.mem.eql(u8, cmd, "update")) {
@@ -430,6 +433,128 @@ fn runSearch(state: *CliState, args: []const []const u8) !void {
             });
         } else {
             try stdout_sw.writer.print("{d:.3}\t{s}\t{s}\n", .{ item.score, item.path, item.snippet });
+        }
+    }
+}
+
+// ── Subcommand: attention ─────────────────────────────────────────────
+
+fn runAttention(state: *CliState, args: []const []const u8) !void {
+    // Parse flags
+    var files_arg: ?[]const u8 = null;
+    var query: []const u8 = "";
+    var budget: usize = 20;
+    var json_out: bool = false;
+
+    // Collect non-flag args for parseReadArgs (repo positional)
+    var leftover = std.ArrayList([]const u8){};
+    defer leftover.deinit(state.allocator);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--files")) {
+            i += 1;
+            if (i >= args.len) return fmtError(state.colors_enabled, errors.invalidArgs("--files expects a value"), std.fs.File.stderr().deprecatedWriter());
+            files_arg = args[i];
+        } else if (std.mem.eql(u8, a, "--query")) {
+            i += 1;
+            if (i >= args.len) return fmtError(state.colors_enabled, errors.invalidArgs("--query expects a value"), std.fs.File.stderr().deprecatedWriter());
+            query = args[i];
+        } else if (std.mem.eql(u8, a, "--budget")) {
+            i += 1;
+            if (i >= args.len) return fmtError(state.colors_enabled, errors.invalidArgs("--budget expects a value"), std.fs.File.stderr().deprecatedWriter());
+            const v = std.fmt.parseInt(usize, args[i], 10) catch return fmtError(state.colors_enabled, errors.invalidArgs("--budget expects an integer"), std.fs.File.stderr().deprecatedWriter());
+            budget = @max(1, @min(v, 100));
+        } else if (std.mem.eql(u8, a, "--json")) {
+            json_out = true;
+        } else {
+            try leftover.append(state.allocator, a);
+        }
+    }
+
+    // Resolve repo path via parseReadArgs on leftover positional args
+    const parsed = try parseReadArgs(state.allocator, leftover.items);
+
+    // Build working set
+    var working_set = std.ArrayList([]const u8){};
+    defer working_set.deinit(state.allocator);
+
+    if (files_arg) |fstr| {
+        // Split on comma, trim each
+        var it = std.mem.splitScalar(u8, fstr, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t");
+            if (trimmed.len > 0) {
+                try working_set.append(state.allocator, trimmed);
+            }
+        }
+    } else {
+        // Derive working set from git status --porcelain.
+        const git_paths = try attention.gitWorkingSet(state.allocator, parsed.repo);
+        defer {
+            for (git_paths) |p| state.allocator.free(p);
+            state.allocator.free(git_paths);
+        }
+
+        if (git_paths.len == 0) {
+            const stderr_w = std.fs.File.stderr().deprecatedWriter();
+            try stderr_w.writeAll("No working set: pass --files, or run inside a git repo with uncommitted changes.\n");
+            return;
+        }
+
+        for (git_paths) |p| {
+            try working_set.append(state.allocator, p);
+        }
+    }
+
+    // Load engine
+    var location = try project_store.resolveRead(state.allocator, parsed.repo, .{
+        .index_dir = parsed.index_dir,
+        .store_root = parsed.store_root,
+    });
+    defer location.deinit();
+
+    var idx = try storage.Index.open(state.allocator, std.fs.cwd(), location.index_dir);
+    defer idx.close();
+
+    var engine = search.Engine.init(&idx);
+
+    // Score
+    const scored = try attention.score(state.allocator, &engine, working_set.items, query, budget);
+    defer attention.freeScored(state.allocator, scored);
+
+    var stdout_sw = terminal.StyledWriter(@TypeOf(std.fs.File.stdout().deprecatedWriter())).init(std.fs.File.stdout().deprecatedWriter());
+    stdout_sw.setColors(state.colors_enabled);
+
+    if (json_out) {
+        try stdout_sw.writer.writeAll("{\"scored\":[");
+        for (scored, 0..) |s, j| {
+            if (j > 0) try stdout_sw.writer.writeAll(",");
+            try stdout_sw.writer.print("{{\"path\":{f},\"score\":{d:.2}}}", .{
+                std.json.fmt(s.path, .{}),
+                s.score,
+            });
+        }
+        try stdout_sw.writer.print("],\"working_set_size\":{},\"budget\":{}}}\n", .{ working_set.items.len, budget });
+    } else {
+        try stdout_sw.print("{s}Attention map ({d} files, working set {d}):{s}\n", .{
+            stdout_sw.bold(), scored.len, working_set.items.len, stdout_sw.reset(),
+        });
+        if (scored.len == 0) {
+            try stdout_sw.print("  {s}No relevant files.{s}\n", .{ stdout_sw.dim(), stdout_sw.reset() });
+            return;
+        }
+        try stdout_sw.print("\n", .{});
+        for (scored) |s| {
+            if (state.colors_enabled) {
+                try stdout_sw.writer.print("{s}{d:.2}{s}\t{s}{s}{s}\n", .{
+                    stdout_sw.green(), s.score, stdout_sw.reset(),
+                    stdout_sw.cyan(), s.path, stdout_sw.reset(),
+                });
+            } else {
+                try stdout_sw.writer.print("{d:.2}\t{s}\n", .{ s.score, s.path });
+            }
         }
     }
 }
@@ -805,6 +930,8 @@ fn usage(sw: anytype) !void {
         \\  index [repo] [--force]    Index a repository (--force / -f wipes existing index first)
         \\  reindex [repo]            Incremental update of an existing index
         \\  search <query> [repo]     Search indexed code (BM25)
+        \\  attention [--files f,...] [--query q] [--budget N] [--json] [repo]
+        \\                            Rank indexed files by working-set relevance
         \\  serve [--port N|--socket P]
         \\                            Start MCP JSON-RPC server (stdio by default,
         \\                            TCP with --port, Unix socket with --socket)

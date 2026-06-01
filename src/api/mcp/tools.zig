@@ -26,6 +26,7 @@ const cypher_parser = @import("../../core/graph/cypher/parser.zig");
 const cypher_executor = @import("../../core/graph/cypher/executor.zig");
 const semantic_mod = @import("../../core/search/semantic.zig");
 const ai_context = @import("../../core/ai/context.zig");
+const ai_attention = @import("../../core/ai/attention.zig");
 const ai_summarize = @import("../../core/ai/summarize.zig");
 const ai_query = @import("../../core/ai/query.zig");
 const ai_window = @import("../../core/ai/window.zig");
@@ -55,6 +56,7 @@ pub const ALL = [_]Descriptor{
     list_files,
     file_outline,
     get_context,
+    score_relevance,
     summarize_symbol,
     trace_call_path,
     get_architecture,
@@ -451,6 +453,32 @@ pub const get_context = Descriptor{
     ,
 };
 
+pub const score_relevance = Descriptor{
+    .name = "score_relevance",
+    .description = "Attention scoring: given the current working set (files or symbols the task is focused on), return other indexed files ranked by relevance (0..1). Use to decide what code context to keep or drop. Scores only — does not modify anything.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "working_set": {
+    \\      "type": "array",
+    \\      "items": { "type": "string" },
+    \\      "description": "File paths or symbol names the current task is focused on"
+    \\    },
+    \\    "query": {
+    \\      "type": "string",
+    \\      "description": "Optional extra natural-language focus to bias scoring"
+    \\    },
+    \\    "budget": {
+    \\      "type": "integer",
+    \\      "description": "Max number of ranked files to return (default 20, max 100)"
+    \\    }
+    \\  },
+    \\  "required": ["working_set"]
+    \\}
+    ,
+};
+
 pub const summarize_symbol = Descriptor{
     .name = "summarize_symbol",
     .description = "Summarise a code symbol: extracts signature, purpose (from doc comments), key operations, dependencies, and a rough complexity score. Supports Zig, Python, JavaScript, Rust, Go, C, C++, Java.",
@@ -688,6 +716,8 @@ pub fn dispatch(
         try handleHealthCheck(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "get_context")) {
         try handleGetContext(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "score_relevance")) {
+        try handleScoreRelevance(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "summarize_symbol")) {
         try handleSummarizeSymbol(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "config")) {
@@ -2439,6 +2469,76 @@ fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
         token_est,
         max_tokens,
     });
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: score_relevance
+// ██████████████████████████████████████████████████████████████████████████
+
+fn handleScoreRelevance(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const engine = ctx.engine orelse {
+        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        return;
+    };
+
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.working_set\"}");
+        return;
+    };
+
+    // Parse working_set array
+    const ws_val = params.get("working_set") orelse {
+        try writer.writeAll("{\"error\":\"Empty working_set\"}");
+        return;
+    };
+    const ws_arr = switch (ws_val) {
+        .array => |a| a,
+        else => {
+            try writer.writeAll("{\"error\":\"Empty working_set\"}");
+            return;
+        },
+    };
+
+    var working_set = std.ArrayList([]const u8){};
+    defer working_set.deinit(ctx.allocator);
+    for (ws_arr.items) |item| {
+        switch (item) {
+            .string => |s| try working_set.append(ctx.allocator, s),
+            else => {},
+        }
+    }
+    if (working_set.items.len == 0) {
+        try writer.writeAll("{\"error\":\"Empty working_set\"}");
+        return;
+    }
+
+    // Optional query
+    const query: []const u8 = if (getString(params, "query")) |q| q else "";
+
+    // Budget: default 20, clamp 1..100
+    const budget: usize = blk: {
+        if (params.get("budget")) |v| switch (v) {
+            .integer => |i| if (i > 0) break :blk @intCast(@min(i, 100)),
+            else => {},
+        };
+        break :blk 20;
+    };
+
+    const working_set_size = working_set.items.len;
+
+    const scored = try ai_attention.score(ctx.allocator, engine, working_set.items, query, budget);
+    defer ai_attention.freeScored(ctx.allocator, scored);
+
+    // Emit JSON
+    try writer.writeAll("{\"scored\":[");
+    for (scored, 0..) |s, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.print("{{\"path\":{f},\"score\":{d:.2}}}", .{
+            std.json.fmt(s.path, .{}),
+            s.score,
+        });
+    }
+    try writer.print("],\"working_set_size\":{},\"budget\":{}}}", .{ working_set_size, budget });
 }
 
 // ██████████████████████████████████████████████████████████████████████████

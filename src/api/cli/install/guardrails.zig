@@ -22,7 +22,10 @@ pub fn installForHost(
     switch (id) {
         .claude_code => {
             try writeSharedGuardScript(allocator, cwd);
-            if (config_path) |path| try injectClaudeHookConfig(allocator, path);
+            if (config_path) |path| {
+                try injectClaudeHookConfig(allocator, path);
+                try injectClaudeUserPromptHookConfig(allocator, path);
+            }
         },
         .cursor => {
             try writeSharedGuardScript(allocator, cwd);
@@ -172,6 +175,61 @@ pub fn injectClaudeHookConfig(allocator: std.mem.Allocator, path: []const u8) !v
     try pre_hook.put("matcher", .{ .string = "Grep|Glob|Bash" });
     try pre_hook.put("hooks", .{ .array = inner_hooks });
     try pre_tool_use.array.append(.{ .object = pre_hook });
+
+    try writeJsonObject(allocator, aa, path, root.value);
+}
+
+pub fn injectClaudeUserPromptHookConfig(allocator: std.mem.Allocator, path: []const u8) !void {
+    var root = try readJsonObject(allocator, path);
+    defer root.deinit();
+
+    const aa = root.arena.allocator();
+
+    // Resolve binary path and build the hook command string (same quoting logic
+    // as injectClaudeHookConfig).
+    const bin = try adapters.selfExePath(aa);
+    const needs_quotes = std.mem.indexOfScalar(u8, bin, ' ') != null;
+    const q: []const u8 = if (needs_quotes) "\"" else "";
+    const command = try std.fmt.allocPrint(aa, "{s}{s}{s} hook --event userpromptsubmit --host claude", .{ q, bin, q });
+
+    const hooks = try ensureObjectField(aa, &root.value, "hooks");
+    const user_prompt_submit = try ensureArrayField(aa, hooks, "UserPromptSubmit");
+
+    // IDEMPOTENT: remove stale zindeks-managed entries before appending.
+    var filtered = std.json.Array.init(aa);
+    for (user_prompt_submit.array.items) |entry| {
+        if (nestedHookCommandContains(entry, "zindeks")) {
+            continue; // drop old zindeks entry
+        }
+        try filtered.append(entry);
+    }
+    user_prompt_submit.array = filtered;
+
+    // Check idempotency: don't double-add if already present.
+    var already_present = false;
+    for (user_prompt_submit.array.items) |entry| {
+        if (nestedHookCommandContains(entry, command)) {
+            already_present = true;
+            break;
+        }
+    }
+    if (already_present) {
+        try writeJsonObject(allocator, aa, path, root.value);
+        return;
+    }
+
+    // Append the new entry. UserPromptSubmit entries have NO matcher field.
+    var command_hook = std.json.ObjectMap.init(aa);
+    try command_hook.put("type", .{ .string = "command" });
+    try command_hook.put("command", .{ .string = command });
+    try command_hook.put("timeout", .{ .integer = 10 });
+
+    var inner_hooks = std.json.Array.init(aa);
+    try inner_hooks.append(.{ .object = command_hook });
+
+    var ups_hook = std.json.ObjectMap.init(aa);
+    try ups_hook.put("hooks", .{ .array = inner_hooks });
+    try user_prompt_submit.array.append(.{ .object = ups_hook });
 
     try writeJsonObject(allocator, aa, path, root.value);
 }
