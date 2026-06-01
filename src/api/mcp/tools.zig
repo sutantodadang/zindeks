@@ -797,6 +797,12 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
     var pipe = pipeline_mod.Pipeline.init(ctx.allocator, gdb, project_dir);
     const pipe_result = try pipe.run();
 
+    // Build and persist HNSW ANN index from the freshly-written embeddings.
+    // Non-fatal: projects below MIN_ANN_DOCS threshold simply skip this.
+    semantic_mod.buildAndSaveAnn(&gdb, index_dir, ctx.allocator) catch |err| {
+        std.log.warn("ANN build skipped: {s}", .{@errorName(err)});
+    };
+
     try writer.print(
         \\{{"project":"{s}","mode":"full","files_indexed":{},"symbols":{},"edges":{},"pipeline_ms":{}}}
     , .{ project_dir, pipe_result.files_scanned, pipe_result.symbols_extracted, pipe_result.edges_extracted, pipe_result.duration_ms });
@@ -1410,6 +1416,11 @@ fn handleUpdateIndex(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     const stats = incremental.applyChangesWithOverlayPooled(ctx.allocator, gdb, project_path, index_dir, &diff, ctx.parser_pool) catch |err| {
         try writer.print("{{\"error\":\"applyChangesWithOverlay failed: {s}\"}}", .{@errorName(err)});
         return;
+    };
+
+    // Rebuild ANN index after embeddings may have changed.
+    semantic_mod.buildAndSaveAnn(gdb, index_dir, ctx.allocator) catch |err| {
+        std.log.warn("ANN build skipped: {s}", .{@errorName(err)});
     };
 
     try writer.print(
@@ -2258,9 +2269,17 @@ fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
         return;
     }
 
-    var results = semantic_mod.search(gdb, query, limit, ctx.allocator) catch {
-        try writer.writeAll("{\"error\":\"Semantic search failed. Ensure embeddings have been generated.\"}");
-        return;
+    var results = blk: {
+        if (ctx.engine) |e| if (e.ann) |a| {
+            break :blk semantic_mod.searchAnn(gdb, a, query, limit, ctx.allocator) catch {
+                try writer.writeAll("{\"error\":\"Semantic search failed. Ensure embeddings have been generated.\"}");
+                return;
+            };
+        };
+        break :blk semantic_mod.search(gdb, query, limit, ctx.allocator) catch {
+            try writer.writeAll("{\"error\":\"Semantic search failed. Ensure embeddings have been generated.\"}");
+            return;
+        };
     };
     defer results.deinit(ctx.allocator);
 

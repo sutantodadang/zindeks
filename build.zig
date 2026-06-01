@@ -49,7 +49,13 @@ pub fn build(b: *std.Build) void {
     const sqlite_mod = b.createModule(.{ .target = target, .optimize = optimize });
     sqlite_mod.addCSourceFiles(.{ .files = &.{"vendor/sqlite3/sqlite3.c"} });
     sqlite_mod.addIncludePath(b.path("vendor/sqlite3"));
-    sqlite_mod.addCMacro("SQLITE_THREADSAFE", "0");
+    // Multi-thread mode: safe to use across threads as long as no single
+    // connection is touched by two threads at once. The MCP server's read-only
+    // worker pool gives each worker its own pooled connection, so mode 2 is the
+    // correct (and faster-than-serialized) choice. Mode 0 would leave SQLite's
+    // global state (allocator, PRNG, page cache) unprotected and corrupt under
+    // concurrent read dispatch.
+    sqlite_mod.addCMacro("SQLITE_THREADSAFE", "2");
     sqlite_mod.addCMacro("SQLITE_OMIT_LOAD_EXTENSION", "1");
     sqlite_mod.addCMacro("SQLITE_ENABLE_FTS5", "1");
     const sqlite = b.addLibrary(.{

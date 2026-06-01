@@ -38,6 +38,8 @@ pub const search = struct {
     pub const tokenizer = @import("core/search/tokenizer.zig");
     pub const embeddings = @import("core/search/embeddings.zig");
     pub const semantic = @import("core/search/semantic.zig");
+    pub const quantize = @import("core/search/quantize.zig");
+    pub const hnsw = @import("core/search/hnsw.zig");
 };
 
 pub const parser = struct {

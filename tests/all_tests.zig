@@ -3,6 +3,7 @@
 test {
     _ = @import("zindeks");
     _ = @import("zindeks_test.zig");
+    _ = @import("ann_test.zig");
     _ = @import("graph_db_test.zig");
     _ = @import("call_graph_test.zig");
     _ = @import("arch_test.zig");

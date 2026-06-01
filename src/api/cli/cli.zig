@@ -7,6 +7,7 @@ const storage = @import("../../core/storage/index.zig");
 const search = @import("../../core/search/engine.zig");
 const graph_db = @import("../../core/storage/graph_db.zig");
 const pipeline_mod = @import("../../core/parser/pipeline.zig");
+const semantic = @import("../../core/search/semantic.zig");
 const mcp = @import("../mcp/server.zig");
 const protocol = @import("../mcp/protocol.zig");
 const update = @import("update.zig");
@@ -305,6 +306,9 @@ fn runGraphPipeline(allocator: std.mem.Allocator, repo: []const u8, index_dir: [
 
     var pipe = pipeline_mod.Pipeline.init(allocator, gdb, project_dir);
     _ = try pipe.run();
+
+    // Build ANN index from the freshly-written embeddings. Non-fatal.
+    semantic.buildAndSaveAnn(&gdb, abs_index_dir, allocator) catch {};
 }
 
 // ── Subcommand: reindex ───────────────────────────────────────────────
@@ -448,6 +452,10 @@ const ServeMode = union(enum) {
 };
 
 fn runServe(state: *CliState, args: []const []const u8) !void {
+    graph_db.tuning = .{
+        .cache_size_kb = state.cfg.cache_size_kb,
+        .mmap_bytes = @as(u64, state.cfg.mmap_size_mb) * 1024 * 1024,
+    };
     var mode: ServeMode = .stdio;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -471,7 +479,7 @@ fn runServe(state: *CliState, args: []const []const u8) !void {
 
     switch (mode) {
         .stdio => {
-            var server = mcp.Server.init(state.allocator, .{ .store_root = state.cfg.store_root });
+            var server = mcp.Server.init(state.allocator, .{ .store_root = state.cfg.store_root, .pool_conns = state.cfg.pool_conns, .worker_threads = state.cfg.worker_threads });
             defer server.deinit();
             try server.serve();
         },
@@ -520,7 +528,7 @@ fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
             std.log.err("accept failed: {s}", .{@errorName(err)});
             continue;
         };
-        const thread = std.Thread.spawn(.{}, sessionThread, .{ state.allocator, conn.stream, state.cfg.store_root }) catch |err| {
+        const thread = std.Thread.spawn(.{}, sessionThread, .{ state.allocator, conn.stream, state.cfg.store_root, state.cfg.pool_conns, state.cfg.worker_threads }) catch |err| {
             std.log.err("spawn session thread failed: {s}", .{@errorName(err)});
             conn.stream.close();
             continue;
@@ -529,9 +537,9 @@ fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
     }
 }
 
-fn sessionThread(allocator: std.mem.Allocator, stream: std.net.Stream, store_root: ?[]const u8) void {
+fn sessionThread(allocator: std.mem.Allocator, stream: std.net.Stream, store_root: ?[]const u8, pool_conns: u32, worker_threads: u32) void {
     const transport = protocol.Transport.initSocket(allocator, stream);
-    var server = mcp.Server.initWithTransport(allocator, .{ .store_root = store_root }, transport);
+    var server = mcp.Server.initWithTransport(allocator, .{ .store_root = store_root, .pool_conns = pool_conns, .worker_threads = worker_threads }, transport);
     defer server.deinit();
     server.serve() catch |err| {
         std.log.warn("session ended with error: {s}", .{@errorName(err)});

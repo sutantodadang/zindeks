@@ -27,6 +27,15 @@ pub const Config = struct {
     /// Embedding model name for semantic search.
     embedding_model: []const u8 = "fasttext",
 
+    /// SQLite page cache per connection, in KiB.
+    cache_size_kb: u32 = 64000,
+    /// SQLite mmap size per connection, in MiB (0 disables).
+    mmap_size_mb: u32 = 256,
+    /// Read-only connection pool size for `serve`.
+    pool_conns: u32 = 4,
+    /// Worker threads for concurrent read-only dispatch in `serve`.
+    worker_threads: u32 = 4,
+
     /// Read config from a JSON file. Returns default Config if file doesn't exist.
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
@@ -90,7 +99,11 @@ pub const Config = struct {
         try writer.print("  \"default_repo\": {f},\n", .{std.json.fmt(config.default_repo, .{})});
         try writer.print("  \"colors_enabled\": {},\n", .{config.colors_enabled});
         try writer.print("  \"max_results\": {},\n", .{config.max_results});
-        try writer.print("  \"embedding_model\": {f}\n", .{std.json.fmt(config.embedding_model, .{})});
+        try writer.print("  \"embedding_model\": {f},\n", .{std.json.fmt(config.embedding_model, .{})});
+        try writer.print("  \"cache_size_kb\": {},\n", .{config.cache_size_kb});
+        try writer.print("  \"mmap_size_mb\": {},\n", .{config.mmap_size_mb});
+        try writer.print("  \"pool_conns\": {},\n", .{config.pool_conns});
+        try writer.print("  \"worker_threads\": {}\n", .{config.worker_threads});
 
         try writer.writeAll("}\n");
     }
@@ -177,6 +190,10 @@ test "load/save roundtrip" {
         .colors_enabled = false,
         .max_results = 20,
         .embedding_model = try allocator.dupe(u8, "bert"),
+        .cache_size_kb = 32000,
+        .mmap_size_mb = 128,
+        .pool_conns = 8,
+        .worker_threads = 6,
     };
 
     try cfg.save(config_path);
@@ -193,6 +210,10 @@ test "load/save roundtrip" {
     try std.testing.expect(!loaded.colors_enabled);
     try std.testing.expectEqual(@as(u32, 20), loaded.max_results);
     try std.testing.expectEqualStrings("bert", loaded.embedding_model);
+    try std.testing.expectEqual(@as(u32, 32000), loaded.cache_size_kb);
+    try std.testing.expectEqual(@as(u32, 128), loaded.mmap_size_mb);
+    try std.testing.expectEqual(@as(u32, 8), loaded.pool_conns);
+    try std.testing.expectEqual(@as(u32, 6), loaded.worker_threads);
 
     // Cleanup original
     cfg.deinit(allocator);

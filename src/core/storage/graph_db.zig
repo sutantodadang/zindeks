@@ -29,6 +29,16 @@ fn sqliteTransient(_: ?*anyopaque) callconv(.c) void {
 const SQLITE_TRANSIENT: sqlite3.sqlite3_destructor_type = &sqliteTransient;
 const cache = @import("cache.zig");
 
+/// Connection-level performance tuning, applied by `open()`.  Set once at
+/// startup (before opening any connection) so every connection inherits it.
+pub const Tuning = struct {
+    /// SQLite page cache size in KiB (passed as negative `cache_size`).
+    cache_size_kb: u32 = 64000,
+    /// Memory-map size in bytes for the database file (0 disables mmap).
+    mmap_bytes: u64 = 268435456, // 256 MiB
+};
+pub var tuning: Tuning = .{};
+
 pub const ColumnType = enum {
     integer,
     float,
@@ -283,8 +293,19 @@ pub const GraphDb = struct {
         // large page cache and in-memory temp tables.
         _ = sqlite3.sqlite3_exec(db, "PRAGMA journal_mode = WAL;", null, null, null);
         _ = sqlite3.sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", null, null, null);
-        _ = sqlite3.sqlite3_exec(db, "PRAGMA cache_size = -64000;", null, null, null);
+        var pragma_buf: [128]u8 = undefined;
+        if (std.fmt.bufPrintZ(&pragma_buf, "PRAGMA cache_size = -{d};", .{tuning.cache_size_kb})) |s| {
+            _ = sqlite3.sqlite3_exec(db, s.ptr, null, null, null);
+        } else |_| {}
         _ = sqlite3.sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", null, null, null);
+        // Wait up to 5s for the lock instead of erroring immediately when a
+        // reader briefly races the writer's WAL checkpoint.
+        _ = sqlite3.sqlite3_exec(db, "PRAGMA busy_timeout = 5000;", null, null, null);
+        if (tuning.mmap_bytes > 0) {
+            if (std.fmt.bufPrintZ(&pragma_buf, "PRAGMA mmap_size = {d};", .{tuning.mmap_bytes})) |s| {
+                _ = sqlite3.sqlite3_exec(db, s.ptr, null, null, null);
+            } else |_| {}
+        }
         return self;
     }
 

@@ -15,6 +15,7 @@ const storage = @import("../storage/index.zig");
 const graph_db = @import("../storage/graph_db.zig");
 const overlay_mod = @import("../storage/overlay.zig");
 const semantic = @import("semantic.zig");
+const hnsw = @import("hnsw.zig");
 
 /// BM25 tuning constants.
 pub const BM25_DEFAULTS = struct {
@@ -243,6 +244,11 @@ pub const Engine = struct {
     /// scored with their doc-id offset by `base.docCount()` so the merged
     /// result list has unique IDs.
     overlay: ?*overlay_mod.Overlay = null,
+    /// Optional HNSW approximate-nearest-neighbor index over document
+    /// embeddings.  When present, hybrid/semantic search query it (with an
+    /// exact f32 re-rank) instead of scanning every embedding linearly.
+    /// Must outlive the engine; owned by the caller (the MCP server).
+    ann: ?*hnsw.Hnsw = null,
     /// B8: Optional snippet LRU cache. Owned by the Engine when non-null.
     /// Initialize via Engine.initWithSnippetCache or attach via useSnippetCache.
     snippet_cache: ?*SnippetLruCache = null,
@@ -312,6 +318,13 @@ pub const Engine = struct {
     /// index — no re-build required.
     pub fn useOverlay(self: *Engine, ov: *overlay_mod.Overlay) void {
         self.overlay = ov;
+    }
+
+    /// Attach an HNSW ANN index.  Must outlive the engine.  When set,
+    /// hybrid/semantic search use approximate nearest-neighbor lookup with an
+    /// exact re-rank instead of a linear embedding scan.
+    pub fn useAnn(self: *Engine, index: *hnsw.Hnsw) void {
+        self.ann = index;
     }
 
     /// Internal: lookup with cache when available.
@@ -555,14 +568,48 @@ pub const Engine = struct {
             return bm25Only(self, allocator, query, limit);
         }
 
-        // 1. Get BM25 results (use a larger pool for better fusion)
+        // 1+2. Get BM25 and semantic results concurrently.
+        // Semantic search touches the gdb connection; BM25 touches the index/overlay.
+        // These are disjoint resources so concurrent execution is safe.
+        const SemCtx = struct {
+            gdb: *graph_db.GraphDb,
+            allocator: std.mem.Allocator,
+            query: []const u8,
+            pool_size: usize,
+            ann: ?*hnsw.Hnsw,
+            result: ?semantic.SemResults = null,
+            err: ?anyerror = null,
+            fn run(c: *@This()) void {
+                // Prefer the ANN index (approximate + exact re-rank) when one is
+                // attached; otherwise fall back to the exact linear scan.
+                if (c.ann) |a| {
+                    c.result = semantic.searchAnn(c.gdb, a, c.query, c.pool_size, c.allocator) catch |e| {
+                        c.err = e;
+                        return;
+                    };
+                } else {
+                    c.result = semantic.search(c.gdb, c.query, c.pool_size, c.allocator) catch |e| {
+                        c.err = e;
+                        return;
+                    };
+                }
+            }
+        };
+        const sem_pool_size: usize = @max(limit * 3, 50);
+        var sem_ctx = SemCtx{ .gdb = gdb, .allocator = allocator, .query = query, .pool_size = sem_pool_size, .ann = self.ann };
+        const sem_thread = std.Thread.spawn(.{}, SemCtx.run, .{&sem_ctx}) catch null;
+
         const bm25_pool_size: usize = @max(limit * 3, 50);
-        var bm25_results = try self.search(allocator, query, bm25_pool_size);
+        var bm25_results = self.search(allocator, query, bm25_pool_size) catch |e| {
+            if (sem_thread) |t| { t.join(); } else { SemCtx.run(&sem_ctx); }
+            if (sem_ctx.result) |*r| r.deinit(allocator);
+            return e;
+        };
         defer bm25_results.deinit(allocator);
 
-        // 2. Get semantic results
-        const sem_pool_size: usize = @max(limit * 3, 50);
-        var sem_results = try semantic.search(gdb, query, sem_pool_size, allocator);
+        if (sem_thread) |t| { t.join(); } else { SemCtx.run(&sem_ctx); }
+        if (sem_ctx.err) |e| return e;
+        var sem_results = sem_ctx.result.?;
         defer sem_results.deinit(allocator);
 
         // 3. Build RRF scores

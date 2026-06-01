@@ -15,11 +15,15 @@ const project_store = @import("../../core/project_store.zig");
 const version = @import("../../version.zig");
 const incremental = @import("../../core/indexer/incremental.zig");
 const ParserPool = incremental.ParserPool;
+const hnsw = @import("../../core/search/hnsw.zig");
+const semantic = @import("../../core/search/semantic.zig");
 
 const ServerInfo = struct {
     name: []const u8 = "zindeks",
     version: []const u8 = version.version,
     store_root: ?[]const u8 = null,
+    pool_conns: u32 = 4,
+    worker_threads: u32 = 4,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -122,6 +126,9 @@ pub const Server = struct {
     idx: ?storage.Index,
     overlay: ?overlay_mod.Overlay,
     engine: ?search.Engine,
+    /// Owned HNSW ANN index.  Loaded from `<index_dir>/hnsw.idx` when a
+    /// project is opened; null when none exists or embeddings < MIN_ANN_DOCS.
+    ann: ?hnsw.Hnsw,
     // ── Guarded by gdb_rwlock ────────────────────────────────────────────
     /// Single graph-DB handle used when no pool is available (initialize-
     /// time, schema migrations).  When `pool` is non-null, read-only
@@ -191,6 +198,7 @@ pub const Server = struct {
             .idx = null,
             .overlay = null,
             .engine = null,
+            .ann = null,
             .gdb = null,
             .pool = null,
             .thread_pool = undefined,
@@ -216,6 +224,7 @@ pub const Server = struct {
         }
         if (self.pool) |*p| p.deinit();
         if (self.gdb) |*gdb| gdb.close();
+        if (self.ann) |*a| a.deinit();
         if (self.overlay) |*ov| ov.close();
         if (self.idx) |*idx| idx.close();
         if (self.project_path) |p| self.allocator.free(p);
@@ -227,7 +236,7 @@ pub const Server = struct {
 
     fn ensureThreadPool(self: *Server) !void {
         if (self.thread_pool_initialized) return;
-        try self.thread_pool.init(.{ .allocator = self.allocator, .n_jobs = DEFAULT_WORKER_THREADS });
+        try self.thread_pool.init(.{ .allocator = self.allocator, .n_jobs = self.info.worker_threads });
         self.thread_pool_initialized = true;
     }
 
@@ -520,8 +529,18 @@ pub const Server = struct {
             try self.runMutatingTool(req, tool_name, args);
             return false; // caller still owns req
         }
-        // Read-only: dispatch to thread pool so concurrent agent queries
-        // overlap.  Worker takes ownership of req and deinits when done.
+        // Read-only. With a connection pool, dispatch to the worker thread
+        // pool so concurrent agent queries overlap — each worker owns a private
+        // pooled connection.  Without a pool, workers would share the single
+        // `self.gdb` handle concurrently, which is unsafe even under
+        // SQLITE_THREADSAFE=2, so run inline (serialized) instead.  `self.pool`
+        // is only mutated on this (main) thread during attach, so reading it
+        // here needs no lock.
+        if (self.pool == null) {
+            try self.runReadOnlyInline(req, tool_name, args);
+            return false; // caller still owns req
+        }
+        // Worker takes ownership of req and deinits when done.
         self.dispatchReadOnly(req.*, tool_name, args) catch |err| {
             std.log.err("Read-only dispatch failed ({s}); falling back inline", .{@errorName(err)});
             try self.runReadOnlyInline(req, tool_name, args);
@@ -777,6 +796,8 @@ pub const Server = struct {
         if (self.pool) |*p| p.deinit();
         self.pool = null;
         if (self.gdb) |*gdb| gdb.close();
+        if (self.ann) |*a| a.deinit();
+        self.ann = null;
         if (self.overlay) |*ov| ov.close();
         if (self.idx) |*idx| idx.close();
         if (self.project_path) |p| self.allocator.free(p);
@@ -823,7 +844,7 @@ pub const Server = struct {
 
         // Initialize the read-only connection pool.  Failure is non-fatal:
         // handlers fall back to `self.gdb` when no pool is available.
-        if (pool.ConnectionPool.init(self.allocator, graph_path, DEFAULT_POOL_CONNS)) |p| {
+        if (pool.ConnectionPool.init(self.allocator, graph_path, self.info.pool_conns)) |p| {
             self.pool = p;
         } else |err| {
             std.log.warn("Failed to init connection pool: {s} — single-connection fallback", .{@errorName(err)});
@@ -836,10 +857,18 @@ pub const Server = struct {
             self.overlay = ov;
             self.engine.?.useOverlay(&self.overlay.?);
         }
+
+        // Load the persisted ANN index (if any) and attach it to the engine.
+        // Absent or below-threshold projects simply use the linear scan.
+        if (semantic.loadAnn(loc.index_dir, self.allocator) catch null) |loaded| {
+            self.ann = loaded;
+            self.engine.?.useAnn(&self.ann.?);
+        }
     }
 
     /// Re-open the on-disk overlay (after `update_index` rewrites it) and
     /// re-attach it to the engine so subsequent searches see the delta.
+    /// Also reloads the ANN index in case the embedding set changed.
     fn reattachOverlayLocked(self: *Server) !void {
         const idx_dir = self.index_dir orelse return;
         const base = if (self.idx != null) &self.idx.? else return;
@@ -851,6 +880,14 @@ pub const Server = struct {
         if (overlay_mod.Overlay.open(self.allocator, std.fs.cwd(), idx_dir, base) catch null) |ov| {
             self.overlay = ov;
             if (self.engine) |*e| e.useOverlay(&self.overlay.?);
+        }
+
+        // Reload the ANN index — update_index may have changed the embeddings.
+        if (self.ann) |*a| a.deinit();
+        self.ann = null;
+        if (semantic.loadAnn(idx_dir, self.allocator) catch null) |loaded| {
+            self.ann = loaded;
+            if (self.engine) |*e| e.useAnn(&self.ann.?);
         }
     }
 
