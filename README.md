@@ -58,6 +58,21 @@ zindeks doctor             # verify
 
 See [INTEGRATIONS.md](INTEGRATIONS.md) for per-host adapter details and exact paths written.
 
+### Concurrent MCP over HTTP (multi-agent)
+
+By default `zindeks serve` speaks MCP over stdio (one client per process).
+For multiple agents sharing one warm index with concurrent tool dispatch, run
+the HTTP daemon and point clients at it:
+
+    zindeks serve --http 7337                 # start the shared daemon
+    zindeks install --host claude-code --http 7337 --yes   # register HTTP transport
+    # or manually:
+    claude mcp add --transport http zindeks http://127.0.0.1:7337/mcp
+
+Read-only tools run in parallel; mutating tools (index/update) are serialized.
+The daemon must be running for the HTTP transport to work (unlike stdio, which
+the client auto-spawns).
+
 ## Quick start
 
 ```bash

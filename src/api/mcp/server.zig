@@ -905,6 +905,202 @@ pub const Server = struct {
         } else |_| null;
         try self.respondError(id, code);
     }
+
+    // ██████████████████████████████████████████████████████████████████████
+    // Transport-independent execution (HTTP front-end)
+    //
+    // `executeMessageToBuffer` runs one JSON-RPC message synchronously on the
+    // caller's thread and writes the reply into `out` (no transport, no worker
+    // pool).  An HTTP server can call this from many connection threads at
+    // once: shared state is guarded by the same fine-grained rwlocks the stdio
+    // path uses, read-only tools take shared locks (true concurrency), and
+    // mutating tools take exclusive locks (the rwlock drains concurrent
+    // readers — no inflight counter needed since no worker pool is running).
+    // ██████████████████████████████████████████████████████████████████████
+
+    /// Attach a warm project resolved from env / cwd-git-walk (params=null).
+    /// Idempotent; safe to call at HTTP startup and lazily on first initialize.
+    pub fn autoAttach(self: *Server) void {
+        self.tryAutoAttach(null) catch |err| {
+            std.log.debug("auto-attach skipped: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Execute one raw JSON-RPC message, writing the response into `out`.
+    /// Returns true when `out` holds a response, false for notifications
+    /// (which get no reply).  Transport-independent and thread-safe against a
+    /// shared `Server`.
+    pub fn executeMessageToBuffer(self: *Server, raw: []const u8, out: *std.ArrayList(u8)) !bool {
+        out.clearRetainingCapacity();
+        const w = out.writer(self.allocator);
+
+        var req = (try protocol.parseRequest(self.allocator, raw)) orelse {
+            try protocol.writeErrorNoData(w, null, .parse_error);
+            return true;
+        };
+        defer req.deinit();
+
+        if (std.mem.eql(u8, req.method, "initialize")) {
+            const requested: ?[]const u8 = blk: {
+                if (req.params) |p| {
+                    if (p.get("protocolVersion")) |pv| {
+                        if (pv == .string) break :blk pv.string;
+                    }
+                }
+                break :blk null;
+            };
+            const negotiated = protocol.negotiateProtocolVersion(requested);
+            try protocol.writeInitializeResultV(w, req.id, self.info.name, self.info.version, negotiated);
+            self.initialized = true;
+            // Lazily attach a warm project if none is bound yet.
+            self.meta_lock.lock();
+            const need_attach = self.project_path == null;
+            self.meta_lock.unlock();
+            if (need_attach) self.autoAttach();
+            return true;
+        }
+
+        if (protocol.isNotification(req)) return false;
+
+        if (std.mem.eql(u8, req.method, "tools/list")) {
+            var tbuf = std.ArrayList(u8){};
+            defer tbuf.deinit(self.allocator);
+            try tools.writeToolsListJson(tbuf.writer(self.allocator));
+            try protocol.writeToolsList(w, req.id, tbuf.items);
+            return true;
+        }
+        if (std.mem.eql(u8, req.method, "ping")) {
+            try protocol.writePingResult(w, req.id);
+            return true;
+        }
+        if (std.mem.eql(u8, req.method, "tools/call")) {
+            try self.executeToolCallToBuffer(&req, out);
+            return true;
+        }
+        try protocol.writeErrorNoData(w, req.id, .method_not_found);
+        return true;
+    }
+
+    fn executeToolCallToBuffer(self: *Server, req: *protocol.ParsedRequest, out: *std.ArrayList(u8)) !void {
+        const w = out.writer(self.allocator);
+        const params = req.params orelse {
+            try protocol.writeErrorNoData(w, req.id, .invalid_params);
+            return;
+        };
+        const tool_name_val = params.get("name") orelse {
+            try protocol.writeErrorNoData(w, req.id, .invalid_params);
+            return;
+        };
+        const tool_name = switch (tool_name_val) {
+            .string => |s| s,
+            else => {
+                try protocol.writeErrorNoData(w, req.id, .invalid_params);
+                return;
+            },
+        };
+        const args_val = params.get("arguments");
+        const args = if (args_val) |a| switch (a) {
+            .object => |o| o,
+            else => null,
+        } else null;
+
+        const mode = lockMode(tool_name);
+
+        var body_buf = std.ArrayList(u8){};
+        defer body_buf.deinit(self.allocator);
+        const body_writer = body_buf.writer(self.allocator);
+
+        if (isMutatingTool(tool_name)) {
+            // Exclusive locks in the documented order; the rwlock's exclusive
+            // side waits for concurrent readers to drain.
+            if (mode.attach) self.attach_mutex.lock();
+            defer if (mode.attach) self.attach_mutex.unlock();
+            if (mode.meta != .none) self.meta_lock.lock();
+            defer if (mode.meta != .none) self.meta_lock.unlock();
+            switch (mode.overlay) {
+                .none => {},
+                .shared => self.overlay_rwlock.lockShared(),
+                .exclusive => self.overlay_rwlock.lock(),
+            }
+            defer switch (mode.overlay) {
+                .none => {},
+                .shared => self.overlay_rwlock.unlockShared(),
+                .exclusive => self.overlay_rwlock.unlock(),
+            };
+            switch (mode.gdb) {
+                .none => {},
+                .shared => self.gdb_rwlock.lockShared(),
+                .exclusive => self.gdb_rwlock.lock(),
+            }
+            defer switch (mode.gdb) {
+                .none => {},
+                .shared => self.gdb_rwlock.unlockShared(),
+                .exclusive => self.gdb_rwlock.unlock(),
+            };
+
+            var ctx = tools.Context{
+                .allocator = self.allocator,
+                .engine = if (self.engine != null) &self.engine.? else null,
+                .gdb = if (self.gdb != null) &self.gdb.? else null,
+                .project_path = self.project_path,
+                .index_dir = self.index_dir,
+                .store_root = self.store_root,
+                .transport = null,
+                .request_id = req.id,
+                .parser_pool = &self.parser_pool,
+            };
+            var is_error = false;
+            tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
+                is_error = true;
+                body_buf.clearRetainingCapacity();
+                body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
+            };
+            try protocol.writeToolResultEnvelope(w, req.id, body_buf.items, is_error);
+
+            if (std.mem.eql(u8, tool_name, "index_repository")) {
+                self.loadProjectLocked(args) catch |err| {
+                    std.log.err("Failed to load project after indexing: {s}", .{@errorName(err)});
+                };
+            } else if (std.mem.eql(u8, tool_name, "update_index")) {
+                self.reattachOverlayLocked() catch |err| {
+                    std.log.err("Failed to reattach overlay after update_index: {s}", .{@errorName(err)});
+                };
+            }
+            return;
+        }
+
+        // Read-only: shared locks + a pooled connection for true concurrency.
+        acquireSharedLocks(self, mode);
+        defer releaseSharedLocks(self, mode);
+
+        var pooled: ?pool.PooledConnection = null;
+        defer if (pooled) |*pc| pc.release();
+        if (self.pool) |*p| {
+            pooled = p.acquire() catch null;
+        }
+        const gdb_ptr: ?*graph_db.GraphDb = if (pooled) |*pc|
+            &pc.db
+        else if (self.gdb != null) &self.gdb.? else null;
+
+        var ctx = tools.Context{
+            .allocator = self.allocator,
+            .engine = if (self.engine != null) &self.engine.? else null,
+            .gdb = gdb_ptr,
+            .project_path = self.project_path,
+            .index_dir = self.index_dir,
+            .store_root = self.store_root,
+            .transport = null,
+            .request_id = req.id,
+            .parser_pool = &self.parser_pool,
+        };
+        var is_error = false;
+        tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
+            is_error = true;
+            body_buf.clearRetainingCapacity();
+            body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
+        };
+        try protocol.writeToolResultEnvelope(w, req.id, body_buf.items, is_error);
+    }
 };
 
 // ██████████████████████████████████████████████████████████████████████████

@@ -14,17 +14,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// How the MCP client should connect to zindeks.
+///
+/// - `.stdio`: client auto-spawns the binary over stdin/stdout (default).
+///   Payload: absolute path to the zindeks binary.
+/// - `.http`: client connects to a running HTTP daemon.
+///   Payload: full URL, e.g. `http://127.0.0.1:7337/mcp`.
+pub const McpTransport = union(enum) {
+    stdio: []const u8, // absolute path to the zindeks binary
+    http: []const u8, // full URL, e.g. http://127.0.0.1:7337/mcp
+};
+
 /// Inject (or overwrite) the `zindeks` key inside `mcpServers` in a JSON
 /// config file.  Creates the file and any parent directories if absent.
 /// The write is atomic: a temp file is written first, then renamed over
 /// the target.
 ///
-/// `command_path` must be an absolute path to the zindeks binary, already
-/// normalized (forward slashes).
+/// `transport` controls the MCP entry shape:
+///   - `.stdio |cmd|`: `{"command":<cmd>,"args":["serve"]}`
+///   - `.http  |url|`: `{"type":"http","url":<url>}`
 pub fn injectMcpEntry(
     allocator: std.mem.Allocator,
     file_path: []const u8,
-    command_path: []const u8,
+    transport: McpTransport,
 ) !void {
     // Use an arena for all JSON parsing + mutation; freed at end.
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -75,11 +87,18 @@ pub fn injectMcpEntry(
 
     // ── Build the zindeks entry ───────────────────────────────────────
     var entry_obj = std.json.ObjectMap.init(aa);
-    try entry_obj.put("command", .{ .string = command_path });
-
-    var args_array = std.json.Array.init(aa);
-    try args_array.append(.{ .string = "serve" });
-    try entry_obj.put("args", .{ .array = args_array });
+    switch (transport) {
+        .stdio => |cmd| {
+            try entry_obj.put("command", .{ .string = cmd });
+            var args_array = std.json.Array.init(aa);
+            try args_array.append(.{ .string = "serve" });
+            try entry_obj.put("args", .{ .array = args_array });
+        },
+        .http => |url| {
+            try entry_obj.put("type", .{ .string = "http" });
+            try entry_obj.put("url", .{ .string = url });
+        },
+    }
 
     try mcp_servers.object.put("zindeks", .{ .object = entry_obj });
 

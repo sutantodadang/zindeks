@@ -34,7 +34,7 @@ test "inject preserves unrelated mcpServers entry" {
     try je.atomicWrite(allocator, cfg_path, initial);
 
     // Inject zindeks entry.
-    try je.injectMcpEntry(allocator, cfg_path, "/usr/local/bin/zindeks");
+    try je.injectMcpEntry(allocator, cfg_path, .{ .stdio = "/usr/local/bin/zindeks" });
 
     // Read back and verify.
     const content = blk: {
@@ -71,7 +71,7 @@ test "inject is idempotent — second run produces same result" {
     defer allocator.free(cfg_path);
 
     // First install.
-    try je.injectMcpEntry(allocator, cfg_path, "/usr/bin/zindeks");
+    try je.injectMcpEntry(allocator, cfg_path, .{ .stdio = "/usr/bin/zindeks" });
 
     const first_run = blk: {
         const f = try std.fs.openFileAbsolute(cfg_path, .{});
@@ -81,7 +81,7 @@ test "inject is idempotent — second run produces same result" {
     defer allocator.free(first_run);
 
     // Second install — must produce identical zindeks entry.
-    try je.injectMcpEntry(allocator, cfg_path, "/usr/bin/zindeks");
+    try je.injectMcpEntry(allocator, cfg_path, .{ .stdio = "/usr/bin/zindeks" });
 
     const second_run = blk: {
         const f = try std.fs.openFileAbsolute(cfg_path, .{});
@@ -408,6 +408,47 @@ test "claude hook config: empty settings gets exactly 1 PreToolUse entry with co
     const hooks2 = parsed2.value.object.get("hooks") orelse return error.MissingHooks;
     const ptu2 = hooks2.object.get("PreToolUse") orelse return error.MissingPreToolUse;
     try std.testing.expectEqual(@as(usize, 1), ptu2.array.items.len);
+}
+
+test "inject http transport writes type+url and omits command/args" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ dir_path, "mcp_http.json" });
+    defer allocator.free(cfg_path);
+
+    // Inject using HTTP transport.
+    try je.injectMcpEntry(allocator, cfg_path, .{ .http = "http://127.0.0.1:7337/mcp" });
+
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(cfg_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const mcp = parsed.value.object.get("mcpServers") orelse return error.MissingMcpServers;
+    const zindeks_entry = mcp.object.get("zindeks") orelse return error.MissingZindeksEntry;
+
+    // Must have type="http".
+    const type_val = zindeks_entry.object.get("type") orelse return error.MissingType;
+    try std.testing.expectEqualStrings("http", type_val.string);
+
+    // Must have correct url.
+    const url_val = zindeks_entry.object.get("url") orelse return error.MissingUrl;
+    try std.testing.expectEqualStrings("http://127.0.0.1:7337/mcp", url_val.string);
+
+    // Must NOT have command or args.
+    try std.testing.expect(zindeks_entry.object.get("command") == null);
+    try std.testing.expect(zindeks_entry.object.get("args") == null);
 }
 
 test "claude hook config: migrates old Node-based enforce-zindeks-search entry" {

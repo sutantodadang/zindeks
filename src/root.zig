@@ -57,6 +57,7 @@ pub const api = struct {
         pub const protocol = @import("api/mcp/protocol.zig");
         pub const tools = @import("api/mcp/tools.zig");
         pub const stream = @import("api/mcp/stream.zig");
+        pub const http = @import("api/mcp/http.zig");
     };
     pub const cli = struct {
         pub const cli = @import("api/cli/cli.zig");

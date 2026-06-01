@@ -18,4 +18,5 @@ test {
     _ = @import("overlay_test.zig");
     _ = @import("mcp_protocol_test.zig");
     _ = @import("install_test.zig");
+    _ = @import("http_test.zig");
 }

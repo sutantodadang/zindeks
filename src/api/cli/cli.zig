@@ -10,6 +10,7 @@ const pipeline_mod = @import("../../core/parser/pipeline.zig");
 const semantic = @import("../../core/search/semantic.zig");
 const mcp = @import("../mcp/server.zig");
 const protocol = @import("../mcp/protocol.zig");
+const http = @import("../mcp/http.zig");
 const update = @import("update.zig");
 const scanner = @import("../../core/scanner/scanner.zig");
 const terminal = @import("terminal.zig");
@@ -449,6 +450,7 @@ const ServeMode = union(enum) {
     stdio,
     tcp: u16,
     unix: []const u8,
+    http: u16,
 };
 
 fn runServe(state: *CliState, args: []const []const u8) !void {
@@ -469,6 +471,11 @@ fn runServe(state: *CliState, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             mode = .{ .unix = args[i] };
+        } else if (std.mem.eql(u8, a, "--http")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            const p = std.fmt.parseInt(u16, args[i], 10) catch return fmtError(state.colors_enabled, errors.invalidArgs("--http expects an integer port"), std.fs.File.stderr().deprecatedWriter());
+            mode = .{ .http = p };
         } else if (std.mem.eql(u8, a, "--no-color") or std.mem.eql(u8, a, "--config")) {
             // global flags consumed earlier; tolerate any trailing values
             if (std.mem.eql(u8, a, "--config")) i += 1;
@@ -485,7 +492,29 @@ fn runServe(state: *CliState, args: []const []const u8) !void {
         },
         .tcp => |port| try runServeDaemon(state, .{ .tcp = port }),
         .unix => |path| try runServeDaemon(state, .{ .unix = path }),
+        .http => |port| try runServeHttp(state, port),
     }
+}
+
+/// MCP-over-HTTP daemon: one warm shared `Server`, one thread per connection,
+/// real concurrent tool dispatch.  DB tuning (`graph_db.tuning`) is already
+/// applied by `runServe` before this is called.
+fn runServeHttp(state: *CliState, port: u16) !void {
+    var sw = terminal.StyledWriter(@TypeOf(std.fs.File.stderr().deprecatedWriter())).init(std.fs.File.stderr().deprecatedWriter());
+    sw.setColors(state.colors_enabled);
+
+    var server = mcp.Server.init(state.allocator, .{
+        .store_root = state.cfg.store_root,
+        .pool_conns = state.cfg.pool_conns,
+        .worker_threads = state.cfg.worker_threads,
+    });
+    defer server.deinit();
+    // Attach a warm project up front so the first request is hot.
+    server.autoAttach();
+
+    const addr = try std.net.Address.parseIp("0.0.0.0", port);
+    try sw.print("{s}zindeks serve{s} (HTTP/MCP) on http://0.0.0.0:{d}/mcp\n", .{ sw.bold(), sw.reset(), port });
+    try http.serve(state.allocator, &server, addr);
 }
 
 fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
@@ -498,6 +527,7 @@ fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
     // removes the unix arm from the AST entirely on Windows targets.
     const addr = switch (mode) {
         .stdio => unreachable,
+        .http => unreachable,
         .tcp => |port| try std.net.Address.parseIp("0.0.0.0", port),
         .unix => |path| blk: {
             if (comptime builtin.os.tag == .windows) {
@@ -519,6 +549,7 @@ fn runServeDaemon(state: *CliState, mode: ServeMode) !void {
 
     switch (mode) {
         .stdio => unreachable,
+        .http => unreachable,
         .tcp => |port| try sw.print("{s}zindeks serve{s} listening on TCP :{d}\n", .{ sw.bold(), sw.reset(), port }),
         .unix => |path| try sw.print("{s}zindeks serve{s} listening on unix:{s}\n", .{ sw.bold(), sw.reset(), path }),
     }

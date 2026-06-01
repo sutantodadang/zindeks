@@ -4,10 +4,12 @@
 //!
 //! Usage:
 //!   zindeks install [--host <id,...>] [--scope user|project|both]
-//!                   [--yes] [--dry-run] [--list-hosts]
+//!                   [--yes] [--dry-run] [--list-hosts] [--http <port>]
 //!
 //! Default (no --host): auto-detect installed hosts, prompt interactively.
 //! Non-interactive (no TTY, no --host): print instructions; do nothing.
+//! --http <port>: register HTTP transport (http://127.0.0.1:<port>/mcp)
+//!               instead of the default stdio command transport.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,6 +36,7 @@ pub fn run(
     var scope: adapters.Scope = .user;
     var selected_hosts_buf: [8]adapters.AdapterId = undefined;
     var selected_count: usize = 0;
+    var http_port: ?u16 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -70,6 +73,10 @@ pub fn run(
             } else {
                 return error.InvalidArguments;
             }
+        } else if (std.mem.eql(u8, a, "--http")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            http_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidArguments;
         }
         // skip unknown flags (globals already consumed)
     }
@@ -92,6 +99,14 @@ pub fn run(
         return error.IoError;
     };
     defer allocator.free(bin_path);
+
+    // ── Build MCP transport ───────────────────────────────────────────
+    var http_url_buf: ?[]u8 = null;
+    defer if (http_url_buf) |u| allocator.free(u);
+    const transport: json_edit.McpTransport = if (http_port) |port| blk: {
+        http_url_buf = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/mcp", .{port});
+        break :blk .{ .http = http_url_buf.? };
+    } else .{ .stdio = bin_path };
 
     // ── Get cwd ───────────────────────────────────────────────────────
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -147,7 +162,7 @@ pub fn run(
     var err_count: usize = 0;
 
     for (final_hosts_buf[0..final_count]) |id| {
-        installHost(allocator, sw, id, scope, cwd, bin_path, dry_run) catch |err| {
+        installHost(allocator, sw, id, scope, cwd, transport, dry_run) catch |err| {
             err_count += 1;
             sw.print("  {s}error{s}: {s} install failed: {s}\n", .{
                 sw.red(), sw.reset(), id.toStr(), @errorName(err),
@@ -166,6 +181,10 @@ pub fn run(
         });
     }
 
+    if (http_port) |port| {
+        try sw.print("  NOTE: HTTP transport — start the daemon: zindeks serve --http {d}\n", .{port});
+    }
+
     if (dry_run) {
         try sw.print("\n{s}[dry-run]{s} No files were written.\n", .{ sw.yellow(), sw.reset() });
     }
@@ -177,7 +196,7 @@ fn installHost(
     id: adapters.AdapterId,
     scope: adapters.Scope,
     cwd: []const u8,
-    bin_path: []const u8,
+    transport: json_edit.McpTransport,
     dry_run: bool,
 ) !void {
     try sw.print("\n{s}{s}{s} ({s}):\n", .{ sw.bold(), id.displayName(), sw.reset(), id.toStr() });
@@ -193,7 +212,7 @@ fn installHost(
         if (paths.config) |cfg_path| {
             try sw.print("  user config: {s}\n", .{cfg_path});
             if (!dry_run) {
-                json_edit.injectMcpEntry(allocator, cfg_path, bin_path) catch |err| {
+                json_edit.injectMcpEntry(allocator, cfg_path, transport) catch |err| {
                     if (err == error.JsoncNotSupported) {
                         try sw.print("  {s}skip{s}: JSONC detected. Merge manually or use --dry-run.\n", .{ sw.yellow(), sw.reset() });
                     } else {
@@ -206,7 +225,7 @@ fn installHost(
                             try sw.print("  {s}skip{s}: hook JSONC config detected. Merge manually.\n", .{ sw.yellow(), sw.reset() });
                         } else return err;
                     };
-                    try sw.print("  enforcement hook: Grep/Glob -> zindeks (deny), shell grep -> ask\n", .{});
+                    try sw.print("  enforcement hook: Grep/Glob -> zindeks (deny), shell grep -> advisory (non-blocking)\n", .{});
                 }
             }
         }
@@ -219,7 +238,7 @@ fn installHost(
         if (paths.config) |cfg_path| {
             try sw.print("  project config: {s}\n", .{cfg_path});
             if (!dry_run) {
-                json_edit.injectMcpEntry(allocator, cfg_path, bin_path) catch |err| {
+                json_edit.injectMcpEntry(allocator, cfg_path, transport) catch |err| {
                     if (err == error.JsoncNotSupported) {
                         try sw.print("  {s}skip{s}: JSONC detected. Merge manually.\n", .{ sw.yellow(), sw.reset() });
                     } else {
@@ -345,7 +364,7 @@ pub fn usage(sw: anytype) !void {
         \\
         \\{s}Usage:{s}
         \\  zindeks install [--host <id,...>] [--scope user|project|both]
-        \\                  [--yes] [--dry-run]
+        \\                  [--yes] [--dry-run] [--http <port>]
         \\  zindeks install --list-hosts
         \\
         \\{s}Options:{s}
@@ -354,11 +373,13 @@ pub fn usage(sw: anytype) !void {
         \\  --yes             Skip interactive prompts (CI-safe)
         \\  --dry-run         Print changes without writing
         \\  --list-hosts      Show supported hosts and detection status
+        \\  --http <port>     Register HTTP transport (http://127.0.0.1:<port>/mcp) instead of stdio
         \\
         \\{s}Examples:{s}
         \\  zindeks install                                    # interactive
         \\  zindeks install --host claude-code --scope both --yes
         \\  zindeks install --host claude-code,cursor --yes
+        \\  zindeks install --host claude-code --http 7337 --yes   # HTTP daemon transport
         \\
     , .{
         sw.bold(), sw.reset(),

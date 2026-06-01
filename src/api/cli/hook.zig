@@ -27,9 +27,14 @@ const glob_deny_msg =
     "See a file's symbols with file_outline; read a file with read_file(path, offset, limit). " ++
     "Escape hatch for non-indexed or uncommitted files: Bash `rtk find`.";
 
-const ask_msg =
-    "Use zindeks before broad shell search: `zindeks search \"<query>\"` or the zindeks MCP " ++
-    "search/graph tools. Retry the shell search if zindeks is insufficient.";
+// Advisory nudge for broad Bash search. Emitted as a NON-blocking `allow`
+// (with additionalContext), not `ask` — `ask` would override Claude Code's
+// auto-accept mode and force a confirmation prompt on every broad shell
+// search. The Grep/Glob *tools* stay hard-denied; raw shell search is only
+// nudged, never blocked.
+const advise_msg =
+    "Tip: zindeks is faster for code search — `zindeks search \"<query>\"` or the zindeks MCP " ++
+    "search/graph tools. This shell search was allowed; prefer zindeks when the project is indexed.";
 
 // ── Token helpers ─────────────────────────────────────────────────────
 
@@ -106,7 +111,9 @@ pub fn decide(tool_name: []const u8, command: []const u8) Decision {
     if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Shell")) {
         if (command.len == 0) return .{ .action = .allow };
         if (invokesZindeks(command) or invokesRtkSearch(command)) return .{ .action = .allow };
-        if (usesBroadShellSearch(command)) return .{ .action = .ask, .reason = ask_msg };
+        // Broad shell search is ALLOWED with an advisory nudge — never `ask`,
+        // so auto-accept mode is not interrupted by a confirmation prompt.
+        if (usesBroadShellSearch(command)) return .{ .action = .allow, .reason = advise_msg };
         return .{ .action = .allow };
     }
 
@@ -178,11 +185,38 @@ fn emitAllow(host: []const u8) !void {
     }
 }
 
+/// Emit an `allow` decision that also carries a non-blocking advisory message.
+/// On Claude Code the nudge goes in `additionalContext` (shown to the model,
+/// no prompt); on Cursor it rides along as `agent_message` with `allow`.
+fn emitAllowAdvisory(host: []const u8, reason: []const u8) !void {
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    if (std.mem.eql(u8, host, "cursor")) {
+        try stdout.print(
+            "{{\"permission\":\"allow\",\"agent_message\":{f}}}",
+            .{std.json.fmt(reason, .{})},
+        );
+    } else {
+        try stdout.print(
+            "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\"," ++
+                "\"permissionDecision\":\"allow\"," ++
+                "\"additionalContext\":{f}}}}}",
+            .{std.json.fmt(reason, .{})},
+        );
+    }
+}
+
 fn emitDecision(host: []const u8, d: Decision) !void {
     const stdout = std.fs.File.stdout().deprecatedWriter();
 
     if (d.action == .allow) {
-        try emitAllow(host);
+        // Plain allow when there's nothing to say; advisory allow (carries a
+        // non-blocking nudge) when a reason is attached.  Either way the tool
+        // runs without a confirmation prompt.
+        if (d.reason.len == 0) {
+            try emitAllow(host);
+        } else {
+            try emitAllowAdvisory(host, d.reason);
+        }
         return;
     }
 
@@ -229,9 +263,10 @@ test "decide Glob -> deny" {
     try std.testing.expectEqual(.deny, d.action);
 }
 
-test "decide Bash grep -r -> ask" {
+test "decide Bash grep -r -> allow with advisory" {
     const d = decide("Bash", "grep -r foo .");
-    try std.testing.expectEqual(.ask, d.action);
+    try std.testing.expectEqual(.allow, d.action);
+    try std.testing.expect(d.reason.len > 0); // advisory nudge attached, non-blocking
 }
 
 test "decide Bash rtk grep -> allow" {
@@ -254,19 +289,30 @@ test "decide Read -> allow" {
     try std.testing.expectEqual(.allow, d.action);
 }
 
-test "decide Bash rg pattern -> ask" {
+test "decide Bash rg pattern -> allow with advisory" {
     const d = decide("Bash", "rg 'some pattern' src/");
-    try std.testing.expectEqual(.ask, d.action);
+    try std.testing.expectEqual(.allow, d.action);
+    try std.testing.expect(d.reason.len > 0);
 }
 
-test "decide Bash get-childitem -> ask" {
+test "decide Bash get-childitem -> allow with advisory" {
     const d = decide("Bash", "Get-ChildItem -Recurse");
-    try std.testing.expectEqual(.ask, d.action);
+    try std.testing.expectEqual(.allow, d.action);
+    try std.testing.expect(d.reason.len > 0);
 }
 
-test "decide Bash git grep -> ask" {
+test "decide Bash git grep -> allow with advisory" {
     const d = decide("Bash", "git grep -n pattern");
-    try std.testing.expectEqual(.ask, d.action);
+    try std.testing.expectEqual(.allow, d.action);
+    try std.testing.expect(d.reason.len > 0);
+}
+
+test "decide never returns ask (auto-accept must not be interrupted)" {
+    // Broad search is advisory-allow, tools are deny — nothing returns ask.
+    try std.testing.expect(decide("Bash", "grep -r x .").action != .ask);
+    try std.testing.expect(decide("Bash", "rg x").action != .ask);
+    try std.testing.expect(decide("Grep", "").action != .ask);
+    try std.testing.expect(decide("Glob", "").action != .ask);
 }
 
 test "decide Bash empty -> allow" {
