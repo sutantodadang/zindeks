@@ -2612,6 +2612,26 @@ fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 // Tool: get_context
 // ██████████████████████████████████████████████████████████████████████████
 
+/// Resolve the most representative symbol name in a file (largest line span),
+/// for 1-hop call-graph neighbor lookup. Caller frees the returned name.
+fn resolveTopSymbol(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb, path: []const u8) !?[]const u8 {
+    var stmt = try gdb.prepare(
+        \\SELECT s.name FROM symbols s
+        \\JOIN documents d ON d.id = s.document_id
+        \\WHERE d.path = ?
+        \\ORDER BY (s.line_end - s.line_start) DESC
+        \\LIMIT 1
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, path);
+    if (try stmt.step()) {
+        const name = try stmt.columnText(0);
+        if (name.len == 0) return null;
+        return try allocator.dupe(u8, name);
+    }
+    return null;
+}
+
 fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
         try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
@@ -2626,6 +2646,7 @@ fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
         try writer.writeAll("{\"error\":\"Missing params.query\"}");
         return;
     };
+
     const query = getString(params, "query") orelse "";
     if (query.len == 0) {
         try writer.writeAll("{\"error\":\"Empty query\"}");
@@ -2639,68 +2660,139 @@ fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
         };
         break :blk 4000;
     };
+    const boolParam = struct {
+        fn get(p: std.json.ObjectMap, key: []const u8, default: bool) bool {
+            if (p.get(key)) |v| switch (v) {
+                .bool => |b| return b,
+                else => {},
+            };
+            return default;
+        }
+    }.get;
+    const include_snippets = boolParam(params, "include_snippets", true);
+    const include_call_graph = boolParam(params, "include_call_graph", true);
+    const include_reasoning = boolParam(params, "include_reasoning", true);
+    const include_arch = boolParam(params, "include_architecture", false);
 
-    const include_call_graph = blk: {
-        if (params.get("include_call_graph")) |v| switch (v) {
-            .bool => |b| break :blk b,
-            else => {},
-        };
-        break :blk true;
-    };
-
-    const include_arch = blk: {
-        if (params.get("include_architecture")) |v| switch (v) {
-            .bool => |b| break :blk b,
-            else => {},
-        };
-        break :blk false;
+    // Parse optional working_set (string array).
+    var working_set = std.ArrayList([]const u8){};
+    defer working_set.deinit(ctx.allocator);
+    if (params.get("working_set")) |wv| switch (wv) {
+        .array => |arr| {
+            for (arr.items) |item| switch (item) {
+                .string => |s| try working_set.append(ctx.allocator, s),
+                else => {},
+            };
+        },
+        else => {},
     };
 
     var builder = ai_context.ContextBuilder.init(ctx.allocator);
     defer builder.deinit();
 
-    // Run BM25 search
+    // 1) PRIOR REASONING (priority 10) — highest signal-per-token.
+    if (include_reasoning) reasoning_blk: {
+        const matches = ai_reasoning.recall(ctx.allocator, gdb, query, 3, 0.3, 0) catch break :reasoning_blk;
+        defer ai_reasoning.freeMatches(ctx.allocator, matches);
+        if (matches.len > 0) {
+            var rbuf = std.ArrayList(u8){};
+            defer rbuf.deinit(ctx.allocator);
+            rbuf.appendSlice(ctx.allocator, "Recalled prior reasoning (verify before trusting):\n\n") catch break :reasoning_blk;
+            for (matches) |m| {
+                rbuf.writer(ctx.allocator).print(
+                    "- **{s}** (confidence {d:.2}, similarity {d:.2})\n  {s}\n",
+                    .{ m.problem, m.confidence, m.score, m.reasoning },
+                ) catch {};
+            }
+            builder.addSection("Prior Reasoning", rbuf.items, 10) catch {};
+        }
+    }
+
+    // 2) RELEVANT CODE (priority 9) — search + attention rerank + snippets.
     var results = engine.search(ctx.allocator, query, 10) catch {
         try writer.writeAll("{\"error\":\"Search failed.\"}");
         return;
     };
     defer results.deinit(ctx.allocator);
 
-    try builder.addSearchResults(query, results.items);
+    if (working_set.items.len > 0) attn_blk: {
+        const scored = ai_attention.score(ctx.allocator, engine, working_set.items, query, 50) catch break :attn_blk;
+        defer ai_attention.freeScored(ctx.allocator, scored);
+        // Boost each result by its file's attention score, then re-sort.
+        for (results.items) |*r| {
+            for (scored) |s| {
+                if (std.mem.eql(u8, s.path, r.path)) {
+                    r.score = r.score * (1.0 + s.score);
+                    break;
+                }
+            }
+        }
+        std.mem.sort(search_engine.Result, results.items, {}, struct {
+            fn desc(_: void, a: search_engine.Result, b: search_engine.Result) bool {
+                return a.score > b.score;
+            }
+        }.desc);
+    }
 
-    // Optionally add architecture overview
+    if (include_snippets) {
+        try builder.addSearchResults(query, results.items);
+    } else {
+        // Path-only list (no code bodies).
+        var pbuf = std.ArrayList(u8){};
+        defer pbuf.deinit(ctx.allocator);
+        for (results.items) |r| {
+            try pbuf.writer(ctx.allocator).print("- {s} (score {d:.2})\n", .{ r.path, r.score });
+        }
+        try builder.addSection("Relevant Files", pbuf.items, 9);
+    }
+
+    // 3) STRUCTURE (priority 7) — 1-hop neighbors of top symbols.
+    if (include_call_graph) {
+        const top_t = @min(results.items.len, 3);
+        var i: usize = 0;
+        while (i < top_t) : (i += 1) {
+            const sym = resolveTopSymbol(ctx.allocator, gdb, results.items[i].path) catch null;
+            if (sym) |name| {
+                defer ctx.allocator.free(name);
+                var trace = call_graph.trace(ctx.allocator, gdb, name, .both, 1) catch continue;
+                defer trace.deinit(ctx.allocator);
+                if (trace.nodes.len > 1) {
+                    builder.addCallGraphContext(name, trace) catch {};
+                }
+            }
+        }
+    }
+
+    // 4) ATTENTION MAP (priority 6) — ranked file overview.
+    if (working_set.items.len > 0) attn_map_blk: {
+        const scored = ai_attention.score(ctx.allocator, engine, working_set.items, query, 15) catch break :attn_map_blk;
+        defer ai_attention.freeScored(ctx.allocator, scored);
+        if (scored.len > 0) {
+            var abuf = std.ArrayList(u8){};
+            defer abuf.deinit(ctx.allocator);
+            for (scored) |s| {
+                abuf.writer(ctx.allocator).print("- {s}  {d:.2}\n", .{ s.path, s.score }) catch {};
+            }
+            builder.addSection("Attention Map", abuf.items, 6) catch {};
+        }
+    }
+
+    // 5) ARCHITECTURE (priority 5) — optional.
     if (include_arch) {
         if (arch_mod.getArchitecture(ctx.allocator, gdb)) |arch| {
             var mutable_arch = arch;
             defer mutable_arch.deinit(ctx.allocator);
             try builder.addArchitectureOverview(mutable_arch);
-        } else |_| {
-            // Silently skip if architecture query fails
-        }
-    }
-
-    // Optionally add call graph context for top result symbols
-    if (include_call_graph) {
-        for (results.items[0..@min(results.items.len, 3)]) |result| {
-            // Extract symbol names from snippet or path
-            _ = result;
-            // Skips per-symbol trace to keep response fast.
-            // Individual call graph queries should use trace_call_path.
-        }
+        } else |_| {}
     }
 
     const assembled = try builder.build(max_tokens);
     defer ctx.allocator.free(assembled);
-
     const token_est = ai_window.estimateTokens(assembled);
 
     try writer.print(
         \\{{"context":{f},"token_estimate":{},"max_tokens":{}}}
-    , .{
-        std.json.fmt(assembled, .{}),
-        token_est,
-        max_tokens,
-    });
+    , .{ std.json.fmt(assembled, .{}), token_est, max_tokens });
 }
 
 // ██████████████████████████████████████████████████████████████████████████

@@ -91,8 +91,8 @@ pub fn recall(
     return owned;
 }
 
-pub fn freeMatches(allocator: std.mem.Allocator, matches: []Match) void {
-    for (matches) |*m| {
+pub fn freeMatches(allocator: std.mem.Allocator, matches: []const Match) void {
+    for (matches) |m| {
         allocator.free(m.problem);
         allocator.free(m.reasoning);
         allocator.free(m.files);
