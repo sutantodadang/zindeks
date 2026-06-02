@@ -15,6 +15,7 @@ comptime {
     _ = zindeks.ai.summarize;
     _ = zindeks.ai.query;
     _ = zindeks.ai.context;
+    _ = zindeks.ai.reasoning;
 }
 
 // ── Integration tests ──────────────────────────────────────────────

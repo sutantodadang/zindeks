@@ -27,6 +27,7 @@ const cypher_executor = @import("../../core/graph/cypher/executor.zig");
 const semantic_mod = @import("../../core/search/semantic.zig");
 const ai_context = @import("../../core/ai/context.zig");
 const ai_attention = @import("../../core/ai/attention.zig");
+const ai_reasoning = @import("../../core/ai/reasoning.zig");
 const ai_summarize = @import("../../core/ai/summarize.zig");
 const ai_query = @import("../../core/ai/query.zig");
 const ai_window = @import("../../core/ai/window.zig");
@@ -2055,16 +2056,6 @@ fn handleSaveReasoning(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 // Tool: recall_reasoning  (thinking cache — read)
 // ██████████████████████████████████████████████████████████████████████████
 
-const ReasoningMatch = struct {
-    id: i64,
-    problem: []u8,
-    reasoning: []u8,
-    files: []u8,
-    confidence: f64,
-    score: f32,
-    created_at: []u8,
-};
-
 fn handleRecallReasoning(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
         try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
@@ -2111,80 +2102,11 @@ fn handleRecallReasoning(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
         }
     }
 
-    // Embed query problem for semantic similarity.
-    const q_emb = embeddings_mod.embedText(problem);
+    const matches = try ai_reasoning.recall(ctx.allocator, gdb, problem, limit, min_confidence, max_age_days);
+    defer ai_reasoning.freeMatches(ctx.allocator, matches);
 
-    // Build SQL — always filter by confidence; optionally by age.
-    var sql_buf: [512]u8 = undefined;
-    const sql: [:0]const u8 = if (max_age_days > 0) blk: {
-        const s = try std.fmt.bufPrintZ(
-            &sql_buf,
-            "SELECT id, problem, reasoning, files, confidence, vector, dimensions, created_at FROM reasoning WHERE confidence >= ? AND created_at >= datetime('now', '-{d} days')",
-            .{max_age_days},
-        );
-        break :blk s;
-    } else
-        "SELECT id, problem, reasoning, files, confidence, vector, dimensions, created_at FROM reasoning WHERE confidence >= ?";
-
-    var stmt = try gdb.prepare(sql);
-    defer stmt.finalize();
-    try stmt.bindFloat(1, min_confidence);
-
-    // Collect all matches, compute similarity, keep top-limit.
-    var matches = std.ArrayList(ReasoningMatch){};
-    defer {
-        for (matches.items) |*m| {
-            ctx.allocator.free(m.problem);
-            ctx.allocator.free(m.reasoning);
-            ctx.allocator.free(m.files);
-            ctx.allocator.free(m.created_at);
-        }
-        matches.deinit(ctx.allocator);
-    }
-
-    while (try stmt.step()) {
-        const row_id = try stmt.columnInt(0);
-        const row_problem = try stmt.columnText(1);
-        const row_reasoning = try stmt.columnText(2);
-        const row_files = try stmt.columnText(3);
-        const row_confidence = stmt.columnFloat(4) catch 0.5;
-        const row_dimensions = stmt.columnInt(6) catch 0;
-        const row_created = try stmt.columnText(7);
-
-        // Skip rows without a valid embedding.
-        if (row_dimensions == 0) continue;
-        const vec_bytes = stmt.columnBlob(5) catch continue;
-        if (vec_bytes.len == 0) continue;
-
-        const d_emb = embeddings_mod.Embedding.fromBytes(vec_bytes) catch continue;
-        const sim = embeddings_mod.cosineSimilarity(
-            q_emb.vector[0..q_emb.dim],
-            d_emb.vector[0..d_emb.dim],
-        );
-
-        const m = ReasoningMatch{
-            .id = row_id,
-            .problem = try ctx.allocator.dupe(u8, row_problem),
-            .reasoning = try ctx.allocator.dupe(u8, row_reasoning),
-            .files = try ctx.allocator.dupe(u8, row_files),
-            .confidence = row_confidence,
-            .score = sim,
-            .created_at = try ctx.allocator.dupe(u8, row_created),
-        };
-        try matches.append(ctx.allocator, m);
-    }
-
-    // Sort descending by similarity score.
-    std.mem.sort(ReasoningMatch, matches.items, {}, struct {
-        fn lessThan(_: void, a: ReasoningMatch, b: ReasoningMatch) bool {
-            return a.score > b.score;
-        }
-    }.lessThan);
-
-    // Emit top-limit results as JSON array.
-    const top = @min(limit, matches.items.len);
     try writer.writeByte('[');
-    for (matches.items[0..top], 0..) |m, i| {
+    for (matches, 0..) |m, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.print(
             \\{{"id":{},"problem":{f},"reasoning":{f},"files":{f},"confidence":{d:.2},"score":{d:.2},"created_at":{f}}}

@@ -79,6 +79,7 @@ pub const api = struct {
 
 pub const ai = struct {
     pub const context = @import("core/ai/context.zig");
+    pub const reasoning = @import("core/ai/reasoning.zig");
     pub const summarize = @import("core/ai/summarize.zig");
     pub const query = @import("core/ai/query.zig");
     pub const window = @import("core/ai/window.zig");
