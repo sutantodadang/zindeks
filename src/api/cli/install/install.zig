@@ -283,6 +283,20 @@ fn installHost(
             }
         }
     }
+
+    // Enforcement guardrails (AGENTS.md + per-host search hooks) are project-local
+    // files written to the current repo. Install them regardless of MCP scope so
+    // `--scope user` still enforces zindeks-first search here. Claude's guardrails
+    // are scope-gated above (its hook lives in settings.json); the project pass
+    // already ran them for `project`/`both`, so only fill the gap for user scope.
+    if (id != .claude_code and !do_project and !dry_run) {
+        guardrails.installForHost(allocator, cwd, id, null) catch |err| {
+            if (err == error.JsoncNotSupported) {
+                try sw.print("  {s}skip{s}: guardrail JSONC config detected. Merge manually.\n", .{ sw.yellow(), sw.reset() });
+            } else return err;
+        };
+        try sw.print("  enforcement guardrails: {s}\n", .{cwd});
+    }
 }
 
 /// Inject (or replace) the managed block in CLAUDE.md.

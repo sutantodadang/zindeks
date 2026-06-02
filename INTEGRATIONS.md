@@ -44,7 +44,12 @@ Re-running `install` replaces the block in-place (idempotent). Running `uninstal
 
 ## Project search guardrails
 
-Project-scope installs also add zindeks-first search guidance without replacing unrelated user content:
+Search-enforcement guardrails are **project-local files written to the current repo**,
+and `install` writes them for the selected hosts **regardless of `--scope`** (the scope
+flag only controls where the `mcpServers` entry is registered). So `install --yes` from
+a repo enforces zindeks-first search there even at the default user scope.
+
+Installs add zindeks-first search guidance without replacing unrelated user content:
 
 - `AGENTS.md`: appends or replaces a managed zindeks-first block for generic agents.
 - Cursor: writes `.cursor/rules/zindeks-first.mdc`, `.cursor/hooks.json`, and `.cursor/hooks/enforce-zindeks-search.js`.
@@ -71,6 +76,10 @@ zindeks install --host claude-code --scope both --dry-run
 
 # List detected hosts
 zindeks install --list-hosts
+
+# Always-on background server (OS supervisor running `serve --http`); implies HTTP
+zindeks install --http 7337 --service --yes
+zindeks install --uninstall-service
 
 # Verify installation
 zindeks doctor
