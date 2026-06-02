@@ -222,15 +222,13 @@ pub const ContextBuilder = struct {
         const budget = window_mod.TokenBudget.init(max_tokens, 0);
 
         var sorted = try window_mod.prioritizeSections(self.allocator, self.sections.items, budget);
-        defer {
-            for (sorted.items) |sec| {
-                self.allocator.free(sec.title);
-                self.allocator.free(sec.content);
-            }
-            sorted.deinit(self.allocator);
-        }
-        // Clear sections without freeing - ownership transferred to sorted
-        self.sections.clearRetainingCapacity();
+        // `sorted.items` alias the title/content owned by `self.sections` — and
+        // for an over-budget section, `.content` is a *truncated subslice* of the
+        // original allocation. Free only the list array here, never the items:
+        // freeing a truncated subslice mismatches its allocation size (heap
+        // corruption), and dropped sections aren't in `sorted` at all (would
+        // leak). The originals stay owned by `self.sections`, freed by `deinit()`.
+        defer sorted.deinit(self.allocator);
 
         var buf = std.ArrayList(u8){};
         errdefer buf.deinit(self.allocator);
