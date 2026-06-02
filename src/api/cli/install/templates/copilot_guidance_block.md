@@ -3,6 +3,9 @@
 
 For this repository, use zindeks before broad shell search.
 
+- **START HERE — `get_context(query, working_set?)`**: one zindeks MCP call returns
+  ranked snippets + call-graph neighbors + recalled prior reasoning, token-budgeted.
+  Begin any task with it; use the narrower tools below for surgical follow-ups.
 - Start with `zindeks search "<query>"` or the zindeks MCP `search(query)` tool
   (mode defaults to "hybrid" — BM25 + semantic RRF; use mode="keyword" for
   pure BM25 or mode="semantic" for embedding-only).

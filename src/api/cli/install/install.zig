@@ -18,6 +18,7 @@ const adapters = @import("adapters.zig");
 const guardrails = @import("guardrails.zig");
 const json_edit = @import("json_edit.zig");
 const tmpl = @import("templates.zig");
+const service = @import("service.zig");
 
 /// Run the install command.  `args` are the subcommand-level args
 /// (after "install" has been stripped).
@@ -37,6 +38,8 @@ pub fn run(
     var selected_hosts_buf: [8]adapters.AdapterId = undefined;
     var selected_count: usize = 0;
     var http_port: ?u16 = null;
+    var want_service = false;
+    var want_uninstall_service = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -77,9 +80,22 @@ pub fn run(
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             http_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidArguments;
+        } else if (std.mem.eql(u8, a, "--service")) {
+            want_service = true;
+        } else if (std.mem.eql(u8, a, "--uninstall-service")) {
+            want_uninstall_service = true;
         }
         // skip unknown flags (globals already consumed)
     }
+
+    // ── --uninstall-service (standalone) ──────────────────────────────
+    if (want_uninstall_service) {
+        try service.uninstall(allocator, sw, dry_run);
+        return;
+    }
+
+    // --service implies the HTTP transport so hosts connect to the daemon.
+    if (want_service and http_port == null) http_port = service.DEFAULT_PORT;
 
     // ── --list-hosts ──────────────────────────────────────────────────
     if (list_hosts) {
@@ -181,7 +197,11 @@ pub fn run(
         });
     }
 
-    if (http_port) |port| {
+    if (want_service) {
+        service.install(allocator, sw, bin_path, http_port.?, dry_run) catch |err| {
+            try sw.print("  {s}warn{s}: service install failed: {s}\n", .{ sw.yellow(), sw.reset(), @errorName(err) });
+        };
+    } else if (http_port) |port| {
         try sw.print("  NOTE: HTTP transport — start the daemon: zindeks serve --http {d}\n", .{port});
     }
 
@@ -364,8 +384,9 @@ pub fn usage(sw: anytype) !void {
         \\
         \\{s}Usage:{s}
         \\  zindeks install [--host <id,...>] [--scope user|project|both]
-        \\                  [--yes] [--dry-run] [--http <port>]
+        \\                  [--yes] [--dry-run] [--http <port>] [--service]
         \\  zindeks install --list-hosts
+        \\  zindeks install --uninstall-service
         \\
         \\{s}Options:{s}
         \\  --host <id,...>   Comma-separated host IDs (see --list-hosts)
@@ -374,12 +395,17 @@ pub fn usage(sw: anytype) !void {
         \\  --dry-run         Print changes without writing
         \\  --list-hosts      Show supported hosts and detection status
         \\  --http <port>     Register HTTP transport (http://127.0.0.1:<port>/mcp) instead of stdio
+        \\  --service         Install an always-on OS supervisor running `serve --http`
+        \\                    (launchd / systemd-user / Windows Scheduled Task; port 7717
+        \\                    default; implies --http). Auto-starts at login, restarts on crash.
+        \\  --uninstall-service  Stop and remove the supervisor installed by --service
         \\
         \\{s}Examples:{s}
         \\  zindeks install                                    # interactive
         \\  zindeks install --host claude-code --scope both --yes
         \\  zindeks install --host claude-code,cursor --yes
         \\  zindeks install --host claude-code --http 7337 --yes   # HTTP daemon transport
+        \\  zindeks install --host claude-code --service --yes     # always-on (port 7717)
         \\
     , .{
         sw.bold(), sw.reset(),

@@ -3,6 +3,9 @@
 
 Use zindeks first for code search and code-structure questions in this repo.
 
+- **START HERE — `get_context(query, working_set?)`**: one call returns ranked
+  snippets + call-graph neighbors + recalled prior reasoning, token-budgeted.
+  Prefer it to begin any task; use the narrower tools below for surgical follow-ups.
 - Search (hybrid BM25+semantic, default): `zindeks search "<query>"` or MCP `search(query)`.
   - Keyword only: `search(query, mode="keyword")`. Semantic only: `search(query, mode="semantic")`.
 - Symbols: MCP `search_graph(name_pattern)`.
