@@ -489,27 +489,18 @@ pub const health_check = Descriptor{
 
 pub const get_context = Descriptor{
     .name = "get_context",
-    .description = "Assemble rich AI-prompt context from search results, call graphs, and architecture overviews. Enforces a token budget — low-priority sections are dropped when the budget is exceeded.",
+    .description = "Assemble fused AI context in ONE call: attention-ranked code snippets + call-graph neighbors + recalled prior reasoning, token-budgeted. Prefer this over chaining search + read_file + trace_call_path.",
     .inputSchema =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "query": {
-    \\      "type": "string",
-    \\      "description": "The search query or natural-language question"
-    \\    },
-    \\    "max_tokens": {
-    \\      "type": "integer",
-    \\      "description": "Maximum token budget for the assembled context (default: 4000)"
-    \\    },
-    \\    "include_call_graph": {
-    \\      "type": "boolean",
-    \\      "description": "Whether to include call graph context for matched symbols (default: true)"
-    \\    },
-    \\    "include_architecture": {
-    \\      "type": "boolean",
-    \\      "description": "Whether to include an architecture overview (default: false)"
-    \\    }
+    \\    "query": { "type": "string", "description": "The search query or natural-language question" },
+    \\    "working_set": { "type": "array", "items": { "type": "string" }, "description": "Files/symbols the task is focused on; biases ranking toward what you're editing" },
+    \\    "max_tokens": { "type": "integer", "description": "Token budget for the assembled context (default 4000)" },
+    \\    "include_snippets": { "type": "boolean", "description": "Inline code snippets for top hits (default true) — saves a read_file per hit" },
+    \\    "include_call_graph": { "type": "boolean", "description": "1-hop callers/callees of top symbols (default true) — saves a trace_call_path" },
+    \\    "include_reasoning": { "type": "boolean", "description": "Recall prior saved reasoning relevant to the query (default true)" },
+    \\    "include_architecture": { "type": "boolean", "description": "Architecture overview (default false)" }
     \\  },
     \\  "required": ["query"]
     \\}
