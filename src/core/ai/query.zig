@@ -16,6 +16,21 @@ pub const QueryIntent = enum {
     search, // generic search
 };
 
+/// How community structure should bias ranking for a given intent.
+///   - cohesion: prefer hits in the same community as the top results (narrow)
+///   - diversity: spread across communities, decay repeats (broad)
+///   - neutral: no community influence
+pub const SearchBias = enum { cohesion, diversity, neutral };
+
+/// Map a detected query intent to a community search bias.
+pub fn searchBias(intent: QueryIntent) SearchBias {
+    return switch (intent) {
+        .find_definition, .find_usage, .debug => .cohesion,
+        .explore, .explain, .refactor => .diversity,
+        .search => .neutral,
+    };
+}
+
 pub const StructuredQuery = struct {
     intent: QueryIntent,
     target_symbols: []const []const u8, // extracted symbol names

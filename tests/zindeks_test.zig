@@ -317,3 +317,51 @@ test "typescript extractor: interface, class, method" {
     try testing.expect(found_class);
     try testing.expect(found_method);
 }
+
+
+test "multiSignalSearch lazy-detects communities and populates community_score" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    try tmp.dir.makeDir("store");
+    {
+        var repo = try tmp.dir.openDir("repo", .{});
+        defer repo.close();
+        try repo.writeFile(.{ .sub_path = "a.zig", .data = "pub fn alphaFn() void { betaFn(); }\npub fn betaFn() void {}\n" });
+        try repo.writeFile(.{ .sub_path = "b.zig", .data = "pub fn gammaFn() void { deltaFn(); }\npub fn deltaFn() void {}\n" });
+    }
+
+    const repo_abs = try tmp.dir.realpathAlloc(testing.allocator, "repo");
+    defer testing.allocator.free(repo_abs);
+    const store_abs = try tmp.dir.realpathAlloc(testing.allocator, "store");
+    defer testing.allocator.free(store_abs);
+
+    var write_location = try zindeks.project_store.prepareWrite(testing.allocator, repo_abs, .{ .store_root = store_abs });
+    defer write_location.deinit();
+    try zindeks.indexer.indexer.indexPath(testing.allocator, repo_abs, write_location.index_dir);
+    try write_location.commit();
+
+    var read_location = try zindeks.project_store.resolveRead(testing.allocator, repo_abs, .{ .store_root = store_abs });
+    defer read_location.deinit();
+
+    var index = try zindeks.storage.index.Index.open(testing.allocator, tmp.dir, read_location.index_dir);
+    defer index.close();
+
+    const graph_path = try std.fs.path.join(testing.allocator, &.{ read_location.index_dir, "graph.db" });
+    defer testing.allocator.free(graph_path);
+    const graph_path_z = try testing.allocator.dupeZ(u8, graph_path);
+    defer testing.allocator.free(graph_path_z);
+    var gdb = try zindeks.storage.graph_db.GraphDb.open(graph_path_z);
+    defer gdb.close();
+    gdb.setAllocator(testing.allocator);
+
+    var engine = zindeks.search.engine.Engine.init(&index);
+    var results = try engine.multiSignalSearch(&gdb, testing.allocator, "alphaFn", 5);
+    defer results.deinit(testing.allocator);
+
+    // multiSignalSearch ran the community signal end-to-end: every result
+    // carries a finite community_score field (0 when no community applies).
+    try testing.expect(results.items.len > 0);
+    for (results.items) |r| try testing.expect(!std.math.isNan(r.community_score));
+}

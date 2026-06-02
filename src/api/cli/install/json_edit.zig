@@ -188,8 +188,16 @@ pub fn atomicWrite(
     dest_path: []const u8,
     content: []const u8,
 ) !void {
-    // Ensure parent directory exists.
+    // Ensure parent directories exist (recursively — paths like
+    // .kiro/settings/mcp.json introduce more than one new level).
     if (std.fs.path.dirname(dest_path)) |parent| {
+        var i: usize = 1;
+        while (i < parent.len) : (i += 1) {
+            if (parent[i] == '/' or parent[i] == '\\') {
+                const prefix = parent[0..i];
+                if (std.fs.path.isAbsolute(prefix)) std.fs.makeDirAbsolute(prefix) catch {};
+            }
+        }
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,

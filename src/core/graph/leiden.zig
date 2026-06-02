@@ -88,6 +88,14 @@ pub fn detect(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb, resolution: 
     };
 }
 
+/// Idempotent lazy-detect: run Leiden only if no community is assigned yet.
+/// Cheap no-op on warm indexes — used as a sentinel by search/get_context so
+/// the community signal works without a separate detect_communities call.
+pub fn ensureDetected(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb, resolution: f64) !void {
+    if (try gdb.hasCommunities()) return;
+    _ = try detect(allocator, gdb, resolution);
+}
+
 // ██████████████████████████████████████████████████████████████████████████
 // Graph representation
 // ██████████████████████████████████████████████████████████████████████████

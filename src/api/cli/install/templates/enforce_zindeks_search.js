@@ -3,15 +3,25 @@
 
 const fs = require("fs");
 
-const host = getArg("--host") || "cursor";
+const host = (getArg("--host") || "cursor").toLowerCase();
 const input = readJson();
 const command = extractCommand(input);
 const decision = decide(command);
 
-if (host === "claude") {
+// Claude-family hosts use the Anthropic hookSpecificOutput contract; Kiro uses
+// an exit-code contract (0=allow, 2=block); every other agent (cursor, vscode,
+// windsurf, antigravity, …) uses the generic permission contract. So the hook
+// applies across all hosts — not just claude.
+if (isClaudeHost(host)) {
   writeClaude(decision);
+} else if (host === "kiro") {
+  writeKiro(decision);
 } else {
-  writeCursor(decision);
+  writeGeneric(decision);
+}
+
+function isClaudeHost(name) {
+  return name === "claude" || name.startsWith("claude");
 }
 
 function getArg(name) {
@@ -89,7 +99,21 @@ function ask(message) {
   return { permission: "ask", message };
 }
 
-function writeCursor(result) {
+// Kiro PreToolUse contract is exit-code based: exit 0 allows the tool; exit 2
+// blocks it and returns STDERR to the LLM. Kiro has no "ask" prompt, so an
+// ask/deny decision becomes a block whose message guides the model to zindeks.
+function writeKiro(result) {
+  if (result.permission === "allow") {
+    process.exit(0);
+  }
+  if (result.message) process.stderr.write(result.message);
+  process.exit(2);
+}
+
+// Generic permission contract — used by Cursor and every other non-Claude
+// agent host. `user_message`/`agent_message` are recognized by Cursor; hosts
+// that only read `permission` still get the correct allow/ask decision.
+function writeGeneric(result) {
   if (result.permission === "allow") {
     process.stdout.write(JSON.stringify({ permission: "allow" }));
     return;

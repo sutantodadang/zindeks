@@ -16,6 +16,8 @@ const graph_db = @import("../storage/graph_db.zig");
 const overlay_mod = @import("../storage/overlay.zig");
 const semantic = @import("semantic.zig");
 const hnsw = @import("hnsw.zig");
+const leiden = @import("../graph/leiden.zig");
+const ai_query = @import("../ai/query.zig");
 
 /// BM25 tuning constants.
 pub const BM25_DEFAULTS = struct {
@@ -34,6 +36,10 @@ pub const SIGNAL_WEIGHTS = struct {
     pub const kind_boost: f32 = 0.10;
     /// Minimum edge confidence to follow for graph proximity.
     pub const min_edge_confidence: f32 = 0.3;
+    /// Weight for same-community cohesion boost (narrow/cohesion bias).
+    pub const community_cohesion: f32 = 0.12;
+    /// Weight for repeat-community diversity decay (broad/diversity bias).
+    pub const community_diversity: f32 = 0.10;
 };
 
 pub const Result = struct {
@@ -81,6 +87,7 @@ pub const MultiSignalResult = struct {
     fused_score: f32,
     graph_proximity_score: f32,
     kind_boost_score: f32,
+    community_score: f32,
     final_score: f32,
 };
 
@@ -748,7 +755,29 @@ pub const Engine = struct {
             }
         }
 
-        // 3. Build final results with signal blending
+        // 3. Community signal: lazy-detect, classify bias, identify top communities.
+        leiden.ensureDetected(allocator, gdb, 1.0) catch {};
+        var doc_comm = gdb.docCommunities(allocator) catch std.AutoHashMap(u32, i64).init(allocator);
+        defer doc_comm.deinit();
+
+        var bias: ai_query.SearchBias = .neutral;
+        if (ai_query.parseQuery(allocator, query)) |parsed| {
+            defer parsed.deinit(allocator);
+            bias = ai_query.searchBias(parsed.intent);
+        } else |_| {}
+
+        // Top-K communities = communities of the highest-fused hybrid hits.
+        var top_comms = std.AutoHashMap(i64, void).init(allocator);
+        defer top_comms.deinit();
+        const topk = @min(hybrid.items.len, 3);
+        for (hybrid.items[0..topk]) |h| {
+            if (doc_comm.get(h.doc_id)) |c| try top_comms.put(c, {});
+        }
+        // Track communities already seen in rank order for diversity decay.
+        var seen_comm = std.AutoHashMap(i64, u32).init(allocator);
+        defer seen_comm.deinit();
+
+        // 4. Build final results with signal blending
         var final_scores = std.ArrayList(struct {
             doc_id: u32,
             final_score: f32,
@@ -757,6 +786,7 @@ pub const Engine = struct {
             fused_score: f32,
             graph_score: f32,
             kind_score: f32,
+            community_score: f32,
         }).initCapacity(allocator, hybrid.items.len) catch @panic("OOM");
         defer final_scores.deinit(allocator);
 
@@ -764,10 +794,27 @@ pub const Engine = struct {
             const graph_score = graph_scores.get(h.doc_id) orelse 0;
             const kind_score = kind_scores.get(h.doc_id) orelse 1.0;
 
-            // Blend: fused_score * (1 + graph_weight * graph_score + kind_weight * (kind_score - 1))
+            // Community signal: cohesion boosts same-community-as-top hits;
+            // diversity decays each repeated community in rank order.
+            var community_score: f32 = 0;
+            if (doc_comm.get(h.doc_id)) |c| switch (bias) {
+                .cohesion => if (top_comms.contains(c)) {
+                    community_score = SIGNAL_WEIGHTS.community_cohesion;
+                },
+                .diversity => {
+                    const e = try seen_comm.getOrPut(c);
+                    if (!e.found_existing) e.value_ptr.* = 0;
+                    community_score = -SIGNAL_WEIGHTS.community_diversity *
+                        @as(f32, @floatFromInt(e.value_ptr.*));
+                    e.value_ptr.* += 1;
+                },
+                .neutral => {},
+            };
+
+            // Blend: fused_score * (1 + graph + kind + community)
             const graph_bonus = SIGNAL_WEIGHTS.graph_proximity * graph_score;
             const kind_bonus = SIGNAL_WEIGHTS.kind_boost * (kind_score - 1.0);
-            const final = h.fused_score * (1.0 + graph_bonus + kind_bonus);
+            const final = h.fused_score * (1.0 + graph_bonus + kind_bonus + community_score);
 
             try final_scores.append(allocator, .{
                 .doc_id = h.doc_id,
@@ -777,10 +824,11 @@ pub const Engine = struct {
                 .fused_score = h.fused_score,
                 .graph_score = graph_score,
                 .kind_score = kind_score,
+                .community_score = community_score,
             });
         }
 
-        // 4. Sort by final score descending
+        // 5. Sort by final score descending
         std.mem.sort(@TypeOf(final_scores.items[0]), final_scores.items, {}, struct {
             fn less(_: void, a: @TypeOf(final_scores.items[0]), b: @TypeOf(final_scores.items[0])) bool {
                 return a.final_score > b.final_score;
@@ -788,7 +836,7 @@ pub const Engine = struct {
         }.less);
         if (final_scores.items.len > limit) final_scores.shrinkRetainingCapacity(limit);
 
-        // 5. Build results
+        // 6. Build results
         const results = try allocator.alloc(MultiSignalResult, final_scores.items.len);
         for (final_scores.items, 0..) |item, idx| {
             results[idx] = .{
@@ -800,6 +848,7 @@ pub const Engine = struct {
                 .fused_score = item.fused_score,
                 .graph_proximity_score = item.graph_score,
                 .kind_boost_score = item.kind_score,
+                .community_score = item.community_score,
                 .final_score = item.final_score,
             };
         }

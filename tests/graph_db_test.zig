@@ -161,3 +161,34 @@ test "graph_db community queries" {
     try std.testing.expectEqual(@as(i64, 2), communities[1].community_id);
     try std.testing.expectEqual(@as(u32, 1), communities[1].member_count);
 }
+
+
+test "leiden ensureDetected lazy-detect fires then is idempotent" {
+    const leiden = @import("zindeks").graph.leiden;
+
+    var db = try graph_db.GraphDb.open(":memory:");
+    defer db.close();
+    try db.migrate();
+
+    try db.exec("INSERT INTO documents (path, language) VALUES ('a.zig', 'Zig')");
+    try db.exec("INSERT INTO documents (path, language) VALUES ('b.zig', 'Zig')");
+    // Symbol ids 1..4 (no community_id assigned yet).
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end) VALUES (1, 'foo', 'function', 1, 5)");
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end) VALUES (1, 'bar', 'function', 10, 15)");
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end) VALUES (2, 'baz', 'function', 1, 5)");
+    try db.exec("INSERT INTO symbols (document_id, name, kind, line_start, line_end) VALUES (2, 'qux', 'function', 10, 15)");
+    // Two intra-cluster edges so the graph has weight to partition.
+    try db.exec("INSERT INTO edges (source_symbol_id, target_symbol_id, edge_type) VALUES (1, 2, 'CALLS')");
+    try db.exec("INSERT INTO edges (source_symbol_id, target_symbol_id, edge_type) VALUES (3, 4, 'CALLS')");
+
+    try std.testing.expect(!try db.hasCommunities());
+
+    try leiden.ensureDetected(std.testing.allocator, &db, 1.0);
+    try std.testing.expect(try db.hasCommunities());
+
+    // Idempotent: second call is a no-op and leaves assignments intact.
+    const before = try db.queryScalar("SELECT COUNT(*) FROM symbols WHERE community_id IS NOT NULL");
+    try leiden.ensureDetected(std.testing.allocator, &db, 1.0);
+    const after = try db.queryScalar("SELECT COUNT(*) FROM symbols WHERE community_id IS NOT NULL");
+    try std.testing.expectEqual(before, after);
+}

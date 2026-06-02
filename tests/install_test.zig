@@ -507,3 +507,69 @@ test "claude hook config: migrates old Node-based enforce-zindeks-search entry" 
     // New binary command must be present.
     try std.testing.expect(std.mem.indexOf(u8, content, "hook --host claude") != null);
 }
+
+
+
+// ── kiro adapter ──────────────────────────────────────────────────────
+
+test "kiro adapter round-trips and resolves documented MCP paths" {
+    const allocator = std.testing.allocator;
+    const adapters = zindeks.api.cli.install.adapters;
+
+    // Registered in fromStr/toStr/all_adapters.
+    try std.testing.expectEqual(adapters.AdapterId.kiro, adapters.AdapterId.fromStr("kiro").?);
+    try std.testing.expectEqualStrings("kiro", adapters.AdapterId.kiro.toStr());
+    var present = false;
+    for (adapters.all_adapters) |id| {
+        if (id == .kiro) present = true;
+    }
+    try std.testing.expect(present);
+    // Kiro supports project scope.
+    try std.testing.expect(adapters.supportsProjectScope(.kiro));
+
+    // Project-scope MCP config lives at .kiro/settings/mcp.json.
+    var paths = try adapters.getPaths(allocator, .kiro, .project, "/tmp/proj");
+    defer paths.deinit(allocator);
+    try std.testing.expect(paths.config != null);
+    try std.testing.expect(std.mem.endsWith(u8, paths.config.?, "mcp.json"));
+    try std.testing.expect(std.mem.indexOf(u8, paths.config.?, ".kiro") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paths.config.?, "settings") != null);
+}
+
+
+
+test "injectKiroAgentHook adds preToolUse shell hook idempotently" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const agent_path = try std.fs.path.join(allocator, &.{ dir_path, "agent.json" });
+    defer allocator.free(agent_path);
+
+    try je.atomicWrite(allocator, agent_path, "{\"name\":\"my-agent\"}");
+
+    try guardrails.injectKiroAgentHook(allocator, agent_path);
+    try guardrails.injectKiroAgentHook(allocator, agent_path); // second run must be a no-op
+
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(agent_path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(allocator, 65536);
+    };
+    defer allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    // Original field preserved.
+    try std.testing.expect(parsed.value.object.get("name") != null);
+    const hooks = parsed.value.object.get("hooks") orelse return error.MissingHooks;
+    const pre = hooks.object.get("preToolUse") orelse return error.MissingPreToolUse;
+    // Exactly one entry after two runs (idempotent), matching shell + --host kiro.
+    try std.testing.expectEqual(@as(usize, 1), pre.array.items.len);
+    const entry = pre.array.items[0];
+    try std.testing.expectEqualStrings("shell", entry.object.get("matcher").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, entry.object.get("command").?.string, "--host kiro") != null);
+}

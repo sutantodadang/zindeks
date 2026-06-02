@@ -126,6 +126,19 @@ test "classifyQuery: natural_language for everything else" {
     try std.testing.expectEqual(engine_mod.QueryShape.natural_language, engine_mod.classifyQuery("a-b"));
 }
 
+// ─── 2.3 Community search bias ──────────────────────────────────────
+
+test "searchBias maps intent to cohesion/diversity/neutral" {
+    const query = zindeks.ai.query;
+    try std.testing.expectEqual(query.SearchBias.cohesion, query.searchBias(.find_definition));
+    try std.testing.expectEqual(query.SearchBias.cohesion, query.searchBias(.find_usage));
+    try std.testing.expectEqual(query.SearchBias.cohesion, query.searchBias(.debug));
+    try std.testing.expectEqual(query.SearchBias.diversity, query.searchBias(.explore));
+    try std.testing.expectEqual(query.SearchBias.diversity, query.searchBias(.explain));
+    try std.testing.expectEqual(query.SearchBias.diversity, query.searchBias(.refactor));
+    try std.testing.expectEqual(query.SearchBias.neutral, query.searchBias(.search));
+}
+
 // ─── 2.3 TermCache wiring ───────────────────────────────────────────
 
 test "TermCache: returns same result on hit and miss" {

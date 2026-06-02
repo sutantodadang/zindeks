@@ -147,7 +147,7 @@ pub fn run(
         }
 
         if (final_count == 0) {
-            try sw.print("No AI hosts detected. Install one of: claude-code, cursor, vscode, windsurf, antigravity.\n", .{});
+            try sw.print("No AI hosts detected. Install one of: claude-code, cursor, vscode, windsurf, antigravity, kiro.\n", .{});
             try sw.print("Then run:  {s}zindeks install --host <id>{s}\n", .{ sw.bold(), sw.reset() });
             return;
         }

@@ -6,13 +6,16 @@ code-structure questions before falling back to broad shell search or full-file
 reads. Prefer `read_file` over reading whole files, and `list_files` over `Glob`
 or `dir`.
 
-**Start any task with `get_context`** — one call returns ranked code snippets +
-call-graph neighbors + recalled prior reasoning, token-budgeted. Drop to the
-narrower tools below only for surgical follow-ups.
+**Start any task with `get_context`** — the most powerful entry point. One call
+returns ranked code snippets + call-graph neighbors + recalled prior reasoning,
+reranked by code community (cohesion for narrow queries, diversity for broad) and
+token-budgeted. Default to it for almost every task; pass `working_set` (files
+you're editing) to bias ranking. Drop to the narrower tools below only for
+surgical follow-ups.
 
 | Question | Tool |
 |---|---|
-| **Understand code before editing (START HERE)** | `get_context(query, working_set?)` — fused: snippets + neighbors + prior reasoning |
+| **Understand code before editing (START HERE — use for almost everything)** | `get_context(query, working_set?)` — fused: community-reranked snippets + neighbors + prior reasoning |
 | Search (hybrid BM25+semantic, default) | `search(query)` |
 | Keyword search only | `search(query, mode="keyword")` |
 | Semantic search only | `search(query, mode="semantic")` |

@@ -7,9 +7,12 @@ alwaysApply: true
 
 Use zindeks first for codebase search and structural questions in this repo.
 
-- START HERE — `get_context(query, working_set?)`: one MCP call returns ranked
-  snippets + call-graph neighbors + recalled prior reasoning, token-budgeted.
-  Begin any task with it; use the narrower tools below for surgical follow-ups.
+- START HERE — `get_context(query, working_set?)`: the most powerful entry point.
+  One MCP call returns ranked snippets + call-graph neighbors + recalled prior
+  reasoning, community-reranked (cohesion for narrow queries, diversity for broad)
+  and token-budgeted. Default to it for almost every task; pass `working_set`
+  (files you're editing) to bias ranking. Use the narrower tools below only for
+  surgical follow-ups.
 - Search (hybrid BM25+semantic, default): use `zindeks search "<query>"` or MCP `search(query)`.
   - Keyword only: `search(query, mode="keyword")`. Semantic only: `search(query, mode="semantic")`.
 - Symbols: use MCP `search_graph(name_pattern)`.

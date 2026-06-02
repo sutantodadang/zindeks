@@ -7,6 +7,8 @@ const tmpl = @import("templates.zig");
 
 pub const cursor_hook_command = "node .cursor/hooks/enforce-zindeks-search.js --host cursor";
 
+pub const kiro_hook_command = "node .kiro/hooks/enforce-zindeks-search.js --host kiro";
+
 const cursor_hook_matcher =
     "rg|grep|git\\s+grep|findstr|Select-String|Get-ChildItem|\\bgci\\b|\\bdir\\s+/s";
 
@@ -33,6 +35,10 @@ pub fn installForHost(
             try installCursorHook(allocator, cwd);
         },
         .vscode => try installCopilotGuidance(allocator, cwd),
+        .kiro => try installKiroHook(allocator, cwd),
+        // Windsurf and Antigravity have no shell pre-tool hook contract we can
+        // wire a blocking guard into; they rely on the generic AGENTS.md
+        // guidance written above.
         .windsurf, .antigravity => {},
     }
 }
@@ -65,6 +71,45 @@ pub fn installCursorHook(allocator: std.mem.Allocator, cwd: []const u8) !void {
     const path = try std.fs.path.join(allocator, &.{ cwd, ".cursor", "hooks.json" });
     defer allocator.free(path);
     try injectCursorHookConfig(allocator, path);
+}
+
+/// Install the Kiro guard: stage the shared script under .kiro/hooks/ and inject
+/// a preToolUse hook into every workspace agent config (.kiro/agents/*.json).
+/// Kiro hooks are per-agent, so there is no single config to register; if no
+/// workspace agents exist yet the script is staged for when one is added.
+pub fn installKiroHook(allocator: std.mem.Allocator, cwd: []const u8) !void {
+    const script = try std.fs.path.join(allocator, &.{ cwd, ".kiro", "hooks", "enforce-zindeks-search.js" });
+    defer allocator.free(script);
+    try json_edit.atomicWrite(allocator, script, tmpl.enforce_zindeks_search_js);
+
+    const agents_dir = try std.fs.path.join(allocator, &.{ cwd, ".kiro", "agents" });
+    defer allocator.free(agents_dir);
+    var dir = std.fs.openDirAbsolute(agents_dir, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const agent_path = try std.fs.path.join(allocator, &.{ agents_dir, entry.name });
+        defer allocator.free(agent_path);
+        injectKiroAgentHook(allocator, agent_path) catch continue;
+    }
+}
+
+/// Inject (idempotently) a shell-matching preToolUse hook into a Kiro agent config.
+pub fn injectKiroAgentHook(allocator: std.mem.Allocator, path: []const u8) !void {
+    var root = try readJsonObject(allocator, path);
+    defer root.deinit();
+    const aa = root.arena.allocator();
+
+    const hooks = try ensureObjectField(aa, &root.value, "hooks");
+    const pre = try ensureArrayField(aa, hooks, "preToolUse");
+    if (!arrayContainsHookCommand(pre, kiro_hook_command)) {
+        var hook = std.json.ObjectMap.init(aa);
+        try hook.put("matcher", .{ .string = "shell" });
+        try hook.put("command", .{ .string = kiro_hook_command });
+        try pre.array.append(.{ .object = hook });
+    }
+    try writeJsonObject(allocator, aa, path, root.value);
 }
 
 /// Inject (or replace) a zindeks managed markdown block without touching other content.

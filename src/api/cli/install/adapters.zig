@@ -5,7 +5,7 @@
 //!   - Which config file to write for user/project scope.
 //!   - Whether project scope is supported.
 //!
-//! Five adapters in v1: claude-code, cursor, vscode, windsurf, antigravity.
+//! Six adapters: claude-code, cursor, vscode, windsurf, antigravity, kiro.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +18,7 @@ pub const AdapterId = enum {
     vscode,
     windsurf,
     antigravity,
+    kiro,
 
     pub fn fromStr(s: []const u8) ?AdapterId {
         if (std.mem.eql(u8, s, "claude-code")) return .claude_code;
@@ -25,6 +26,7 @@ pub const AdapterId = enum {
         if (std.mem.eql(u8, s, "vscode")) return .vscode;
         if (std.mem.eql(u8, s, "windsurf")) return .windsurf;
         if (std.mem.eql(u8, s, "antigravity")) return .antigravity;
+        if (std.mem.eql(u8, s, "kiro")) return .kiro;
         return null;
     }
 
@@ -35,6 +37,7 @@ pub const AdapterId = enum {
             .vscode => "vscode",
             .windsurf => "windsurf",
             .antigravity => "antigravity",
+            .kiro => "kiro",
         };
     }
 
@@ -45,6 +48,7 @@ pub const AdapterId = enum {
             .vscode => "VS Code",
             .windsurf => "Windsurf",
             .antigravity => "Antigravity",
+            .kiro => "Kiro",
         };
     }
 };
@@ -76,6 +80,7 @@ pub fn getPaths(
         .vscode => vscodePaths(allocator, scope, cwd),
         .windsurf => windsurfPaths(allocator, scope, cwd),
         .antigravity => antigravityPaths(allocator, scope, cwd),
+        .kiro => kiroPaths(allocator, scope, cwd),
     };
 }
 
@@ -140,6 +145,7 @@ pub fn getProjectPaths(
         .vscode => vscodePaths(allocator, .project, cwd),
         .windsurf => Paths{ .config = null, .claude_md = null }, // no project scope
         .antigravity => antigravityPaths(allocator, .project, cwd),
+        .kiro => kiroPaths(allocator, .project, cwd),
     };
 }
 
@@ -228,6 +234,26 @@ fn antigravityPaths(
 
 // ── Platform helpers ──────────────────────────────────────────────────
 
+/// Kiro stores MCP servers in `.kiro/settings/mcp.json` (workspace) and
+/// `~/.kiro/settings/mcp.json` (global).
+fn kiroPaths(
+    allocator: std.mem.Allocator,
+    scope: Scope,
+    cwd: []const u8,
+) !Paths {
+    var result = Paths{ .config = null, .claude_md = null };
+    switch (scope) {
+        .user, .both => {
+            const home = try homeDir(allocator);
+            defer allocator.free(home);
+            result.config = try std.fs.path.join(allocator, &.{ home, ".kiro", "settings", "mcp.json" });
+        },
+        .project => {
+            result.config = try std.fs.path.join(allocator, &.{ cwd, ".kiro", "settings", "mcp.json" });
+        },
+    }
+    return result;
+}
 /// Return a probe path used to detect whether a host is installed.
 /// The path points to the host's user-level config directory or file.
 fn detectProbe(allocator: std.mem.Allocator, id: AdapterId) ![]u8 {
@@ -243,6 +269,7 @@ fn detectProbe(allocator: std.mem.Allocator, id: AdapterId) ![]u8 {
             const primary = try std.fs.path.join(allocator, &.{ home, ".antigravity" });
             break :blk primary;
         },
+        .kiro => std.fs.path.join(allocator, &.{ home, ".kiro" }),
     };
 }
 
@@ -306,4 +333,5 @@ pub const all_adapters = [_]AdapterId{
     .vscode,
     .windsurf,
     .antigravity,
+    .kiro,
 };

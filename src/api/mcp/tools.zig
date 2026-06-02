@@ -120,7 +120,7 @@ pub const list_projects = Descriptor{
 
 pub const search = Descriptor{
     .name = "search",
-    .description = "Search indexed source files. mode=\"keyword\" uses BM25 ranking with scored snippets (optional stream); mode=\"semantic\" uses document-embedding cosine similarity; mode=\"hybrid\" (default) fuses BM25 + semantic via Reciprocal Rank Fusion. Falls back to keyword when no embeddings are available.",
+    .description = "Search indexed source files. mode=\"keyword\" uses BM25 ranking with scored snippets (optional stream); mode=\"semantic\" uses document-embedding cosine similarity; mode=\"hybrid\" (default) fuses BM25 + semantic via Reciprocal Rank Fusion. Falls back to keyword when no embeddings are available. Multi-signal ranking also factors Leiden community structure (lazy-detected): cohesion for narrow lookups, diversity for broad exploration.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -489,7 +489,7 @@ pub const health_check = Descriptor{
 
 pub const get_context = Descriptor{
     .name = "get_context",
-    .description = "Assemble fused AI context in ONE call: attention-ranked code snippets + call-graph neighbors + recalled prior reasoning, token-budgeted. Prefer this over chaining search + read_file + trace_call_path.",
+    .description = "Assemble fused AI context in ONE call: attention-ranked code snippets + call-graph neighbors + recalled prior reasoning, token-budgeted. Results are reranked by Leiden community structure (lazy-detected): cohesion for narrow queries, diversity for broad ones. Prefer this over chaining search + read_file + trace_call_path.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -2725,6 +2725,53 @@ fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
                     r.score = r.score * (1.0 + s.score);
                     break;
                 }
+            }
+        }
+        std.mem.sort(search_engine.Result, results.items, {}, struct {
+            fn desc(_: void, a: search_engine.Result, b: search_engine.Result) bool {
+                return a.score > b.score;
+            }
+        }.desc);
+    }
+
+    // 2b) COMMUNITY rerank — lazy-detect, then bias by query intent:
+    //     cohesion boosts same-community-as-top hits (narrow queries);
+    //     diversity decays repeated communities in rank order (broad queries).
+    community_blk: {
+        leiden_mod.ensureDetected(ctx.allocator, gdb, 1.0) catch break :community_blk;
+        var doc_comm = gdb.docCommunities(ctx.allocator) catch break :community_blk;
+        defer doc_comm.deinit();
+
+        var bias: ai_query.SearchBias = .neutral;
+        if (ai_query.parseQuery(ctx.allocator, query)) |parsed| {
+            defer parsed.deinit(ctx.allocator);
+            bias = ai_query.searchBias(parsed.intent);
+        } else |_| {}
+        if (bias == .neutral) break :community_blk;
+
+        var top_comms = std.AutoHashMap(i64, void).init(ctx.allocator);
+        defer top_comms.deinit();
+        const topk = @min(results.items.len, 3);
+        for (results.items[0..topk]) |r| {
+            if (doc_comm.get(r.doc_id)) |c| top_comms.put(c, {}) catch {};
+        }
+        var seen_comm = std.AutoHashMap(i64, u32).init(ctx.allocator);
+        defer seen_comm.deinit();
+
+        for (results.items) |*r| {
+            const c = doc_comm.get(r.doc_id) orelse continue;
+            switch (bias) {
+                .cohesion => if (top_comms.contains(c)) {
+                    r.score *= (1.0 + search_engine.SIGNAL_WEIGHTS.community_cohesion);
+                },
+                .diversity => {
+                    const e = seen_comm.getOrPut(c) catch continue;
+                    if (!e.found_existing) e.value_ptr.* = 0;
+                    r.score *= (1.0 - search_engine.SIGNAL_WEIGHTS.community_diversity *
+                        @as(f32, @floatFromInt(e.value_ptr.*)));
+                    e.value_ptr.* += 1;
+                },
+                .neutral => {},
             }
         }
         std.mem.sort(search_engine.Result, results.items, {}, struct {

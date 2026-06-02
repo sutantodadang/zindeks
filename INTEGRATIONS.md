@@ -1,6 +1,6 @@
 # Zindeks — Host Integrations
 
-This document describes the five AI host adapters supported by `zindeks install`.
+This document describes the six AI host adapters supported by `zindeks install`.
 
 ## Supported hosts
 
@@ -11,6 +11,7 @@ This document describes the five AI host adapters supported by `zindeks install`
 | `vscode` | VS Code | `%APPDATA%\Code\User\mcp.json` (Windows)<br>`~/Library/Application Support/Code/User/mcp.json` (macOS)<br>`~/.config/Code/User/mcp.json` (Linux) | `<cwd>/.vscode/mcp.json` | Yes |
 | `windsurf` | Windsurf | `~/.codeium/windsurf/mcp_config.json` | n/a | No |
 | `antigravity` | Antigravity | `~/.antigravity/mcp.json`<br>(fallback: `~/.config/antigravity/mcp.json` on Linux/macOS) | `<cwd>/.antigravity/mcp.json` | Yes |
+| `kiro` | Kiro | `~/.kiro/settings/mcp.json` | `<cwd>/.kiro/settings/mcp.json` | Yes |
 
 ## MCP entry shape
 
@@ -49,8 +50,9 @@ Project-scope installs also add zindeks-first search guidance without replacing 
 - Cursor: writes `.cursor/rules/zindeks-first.mdc`, `.cursor/hooks.json`, and `.cursor/hooks/enforce-zindeks-search.js`.
 - VS Code / GitHub Copilot: appends or replaces a managed block in `.github/copilot-instructions.md`.
 - Claude Code: adds a project `.claude/settings.json` `PreToolUse` hook for Bash/Shell commands and reuses `.cursor/hooks/enforce-zindeks-search.js`.
+- Kiro: writes `.kiro/hooks/enforce-zindeks-search.js` and injects a `preToolUse` hook (`matcher: "shell"`) into each workspace agent config (`.kiro/agents/*.json`). Kiro hooks are per-agent and exit-code based (exit 0 allows, exit 2 blocks and returns the guidance to the model), so broad shell search is blocked with a nudge rather than prompted. Re-run after adding new agents.
 
-The shared hook script asks before broad shell search commands (`rg`, `grep`, `git grep`, `findstr`, `Select-String`, recursive `Get-ChildItem`/`gci`, or `dir /s`) unless the command invokes zindeks. It is plain Node.js and does not require jq or bash.
+The shared hook script steers agents to zindeks for broad shell search commands (`rg`, `grep`, `git grep`, `findstr`, `Select-String`, recursive `Get-ChildItem`/`gci`, or `dir /s`) unless the command invokes zindeks: Cursor is prompted (`ask`), Claude gets a non-blocking advisory, and Kiro is blocked (exit 2) with guidance. It is plain Node.js and does not require jq or bash.
 
 ## Commands
 

@@ -607,6 +607,72 @@ pub const GraphDb = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    /// Return true if any symbol has a community_id assigned (lazy-detect sentinel).
+    pub fn hasCommunities(self: *GraphDb) !bool {
+        var stmt = try self.prepare(
+            \\SELECT EXISTS(SELECT 1 FROM symbols WHERE community_id IS NOT NULL)
+        );
+        defer stmt.finalize();
+        if (!(try stmt.step())) return false;
+        return (try stmt.columnInt(0)) != 0;
+    }
+
+    /// Return a map of document_id -> dominant community_id (mode among that doc's symbols).
+    /// Caller owns and must deinit the returned map.
+    pub fn docCommunities(self: *GraphDb, allocator: std.mem.Allocator) !std.AutoHashMap(u32, i64) {
+        // Tally counts: doc_id -> (community_id -> count)
+        var tally = std.AutoHashMap(u32, std.AutoHashMap(i64, u32)).init(allocator);
+        errdefer {
+            var it = tally.valueIterator();
+            while (it.next()) |inner| inner.deinit();
+            tally.deinit();
+        }
+
+        var stmt = try self.prepare(
+            \\SELECT document_id, community_id FROM symbols WHERE community_id IS NOT NULL
+        );
+        defer stmt.finalize();
+
+        while (try stmt.step()) {
+            const doc_id: u32 = @intCast(try stmt.columnInt(0));
+            const comm_id: i64 = try stmt.columnInt(1);
+
+            const doc_entry = try tally.getOrPut(doc_id);
+            if (!doc_entry.found_existing) {
+                doc_entry.value_ptr.* = std.AutoHashMap(i64, u32).init(allocator);
+            }
+            const cnt_entry = try doc_entry.value_ptr.getOrPut(comm_id);
+            if (!cnt_entry.found_existing) cnt_entry.value_ptr.* = 0;
+            cnt_entry.value_ptr.* += 1;
+        }
+
+        // Build result: for each doc, pick the community_id with the max count.
+        var result = std.AutoHashMap(u32, i64).init(allocator);
+        errdefer result.deinit();
+
+        var tally_it = tally.iterator();
+        while (tally_it.next()) |doc_kv| {
+            const doc_id = doc_kv.key_ptr.*;
+            var best_comm: i64 = 0;
+            var best_cnt: u32 = 0;
+            var comm_it = doc_kv.value_ptr.iterator();
+            while (comm_it.next()) |comm_kv| {
+                if (comm_kv.value_ptr.* > best_cnt) {
+                    best_cnt = comm_kv.value_ptr.*;
+                    best_comm = comm_kv.key_ptr.*;
+                }
+            }
+            try result.put(doc_id, best_comm);
+        }
+
+        // Free inner tally maps.
+        var free_it = tally.valueIterator();
+        while (free_it.next()) |inner| inner.deinit();
+        tally.deinit();
+
+        return result;
+    }
+
     /// Get the community ID for a symbol by name. Returns null if not found or
     /// no community assigned.
     pub fn getSymbolCommunity(self: *GraphDb, symbol_name: []const u8) !?i64 {

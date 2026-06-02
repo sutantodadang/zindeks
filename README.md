@@ -187,7 +187,7 @@ Embeddings are generated at index time and stored alongside the graph; `health_c
 
 - **Call graph tracing** — BFS traversal with cycle detection, inbound/outbound/both directions
 - **Architecture analysis** — fan-in/fan-out, entry points, module-level statistics
-- **Community detection** — Leiden algorithm (modularity gain + refinement), auto-partitions symbols
+- **Community detection** — Leiden algorithm (modularity gain + refinement), auto-partitions symbols. Lazily detected on first use and cached, then used to rerank `search` and `get_context` results — cohesion for narrow queries (find-def/usage/debug), diversity for broad ones (explore/explain/refactor).
 - **Cypher queries** — lexer/parser/executor, `MATCH ... WHERE ... RETURN ...` translated to SQL
 
 ### Edge types
@@ -228,7 +228,7 @@ Embeddings are generated at index time and stored alongside the graph; `health_c
 | `read_file` | Read a file by path, numbered + paged (offset/limit) |
 | `list_files` | List indexed files by glob/dir (replaces Glob) |
 | `file_outline` | Symbol names/kinds/line-ranges for one file, no full content |
-| `get_context` | Assemble token-budgeted AI context from search + call graph + architecture |
+| `get_context` | **Start here.** One fused, token-budgeted call: community-reranked code snippets + 1-hop call-graph neighbors + recalled prior reasoning (+ optional architecture). Prefer over chaining `search`/`read_file`/`trace_call_path`; pass `working_set` to bias ranking |
 | `summarize_symbol` | Signature, purpose, key ops, deps, complexity for a symbol |
 
 **Graph analysis**
