@@ -187,8 +187,28 @@ pub const ContextBuilder = struct {
         try self.sections.append(self.allocator, .{
             .title = title,
             .content = content,
-            .priority = 8,
+            .priority = 5,
             .estimated_tokens = window_mod.estimateTokens(content),
+        });
+        self.token_source = true;
+    }
+
+    /// Add an arbitrary titled section at a given priority. Title + content
+    /// are duped (the builder owns them). Higher priority survives the budget.
+    pub fn addSection(
+        self: *ContextBuilder,
+        title: []const u8,
+        content: []const u8,
+        priority: u8,
+    ) !void {
+        const owned_content = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(owned_content);
+        const owned_title = try self.allocator.dupe(u8, title);
+        try self.sections.append(self.allocator, .{
+            .title = owned_title,
+            .content = owned_content,
+            .priority = priority,
+            .estimated_tokens = window_mod.estimateTokens(owned_content),
         });
         self.token_source = true;
     }
@@ -358,6 +378,19 @@ test "ContextBuilder addArchitectureOverview" {
 
     try std.testing.expect(std.mem.indexOf(u8, ctx, "150 symbols") != null);
     try std.testing.expect(std.mem.indexOf(u8, ctx, "320 edges") != null);
+}
+
+test "ContextBuilder addSection generic" {
+    var builder = ContextBuilder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    try builder.addSection("Prior Reasoning", "compressed thought here", 10);
+
+    const ctx = try builder.build(2000);
+    defer std.testing.allocator.free(ctx);
+
+    try std.testing.expect(std.mem.indexOf(u8, ctx, "Prior Reasoning") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx, "compressed thought here") != null);
 }
 
 test "ContextBuilder token budget enforcement" {
