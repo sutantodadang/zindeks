@@ -730,6 +730,9 @@ pub const Context = struct {
     /// Optional parser pool — when non-null, incremental updates reuse
     /// TSParser instances instead of allocating/freeing per file.
     parser_pool: ?*incremental.ParserPool = null,
+    /// Optional result cache pointer — used by health_check to surface
+    /// hit/miss statistics.  Null in test-constructed Contexts.
+    result_cache: ?*@import("result_cache.zig").ResultCache = null,
 };
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -1599,8 +1602,11 @@ fn handleHealthCheck(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
 
     const status: []const u8 = if (doc_count > 0) "healthy" else "needs_indexing";
 
+    const cache_hits: u64 = if (ctx.result_cache) |rc| rc.hits else 0;
+    const cache_misses: u64 = if (ctx.result_cache) |rc| rc.misses else 0;
+
     try writer.print(
-        \\{{"status":{f},"counts":{{"documents":{},"symbols":{},"edges":{},"embeddings":{},"communities":{}}},"last_indexed":{},"uptime_seconds":0}}
+        \\{{"status":{f},"counts":{{"documents":{},"symbols":{},"edges":{},"embeddings":{},"communities":{}}},"last_indexed":{},"uptime_seconds":0,"cache_hits":{},"cache_misses":{}}}
     , .{
         std.json.fmt(status, .{}),
         doc_count,
@@ -1609,6 +1615,8 @@ fn handleHealthCheck(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
         emb_count,
         community_count,
         last_indexed,
+        cache_hits,
+        cache_misses,
     });
 }
 

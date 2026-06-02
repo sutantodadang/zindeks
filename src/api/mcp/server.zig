@@ -6,6 +6,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const tools = @import("tools.zig");
+const result_cache_mod = @import("result_cache.zig");
 const storage = @import("../../core/storage/index.zig");
 const overlay_mod = @import("../../core/storage/overlay.zig");
 const search = @import("../../core/search/engine.zig");
@@ -118,6 +119,13 @@ fn isMutatingTool(name: []const u8) bool {
     return mode.isInline();
 }
 
+fn isCacheable(name: []const u8) bool {
+    if (isMutatingTool(name)) return false;
+    if (std.mem.eql(u8, name, "health_check")) return false;
+    if (std.mem.eql(u8, name, "config")) return false;
+    return true;
+}
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     transport: protocol.Transport,
@@ -178,6 +186,10 @@ pub const Server = struct {
 
     response_buf: std.ArrayList(u8),
 
+    /// Session-scoped cache of read-only tool result bodies.
+    /// Invalidated on any mutating tool call.
+    result_cache: result_cache_mod.ResultCache,
+
     /// Long-lived parser pool — reuses TSParser instances across incremental
     /// index updates so we avoid alloc/free of TSParser + grammar binding per
     /// file.  Created in init, destroyed in deinit.
@@ -218,6 +230,7 @@ pub const Server = struct {
             .inflight_mu = .{},
             .inflight_cv = .{},
             .response_buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
+            .result_cache = result_cache_mod.ResultCache.init(allocator),
             .parser_pool = ParserPool.init(allocator),
         };
     }
@@ -236,6 +249,7 @@ pub const Server = struct {
         if (self.idx) |*idx| idx.close();
         if (self.project_path) |p| self.allocator.free(p);
         if (self.index_dir) |p| self.allocator.free(p);
+        self.result_cache.deinit();
         self.parser_pool.deinit();
         self.response_buf.deinit(self.allocator);
         self.transport.deinit();
@@ -619,6 +633,7 @@ pub const Server = struct {
             .transport = &self.transport,
             .request_id = req.id,
             .parser_pool = &self.parser_pool,
+            .result_cache = &self.result_cache,
         };
         var is_error = false;
         tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
@@ -641,6 +656,7 @@ pub const Server = struct {
                 std.log.err("Failed to reattach overlay after update_index: {s}", .{@errorName(err)});
             };
         }
+        self.result_cache.clear();
     }
 
     /// Synchronous fallback for read-only tools when the thread pool
@@ -678,23 +694,33 @@ pub const Server = struct {
         defer body_buf.deinit(self.allocator);
         const body_writer = body_buf.writer(self.allocator);
 
-        var ctx = tools.Context{
-            .allocator = self.allocator,
-            .engine = if (self.engine != null) &self.engine.? else null,
-            .gdb = gdb_ptr,
-            .project_path = self.project_path,
-            .index_dir = self.index_dir,
-            .store_root = self.store_root,
-            .transport = &self.transport,
-            .request_id = id,
-            .parser_pool = &self.parser_pool,
-        };
+        const cacheable = isCacheable(tool_name);
+        const cache_key: u64 = if (cacheable)
+            result_cache_mod.ResultCache.computeKey(tool_name, args, self.allocator)
+        else
+            0;
         var is_error = false;
-        tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
-            is_error = true;
-            body_buf.shrinkRetainingCapacity(0);
-            body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
-        };
+        const served_from_cache = cacheable and self.result_cache.getInto(cache_key, &body_buf);
+        if (!served_from_cache) {
+            var ctx = tools.Context{
+                .allocator = self.allocator,
+                .engine = if (self.engine != null) &self.engine.? else null,
+                .gdb = gdb_ptr,
+                .project_path = self.project_path,
+                .index_dir = self.index_dir,
+                .store_root = self.store_root,
+                .transport = &self.transport,
+                .request_id = id,
+                .parser_pool = &self.parser_pool,
+                .result_cache = &self.result_cache,
+            };
+            tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
+                is_error = true;
+                body_buf.shrinkRetainingCapacity(0);
+                body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
+            };
+            if (cacheable and !is_error) self.result_cache.put(cache_key, body_buf.items);
+        }
 
         out_buf.shrinkRetainingCapacity(0);
         const writer = out_buf.writer(self.allocator);
@@ -1063,6 +1089,7 @@ pub const Server = struct {
                 .transport = null,
                 .request_id = req.id,
                 .parser_pool = &self.parser_pool,
+                .result_cache = &self.result_cache,
             };
             var is_error = false;
             tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
@@ -1081,6 +1108,7 @@ pub const Server = struct {
                     std.log.err("Failed to reattach overlay after update_index: {s}", .{@errorName(err)});
                 };
             }
+            self.result_cache.clear();
             return;
         }
 
@@ -1097,23 +1125,33 @@ pub const Server = struct {
             &pc.db
         else if (self.gdb != null) &self.gdb.? else null;
 
-        var ctx = tools.Context{
-            .allocator = self.allocator,
-            .engine = if (self.engine != null) &self.engine.? else null,
-            .gdb = gdb_ptr,
-            .project_path = self.project_path,
-            .index_dir = self.index_dir,
-            .store_root = self.store_root,
-            .transport = null,
-            .request_id = req.id,
-            .parser_pool = &self.parser_pool,
-        };
+        const cacheable = isCacheable(tool_name);
+        const cache_key: u64 = if (cacheable)
+            result_cache_mod.ResultCache.computeKey(tool_name, args, self.allocator)
+        else
+            0;
         var is_error = false;
-        tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
-            is_error = true;
-            body_buf.clearRetainingCapacity();
-            body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
-        };
+        const served_from_cache = cacheable and self.result_cache.getInto(cache_key, &body_buf);
+        if (!served_from_cache) {
+            var ctx = tools.Context{
+                .allocator = self.allocator,
+                .engine = if (self.engine != null) &self.engine.? else null,
+                .gdb = gdb_ptr,
+                .project_path = self.project_path,
+                .index_dir = self.index_dir,
+                .store_root = self.store_root,
+                .transport = null,
+                .request_id = req.id,
+                .parser_pool = &self.parser_pool,
+                .result_cache = &self.result_cache,
+            };
+            tools.dispatch(&ctx, tool_name, args, body_writer) catch |err| {
+                is_error = true;
+                body_buf.clearRetainingCapacity();
+                body_writer.print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
+            };
+            if (cacheable and !is_error) self.result_cache.put(cache_key, body_buf.items);
+        }
         try protocol.writeToolResultEnvelope(w, req.id, body_buf.items, is_error);
     }
 };
