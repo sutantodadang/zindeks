@@ -5,6 +5,7 @@ zig-out/
 .sisyphus/
 .claude/
 .cursor/
+.omo/
 
 # Exclude upstream CI/config from vendored dependencies
 vendor/**/.github/
