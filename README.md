@@ -5,7 +5,7 @@ let your AI agent query it over a long-lived MCP server — fast hybrid search, 
 graphs, architecture analysis, and one-call fused context. Single static binary
 (~3.4 MB), zero runtime dependencies.
 
-**Highlights:** 20+ languages (tree-sitter) · 23 MCP tools · BM25 + semantic + hybrid
+**Highlights:** 20+ languages (tree-sitter) · 27 MCP tools · BM25 + semantic + hybrid
 search (RRF) · call-graph tracing · Leiden community detection · incremental indexing ·
 6 cross-platform targets. AST symbol/edge extraction for 10 languages; BM25 keyword
 search for all.
@@ -168,6 +168,9 @@ Then drop to the narrower tools for surgical follow-ups:
 | File outline (symbols only) | `file_outline(path)` |
 | Architecture / hotspots | `get_architecture()` |
 | Custom relation | `query_graph("MATCH ...")` |
+| Persist & recall reasoning (thinking cache) | `save_reasoning(problem, reasoning)` / `recall_reasoning(problem)` — `get_context` auto-recalls prior reasoning |
+| Rank context by relevance | `score_relevance(working_set)` — returns other indexed files ranked 0..1; decide what to keep or drop |
+| Batch many read-only tools in one round-trip | `batch(calls)` — up to 32 calls; cuts latency and tokens |
 
 If a tool returns "No project loaded", call `index_repository` with the repo's absolute
 path (or run `zindeks index .`).
@@ -180,6 +183,8 @@ path (or run `zindeks index .`).
 zindeks index [repo] [--store-root dir] [--index-dir dir]      # index (incremental)
 zindeks search <query> [repo] [--store-root dir]               # BM25 keyword search
 zindeks serve [--http <port>] [--store-root dir]               # MCP JSON-RPC server
+                                                               # ZINDEKS_WATCH=1 enables auto-re-index on file change
+                                                               # ZINDEKS_WATCH_INTERVAL_MS sets poll interval (default 2000)
 zindeks install [--host <id,...>] [--scope user|project|both]  # wire into AI hosts
                 [--http <port>] [--service] [--yes] [--dry-run] [--list-hosts]
 zindeks install --uninstall-service
@@ -233,7 +238,9 @@ preserve precision.
 
 Files larger than 256 MB are skipped. Re-indexing is incremental: `detect_changes`
 compares file size/mtime against the `documents` table; only changed files are
-transactionally re-inserted. A `PollWatcher` can trigger automatic re-index.
+transactionally re-inserted. A `PollWatcher` can trigger automatic re-index — set
+`ZINDEKS_WATCH=1` before starting `zindeks serve` to enable it; tune the poll interval
+with `ZINDEKS_WATCH_INTERVAL_MS` (default `2000` ms).
 
 ### Search engine
 
@@ -269,7 +276,7 @@ Edge types: `CALLS`, `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`, `CONTAINS`,
 ## MCP server & tools
 
 `zindeks serve` is a JSON-RPC 2.0 server with MCP-compliant framing (Content-Length
-headers, initialize handshake, capability negotiation). 23 tools:
+headers, initialize handshake, capability negotiation). 27 tools:
 
 **Indexing & projects:** `index_repository`, `update_index`, `detect_changes`,
 `list_projects`, `delete_project`, `get_graph_schema`, `health_check`
@@ -282,6 +289,14 @@ headers, initialize handshake, capability negotiation). 23 tools:
 
 **Editing, records & config:** `rename_symbol`, `manage_adr`, `ingest_traces`, `config`
 
+**Agent memory & attention (new):** `save_reasoning`, `recall_reasoning`,
+`score_relevance`, `batch`
+
+- `save_reasoning(problem, reasoning, files?, confidence?)` — thinking cache: store compressed reasoning so it can be recalled later instead of re-derived.
+- `recall_reasoning(problem, limit?, min_confidence?, max_age_days?)` — retrieve semantically similar prior reasoning; returns matches with similarity score, confidence, and age — verify before trusting.
+- `score_relevance(working_set, query?, budget?)` — given the files/symbols the task is focused on, rank other indexed files by relevance (0..1). Use to decide what context to keep or drop.
+- `batch(calls)` — run up to 32 read-only tools in one request; returns `[{tool, result|error}]`. Mutating tools and nested batch are rejected.
+
 Example calls:
 
 ```json
@@ -291,6 +306,8 @@ Example calls:
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"trace_call_path","arguments":{"name":"main","direction":"outbound","max_depth":5}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query_graph","arguments":{"query":"MATCH (a)-[r:CALLS]->(b) RETURN a.name, b.name LIMIT 20"}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"detect_communities","arguments":{"action":"list","limit":20}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"recall_reasoning","arguments":{"problem":"how is the connection pool initialised","limit":3}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"batch","arguments":{"calls":[{"tool":"file_outline","args":{"path":"src/api/server.zig"}},{"tool":"get_code_snippet","args":{"name":"handleRequest"}},{"tool":"trace_call_path","args":{"name":"handleRequest","direction":"inbound"}}]}}}
 ```
 
 ### Architecture Decision Records
@@ -313,6 +330,37 @@ ADRs are queryable and version-tracked (`action: "list"` / `"get"`).
 
 Benchmarks: `zindeks bench cold-index .` (see `BENCHMARKS.md`) and
 `zindeks bench answer-quality` (see `ANSWER_QUALITY.md`).
+
+### Accuracy
+
+zindeks ships a CI-gated accuracy harness (`tests/accuracy_test.zig`, run on every
+`zig build test`, enforced by `.github/workflows/ci.yml` on push/PR to main). It
+asserts:
+
+- **Extraction recall** — symbol recall and CALLS-edge recall = 1.00 across all 10
+  AST-extraction languages (Zig, Python, JavaScript, TypeScript, TSX, Go, Rust, Java,
+  C, C++).
+- **Search ranking** — recall@1 = 1.00, recall@5 = 1.00, MRR = 1.00 via BM25
+  `Engine.search` over a multi-file fixture.
+- **Graph trace** — path-found and correct neighbor count.
+
+Accuracy regressions fail the build. See `ANSWER_QUALITY.md` for the full retrieval
+quality benchmark (zindeks vs grep).
+
+### Tuning (memory & concurrency)
+
+The `config` tool exposes knobs that take effect on the next `serve` restart or
+connection:
+
+| Key | Default | Description |
+|---|---|---|
+| `cache_size_kb` | `64000` | SQLite page cache per connection (KiB) — lower for tighter RAM |
+| `mmap_size_mb` | `256` | SQLite mmap per connection (MiB); `0` disables |
+| `pool_conns` | `4` | Read-only connection pool size for `serve` |
+| `worker_threads` | `4` | Worker threads for concurrent read-only dispatch |
+
+Existing tunable: `colors_enabled`, `max_results`, `default_repo`, `embedding_model`,
+`store_root`. Call `config` with no params to view current settings.
 
 ## License
 

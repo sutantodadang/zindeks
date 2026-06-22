@@ -13,6 +13,36 @@ zindeks bench answer-quality [corpus_path]
 
 ---
 
+## Extraction accuracy (CI-gated)
+
+zindeks ships `tests/accuracy_test.zig`, run on every `zig build test` and enforced by
+GitHub Actions CI (`.github/workflows/ci.yml`) on every push and PR to main. It
+complements the retrieval-quality benchmark below (which compares zindeks vs grep) by
+guarding the underlying extraction and search primitives against regression. Three
+groups with asserted thresholds:
+
+**GROUP A / A2 — Extraction recall** — symbol recall and CALLS-edge recall, measured
+per language across all 10 AST-extraction languages: Zig, Python, JavaScript,
+TypeScript, TSX, Go, Rust, Java, C, C++. Current measured scores: symbol_recall = 1.00
+and edge_recall = 1.00 for every language.
+
+One fixed bug worth noting: tree-sitter-zig parses a negated call such as
+`if (!validate(cfg))` as a `call_expression` whose `function` field is an
+`error_union_type` node (because `!T` is Zig error-union syntax). The Zig extractor now
+strips the leading `!` before recording the callee name, so negated calls still produce
+correct CALLS edges.
+
+**GROUP B — Search ranking** — recall@1 = 1.00, recall@5 = 1.00, MRR = 1.00, measured
+via the real BM25 `Engine.search` over a multi-file fixture.
+
+**GROUP C — Graph trace** — path-found and correct neighbor-count checks via
+`trace_call_path`.
+
+These thresholds are asserted in CI so accuracy regressions fail the build — speed and
+token-savings never come at the cost of correctness.
+
+---
+
 ## Methodology
 
 ### Corpus
