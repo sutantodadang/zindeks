@@ -41,7 +41,7 @@ pub const Descriptor = struct {
     inputSchema: []const u8, // JSON literal
 };
 
-/// All tools registered (v0.6.0 — 23 tools).
+/// All tools registered (v0.6.0 — 23 tools + batch).
 pub const ALL = [_]Descriptor{
     index_repository,
     update_index,
@@ -69,6 +69,33 @@ pub const ALL = [_]Descriptor{
     save_reasoning,
     recall_reasoning,
     config,
+    batch,
+};
+
+pub const batch = Descriptor{
+    .name = "batch",
+    .description = "Run multiple read-only tools in one request; returns an array of {tool,result|error}. Cuts round-trips. Mutating tools and nested batch are rejected.",
+    .inputSchema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "calls": {
+    \\      "type": "array",
+    \\      "description": "Read-only tool calls to run in one round-trip (max 32).",
+    \\      "items": {
+    \\        "type": "object",
+    \\        "properties": {
+    \\          "tool": { "type": "string", "description": "Read-only tool name" },
+    \\          "args": { "type": "object", "description": "Arguments for that tool" }
+    \\        },
+    \\        "required": ["tool"]
+    \\      }
+    \\    }
+    \\  },
+    \\  "required": ["calls"],
+    \\  "additionalProperties": false
+    \\}
+    ,
 };
 
 /// Apply detected file changes incrementally: updates the SQLite graph DB
@@ -556,7 +583,7 @@ pub const summarize_symbol = Descriptor{
 
 pub const config = Descriptor{
     .name = "config",
-    .description = "Get or set zindeks configuration. When called with no params, returns the current configuration. When any param is provided, updates those fields, persists to file, and returns the updated configuration.",
+    .description = "Get or set zindeks configuration. When called with no params, returns the current configuration. When any param is provided, updates those fields, persists to file, and returns the updated configuration. Memory/concurrency knobs (cache_size_kb, mmap_size_mb, pool_conns, worker_threads) take effect on the next serve restart / connection.",
     .inputSchema =
     \\{
     \\  "type": "object",
@@ -580,6 +607,22 @@ pub const config = Descriptor{
     \\    "store_root": {
     \\      "type": "string",
     \\      "description": "Custom index store root path"
+    \\    },
+    \\    "cache_size_kb": {
+    \\      "type": "string",
+    \\      "description": "SQLite page cache per connection, KiB (default 64000). Lower for tighter RAM."
+    \\    },
+    \\    "mmap_size_mb": {
+    \\      "type": "string",
+    \\      "description": "SQLite mmap size per connection, MiB; 0 disables (default 256)."
+    \\    },
+    \\    "pool_conns": {
+    \\      "type": "string",
+    \\      "description": "Read-only connection pool size for serve (default 4)."
+    \\    },
+    \\    "worker_threads": {
+    \\      "type": "string",
+    \\      "description": "Worker threads for concurrent read-only dispatch (default 4)."
     \\    }
     \\  },
     \\  "additionalProperties": false
@@ -789,6 +832,8 @@ pub fn dispatch(
         try handleSaveReasoning(ctx, params_obj, writer);
     } else if (std.mem.eql(u8, tool_name, "recall_reasoning")) {
         try handleRecallReasoning(ctx, params_obj, writer);
+    } else if (std.mem.eql(u8, tool_name, "batch")) {
+        try handleBatch(ctx, params_obj, writer);
     } else {
         // Propagate as an error so the caller emits an MCP-compliant
         // `result.isError: true` envelope.  Embedding the tool name as a
@@ -798,6 +843,98 @@ pub fn dispatch(
         try writer.writeAll("\"}");
         return error.UnknownTool;
     }
+}
+
+// ██████████████████████████████████████████████████████████████████████████
+// Tool: batch
+// ██████████████████████████████████████████████████████████████████████████
+
+const BATCH_MAX_CALLS = 32;
+
+/// Read-only tools permitted inside a batch.  Mutating tools (which need
+/// exclusive locks the batch wrapper does not hold) and `batch` itself are
+/// rejected.
+fn batchToolAllowed(name: []const u8) bool {
+    const allowed = [_][]const u8{
+        "search",          "search_graph",   "get_code_snippet",
+        "query_graph",     "trace_call_path", "get_architecture",
+        "get_context",     "summarize_symbol", "read_file",
+        "list_files",      "file_outline",    "health_check",
+        "get_graph_schema", "list_projects",  "detect_changes",
+        "score_relevance", "recall_reasoning",
+    };
+    for (allowed) |a| if (std.mem.eql(u8, name, a)) return true;
+    return false;
+}
+
+fn handleBatch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
+    const params = params_obj orelse {
+        try writer.writeAll("{\"error\":\"Missing params.calls\",\"code\":\"BAD_PARAMS\"}");
+        return;
+    };
+    const calls_val = params.get("calls") orelse {
+        try writer.writeAll("{\"error\":\"Missing params.calls\",\"code\":\"BAD_PARAMS\"}");
+        return;
+    };
+    if (calls_val != .array) {
+        try writer.writeAll("{\"error\":\"calls must be an array\",\"code\":\"BAD_PARAMS\"}");
+        return;
+    }
+    const calls = calls_val.array;
+    if (calls.items.len > BATCH_MAX_CALLS) {
+        try writer.writeAll("{\"error\":\"batch limited to 32 calls\",\"code\":\"BATCH_TOO_LARGE\"}");
+        return;
+    }
+
+    try writer.writeByte('[');
+    for (calls.items, 0..) |call, i| {
+        if (i > 0) try writer.writeByte(',');
+        // resolve tool name
+        const tool_name: []const u8 = if (call == .object) blk: {
+            if (call.object.get("tool")) |tv| {
+                if (tv == .string) break :blk tv.string;
+            }
+            break :blk "";
+        } else "";
+        if (tool_name.len == 0) {
+            try writer.writeAll("{\"error\":\"missing tool\",\"code\":\"BAD_CALL\"}");
+            continue;
+        }
+        // write per-entry header
+        try writer.writeAll("{\"tool\":\"");
+        try writeJsonStringContents(writer, tool_name);
+        try writer.writeAll("\",");
+        if (std.mem.eql(u8, tool_name, "batch") or !batchToolAllowed(tool_name)) {
+            try writer.writeAll("\"error\":\"tool not allowed in batch\",\"code\":\"BATCH_FORBIDDEN\"}");
+            continue;
+        }
+        // sub-args (optional object)
+        const sub_args: ?std.json.ObjectMap = if (call.object.get("args")) |av|
+            (if (av == .object) av.object else null)
+        else
+            null;
+        // run into a private buffer so a sub-failure does not corrupt output
+        var sub_buf = std.ArrayList(u8){};
+        defer sub_buf.deinit(ctx.allocator);
+        const sub_writer = sub_buf.writer(ctx.allocator);
+        const sub_err: anyerror!void = dispatch(ctx, tool_name, sub_args, sub_writer);
+        if (sub_err) |_| {
+            try writer.writeAll("\"result\":");
+            try writer.writeAll(sub_buf.items);
+            try writer.writeByte('}');
+        } else |err| {
+            try writer.writeAll("\"error\":\"");
+            try writeJsonStringContents(writer, @errorName(err));
+            try writer.writeAll("\",\"code\":\"SUBCALL_FAILED\"}");
+        }
+    }
+    try writer.writeByte(']');
+}
+
+/// Emit the standard "no project loaded" MCP error envelope with a stable
+/// machine-readable code so agents can branch without string-matching.
+fn writeNoProjectError(writer: anytype) !void {
+    try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\",\"code\":\"NO_PROJECT\"}");
 }
 
 /// Like `protocol.writeJsonString` but emits the *escaped contents* only —
@@ -854,9 +991,15 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
                 try writer.print("{{\"error\":\"applyChangesWithOverlay failed: {s}\"}}", .{@errorName(err)});
                 return;
             };
-            try writer.print(
-                \\{{"project":"{s}","mode":"incremental","added":{},"modified":{},"deleted":{},"symbols_added":{},"edges_added":{},"errors":{},"duration_ms":{}}}
-            , .{ project_path, stats.added, stats.modified, stats.deleted, stats.symbols_added, stats.edges_added, stats.errors, stats.duration_ms });
+            if (stats.errors > 0) {
+                try writer.print(
+                    \\{{"project":"{s}","mode":"incremental","added":{},"modified":{},"deleted":{},"symbols_added":{},"edges_added":{},"errors":{},"error_breakdown":{{"unknown_lang":{},"no_extractor":{},"read_failed":{},"stat_failed":{},"extract_failed":{}}},"duration_ms":{}}}
+                , .{ project_path, stats.added, stats.modified, stats.deleted, stats.symbols_added, stats.edges_added, stats.errors, stats.err_unknown_lang, stats.err_no_extractor, stats.err_read_failed, stats.err_stat_failed, stats.err_extract_failed, stats.duration_ms });
+            } else {
+                try writer.print(
+                    \\{{"project":"{s}","mode":"incremental","added":{},"modified":{},"deleted":{},"symbols_added":{},"edges_added":{},"errors":{},"duration_ms":{}}}
+                , .{ project_path, stats.added, stats.modified, stats.deleted, stats.symbols_added, stats.edges_added, stats.errors, stats.duration_ms });
+            }
             rl.deinit();
             return;
         }
@@ -894,9 +1037,15 @@ fn handleIndexRepository(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
         std.log.warn("ANN build skipped: {s}", .{@errorName(err)});
     };
 
-    try writer.print(
-        \\{{"project":"{s}","mode":"full","files_indexed":{},"symbols":{},"edges":{},"pipeline_ms":{}}}
-    , .{ project_dir, pipe_result.files_scanned, pipe_result.symbols_extracted, pipe_result.edges_extracted, pipe_result.duration_ms });
+    if (pipe_result.files_with_errors > 0) {
+        try writer.print(
+            \\{{"project":"{s}","mode":"full","files_indexed":{},"symbols":{},"edges":{},"errors":{},"error_breakdown":{{"extract_failed":{}}},"pipeline_ms":{}}}
+        , .{ project_dir, pipe_result.files_scanned, pipe_result.symbols_extracted, pipe_result.edges_extracted, pipe_result.files_with_errors, pipe_result.err_extract_failed, pipe_result.duration_ms });
+    } else {
+        try writer.print(
+            \\{{"project":"{s}","mode":"full","files_indexed":{},"symbols":{},"edges":{},"pipeline_ms":{}}}
+        , .{ project_dir, pipe_result.files_scanned, pipe_result.symbols_extracted, pipe_result.edges_extracted, pipe_result.duration_ms });
+    }
 }
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -978,7 +1127,7 @@ fn handleSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype)
 
 fn handleSearchCode(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1020,7 +1169,7 @@ fn handleSearchCode(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
     for (results.items, 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.print(
-            \\{{"path":{f},"score":{f},"snippet":{f}}}
+            \\{{"p":{f},"s":{f},"x":{f}}}
         , .{
             std.json.fmt(item.path, .{}),
             std.json.fmt(item.score, .{}),
@@ -1065,7 +1214,7 @@ fn emitSearchStream(ctx: *Context, query: []const u8, items: []const search_engi
         for (items[i..end], 0..) |item, j| {
             if (j > 0) try w.writeByte(',');
             try w.print(
-                \\{{"path":{f},"score":{f},"snippet":{f}}}
+                \\{{"p":{f},"s":{f},"x":{f}}}
             , .{
                 std.json.fmt(item.path, .{}),
                 std.json.fmt(item.score, .{}),
@@ -1097,7 +1246,7 @@ fn handleGetGraphSchema(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
     _ = params_obj;
 
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1131,7 +1280,7 @@ fn handleGetGraphSchema(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 
 fn handleSearchGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1191,7 +1340,7 @@ fn handleSearchGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
         if (!first) try writer.writeByte(',');
         first = false;
         try writer.print(
-            \\{{"id":{},"name":{f},"kind":{f},"line_start":{},"line_end":{},"col_start":{},"col_end":{},"path":{f},"out_degree":{},"in_degree":{}}}
+            \\{{"id":{},"n":{f},"k":{f},"l":{},"e":{},"cs":{},"ce":{},"p":{f},"out_degree":{},"in_degree":{}}}
         , .{
             try stmt.columnInt(0),
             std.json.fmt(try stmt.columnText(1), .{}),
@@ -1214,7 +1363,7 @@ fn handleSearchGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
 
 fn handleGetCodeSnippet(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1328,7 +1477,7 @@ fn handleGetCodeSnippet(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 
 fn handleQueryGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1433,12 +1582,12 @@ fn handleQueryGraph(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
 
 fn handleDetectChanges(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
     const project_path = ctx.project_path orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1486,11 +1635,11 @@ fn handleDetectChanges(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 fn handleUpdateIndex(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     _ = params_obj;
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
     const project_path = ctx.project_path orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
     const index_dir = ctx.index_dir orelse {
@@ -1537,7 +1686,7 @@ fn handleIndexStatus(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     _ = params_obj;
 
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1581,7 +1730,7 @@ fn handleHealthCheck(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     _ = params_obj;
 
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1680,7 +1829,7 @@ fn handleDeleteProject(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 
 fn handleTraceCallPath(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
     const params = params_obj orelse {
@@ -1771,7 +1920,7 @@ fn handleTraceCallPath(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 
 fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1863,7 +2012,7 @@ fn handleGetArchitecture(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 
 fn handleManageAdr(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -1954,7 +2103,7 @@ fn handleManageAdr(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyty
 
 fn handleSaveReasoning(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2049,7 +2198,7 @@ fn handleSaveReasoning(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: a
 
 fn handleRecallReasoning(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2120,7 +2269,7 @@ fn handleRecallReasoning(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 
 fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2184,7 +2333,7 @@ fn handleDetectCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, write
 
 fn handleListCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2245,7 +2394,7 @@ fn handleListCommunities(ctx: *Context, params_obj: ?std.json.ObjectMap, writer:
 
 fn handleGetSymbolCommunity(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2312,7 +2461,7 @@ fn isCypherQuery(query: []const u8) bool {
 
 fn handleRenameSymbol(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2479,7 +2628,7 @@ fn replaceWord(allocator: std.mem.Allocator, haystack: []const u8, old_word: []c
 
 fn handleIngestTraces(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2515,7 +2664,7 @@ fn handleIngestTraces(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
 
 fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2549,7 +2698,7 @@ fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
     for (results.items, 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.print(
-            \\{{"document_path":{f},"score":{f},"doc_id":{}}}
+            \\{{"p":{f},"s":{f},"doc_id":{}}}
         , .{
             std.json.fmt(item.document_path, .{}),
             std.json.fmt(item.score, .{}),
@@ -2565,7 +2714,7 @@ fn handleSemanticSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 
 fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
     const gdb = ctx.gdb orelse {
@@ -2595,7 +2744,7 @@ fn handleHybridSearch(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: an
     for (results.items, 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.print(
-            \\{{"doc_id":{},"path":{f},"bm25_score":{f},"semantic_score":{f},"fused_score":{f},"snippet":{f}}}
+            \\{{"doc_id":{},"p":{f},"bm25_score":{f},"semantic_score":{f},"fused_score":{f},"x":{f}}}
         , .{
             item.doc_id,
             std.json.fmt(item.path, .{}),
@@ -2634,7 +2783,7 @@ fn resolveTopSymbol(allocator: std.mem.Allocator, gdb: *graph_db.GraphDb, path: 
 
 fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
     const gdb = ctx.gdb orelse {
@@ -2848,7 +2997,7 @@ fn handleGetContext(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyt
 
 fn handleScoreRelevance(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const engine = ctx.engine orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -2918,7 +3067,7 @@ fn handleScoreRelevance(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: 
 
 fn handleSummarizeSymbol(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first (call list_projects to see already-indexed repos).\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -3090,7 +3239,11 @@ fn handleConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype)
         p.get("default_repo") != null or
         p.get("embedding_model") != null or
         p.get("colors_enabled") != null or
-        p.get("max_results") != null
+        p.get("max_results") != null or
+        p.get("cache_size_kb") != null or
+        p.get("mmap_size_mb") != null or
+        p.get("pool_conns") != null or
+        p.get("worker_threads") != null
     else
         false;
 
@@ -3125,6 +3278,19 @@ fn handleConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype)
         if (getString(params, "max_results")) |v| {
             cfg.max_results = std.fmt.parseUnsigned(u32, v, 10) catch cfg.max_results;
         }
+        // Memory/concurrency tuning (applied on next serve restart / connection open).
+        if (getString(params, "cache_size_kb")) |v| {
+            cfg.cache_size_kb = std.fmt.parseUnsigned(u32, v, 10) catch cfg.cache_size_kb;
+        }
+        if (getString(params, "mmap_size_mb")) |v| {
+            cfg.mmap_size_mb = std.fmt.parseUnsigned(u32, v, 10) catch cfg.mmap_size_mb;
+        }
+        if (getString(params, "pool_conns")) |v| {
+            cfg.pool_conns = std.fmt.parseUnsigned(u32, v, 10) catch cfg.pool_conns;
+        }
+        if (getString(params, "worker_threads")) |v| {
+            cfg.worker_threads = std.fmt.parseUnsigned(u32, v, 10) catch cfg.worker_threads;
+        }
         // Persist
         cfg.save(config_path) catch {
             try writer.writeAll("{\"error\":\"Failed to save config\"}");
@@ -3137,7 +3303,7 @@ fn handleConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype)
     const index_dir_str = cfg.index_dir orelse "null";
 
     try writer.print(
-        \\{{"store_root":"{s}","index_dir":"{s}","default_repo":"{s}","colors_enabled":{},"max_results":{},"embedding_model":"{s}","config_path":"{s}"}}
+        \\{{"store_root":"{s}","index_dir":"{s}","default_repo":"{s}","colors_enabled":{},"max_results":{},"embedding_model":"{s}","cache_size_kb":{},"mmap_size_mb":{},"pool_conns":{},"worker_threads":{},"config_path":"{s}"}}
     , .{
         store_root_str,
         index_dir_str,
@@ -3145,6 +3311,10 @@ fn handleConfig(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype)
         cfg.colors_enabled,
         cfg.max_results,
         cfg.embedding_model,
+        cfg.cache_size_kb,
+        cfg.mmap_size_mb,
+        cfg.pool_conns,
+        cfg.worker_threads,
         config_path,
     });
 }
@@ -3370,7 +3540,7 @@ fn normSep(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn handleReadFile(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const project_path = ctx.project_path orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first.\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -3441,7 +3611,7 @@ fn handleReadFile(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytyp
 
 fn handleListFiles(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first.\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -3530,7 +3700,7 @@ fn handleListFiles(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anyty
 
 fn handleFileOutline(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: anytype) !void {
     const gdb = ctx.gdb orelse {
-        try writer.writeAll("{\"error\":\"No project loaded. Run index_repository with an absolute repo path first.\"}");
+        try writeNoProjectError(writer);
         return;
     };
 
@@ -3660,7 +3830,7 @@ fn handleFileOutline(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     for (symbols.items, 0..) |s, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.print(
-            \\{{"name":{f},"kind":{f},"line":{d},"end":{d}}}
+            \\{{"n":{f},"k":{f},"l":{d},"e":{d}}}
         , .{
             std.json.fmt(s.name, .{}),
             std.json.fmt(s.kind, .{}),

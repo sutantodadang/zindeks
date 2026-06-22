@@ -3,7 +3,11 @@ const std = @import("std");
 /// Session-scoped memoization of read-only MCP tool result bodies.
 /// Bounded FIFO; concurrency-safe (all ops take the internal mutex).
 pub const ResultCache = struct {
-    pub const MAX_ENTRIES: usize = 64;
+    // ponytail: flat cap, not config-driven — bump the constant if a session
+    // needs more. 256 small JSON bodies is cheap and covers far more distinct
+    // read queries per session than the old 64. Make it configurable only if
+    // measured hit-rate (see health_check) shows churn at this size.
+    pub const MAX_ENTRIES: usize = 256;
 
     const Entry = struct { key: u64, body: []u8 };
 

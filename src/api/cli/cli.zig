@@ -43,9 +43,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const global = try parseGlobalArgs(args);
     defer allocator.free(global.config_path);
 
-    // Load config
+    // Load config. Ownership transfers to `state` below; `defer state.deinit()`
+    // frees it on every return path. No separate errdefer here — that would
+    // double-free the shared pointers (state.cfg is a shallow copy).
     var cfg = try loadConfig(allocator, global.config_path);
-    errdefer cfg.deinit(allocator);
 
     // Merge CLI flags into config
     if (global.no_color) cfg.colors_enabled = false;
@@ -278,7 +279,7 @@ fn runIndex(state: *CliState, args: []const []const u8) !void {
     // the MCP `index_repository` runs.  Without this, `index` would build only
     // the BM25 search index and leave the graph empty (search_graph,
     // trace_call_path, get_architecture, file_outline would all return nothing).
-    runGraphPipeline(state.allocator, parsed.repo, location.index_dir) catch |err| {
+    const pstats = runGraphPipeline(state.allocator, parsed.repo, location.index_dir) catch |err| {
         spin.done(false);
         return err;
     };
@@ -287,13 +288,22 @@ fn runIndex(state: *CliState, args: []const []const u8) !void {
 
     try location.commit();
 
-    try sw.print("{s}Done.{s}\n", .{ sw.green(), sw.reset() });
+    try sw.print(
+        "{s}Done.{s} files={d} symbols+{d} edges+{d} ({d} ms)\n",
+        .{ sw.green(), sw.reset(), pstats.files_scanned, pstats.symbols_extracted, pstats.edges_extracted, pstats.duration_ms },
+    );
+    if (pstats.files_with_errors > 0) {
+        try sw.print(
+            "  {s}errors: {d} (extract_failed: {d}){s}\n",
+            .{ sw.dim(), pstats.files_with_errors, pstats.err_extract_failed, sw.reset() },
+        );
+    }
 }
 
 /// Run the tree-sitter symbol/edge extraction pipeline against the freshly
 /// built index segment.  Mirrors the full-build path of the MCP
 /// `index_repository` handler so CLI `index` produces a complete graph.
-fn runGraphPipeline(allocator: std.mem.Allocator, repo: []const u8, index_dir: []const u8) !void {
+fn runGraphPipeline(allocator: std.mem.Allocator, repo: []const u8, index_dir: []const u8) !pipeline_mod.PipelineResult {
     var project_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_dir = try std.fs.cwd().realpath(repo, &project_dir_buf);
     var index_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -309,10 +319,11 @@ fn runGraphPipeline(allocator: std.mem.Allocator, repo: []const u8, index_dir: [
     defer gdb.close();
 
     var pipe = pipeline_mod.Pipeline.init(allocator, gdb, project_dir);
-    _ = try pipe.run();
+    const result = try pipe.run();
 
     // Build ANN index from the freshly-written embeddings. Non-fatal.
     semantic.buildAndSaveAnn(&gdb, abs_index_dir, allocator) catch {};
+    return result;
 }
 
 // ── Subcommand: reindex ───────────────────────────────────────────────
@@ -378,6 +389,12 @@ fn runReindex(state: *CliState, args: []const []const u8) !void {
         "{s}Done.{s} symbols+{d} edges+{d} overlay_docs={d} tombstoned={d} ({d} ms)\n",
         .{ sw.green(), sw.reset(), stats.symbols_added, stats.edges_added, stats.overlay_docs, stats.overlay_tombstoned, stats.duration_ms },
     );
+    if (stats.errors > 0) {
+        try sw.print(
+            "  errors: {d} (unknown_lang: {d}, no_extractor: {d}, read_failed: {d}, stat_failed: {d}, extract_failed: {d})\n",
+            .{ stats.errors, stats.err_unknown_lang, stats.err_no_extractor, stats.err_read_failed, stats.err_stat_failed, stats.err_extract_failed },
+        );
+    }
 }
 
 // ── Subcommand: search ────────────────────────────────────────────────

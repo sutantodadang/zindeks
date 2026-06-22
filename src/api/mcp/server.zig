@@ -18,6 +18,7 @@ const incremental = @import("../../core/indexer/incremental.zig");
 const ParserPool = incremental.ParserPool;
 const hnsw = @import("../../core/search/hnsw.zig");
 const semantic = @import("../../core/search/semantic.zig");
+const watcher_mod = @import("../../project/watcher.zig");
 
 const ServerInfo = struct {
     name: []const u8 = "zindeks",
@@ -92,6 +93,10 @@ fn lockMode(name: []const u8) LockMode {
     if (std.mem.eql(u8, name, "save_reasoning")) {
         return .{ .gdb = .exclusive };
     }
+    // ── batch: read-only fan-out; holds same locks as its sub-tools ─────
+    if (std.mem.eql(u8, name, "batch")) {
+        return .{ .overlay = .shared, .gdb = .shared };
+    }
     // ── search: keyword/semantic (overlay reader), hybrid (overlay+gdb) ──
     if (std.mem.eql(u8, name, "search")) {
         // Hybrid needs both; keyword/semantic only need overlay.
@@ -126,6 +131,7 @@ fn isCacheable(name: []const u8) bool {
     if (isMutatingTool(name)) return false;
     if (std.mem.eql(u8, name, "health_check")) return false;
     if (std.mem.eql(u8, name, "config")) return false;
+    if (std.mem.eql(u8, name, "batch")) return false;
     return true;
 }
 
@@ -193,6 +199,10 @@ pub const Server = struct {
     /// Invalidated on any mutating tool call.
     result_cache: result_cache_mod.ResultCache,
 
+    /// Optional background file watcher; non-null only when ZINDEKS_WATCH is
+    /// set and a project is attached. Auto-applies incremental updates.
+    watcher: ?*watcher_mod.PollWatcher = null,
+
     /// Long-lived parser pool — reuses TSParser instances across incremental
     /// index updates so we avoid alloc/free of TSParser + grammar binding per
     /// file.  Created in init, destroyed in deinit.
@@ -235,10 +245,14 @@ pub const Server = struct {
             .response_buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
             .result_cache = result_cache_mod.ResultCache.init(allocator),
             .parser_pool = ParserPool.init(allocator),
+            .watcher = null,
         };
     }
 
     pub fn deinit(self: *Server) void {
+        // Stop the file watcher first — it holds a reference to gdb/project_path
+        // and its thread must be joined before those resources are freed.
+        self.stopWatcher();
         // Drain any in-flight workers before closing shared resources.
         self.waitForInflight();
         if (self.thread_pool_initialized) {
@@ -626,8 +640,10 @@ pub const Server = struct {
         defer body_buf.deinit(self.allocator);
         const body_writer = body_buf.writer(self.allocator);
 
+        var call_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer call_arena.deinit();
         var ctx = tools.Context{
-            .allocator = self.allocator,
+            .allocator = call_arena.allocator(),
             .engine = if (self.engine != null) &self.engine.? else null,
             .gdb = if (self.gdb != null) &self.gdb.? else null,
             .project_path = self.project_path,
@@ -705,8 +721,10 @@ pub const Server = struct {
         var is_error = false;
         const served_from_cache = cacheable and self.result_cache.getInto(cache_key, &body_buf);
         if (!served_from_cache) {
+            var call_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer call_arena.deinit();
             var ctx = tools.Context{
-                .allocator = self.allocator,
+                .allocator = call_arena.allocator(),
                 .engine = if (self.engine != null) &self.engine.? else null,
                 .gdb = gdb_ptr,
                 .project_path = self.project_path,
@@ -823,6 +841,10 @@ pub const Server = struct {
     /// the auto-detect path on `initialize`.  Tears down any currently
     /// loaded project, opens the new one, and primes the engine + overlay.
     fn openProjectByPath(self: *Server, path: []const u8) !void {
+        // Stop the watcher first — it references the old gdb/project_path and
+        // its thread must be joined before those resources are torn down.
+        self.stopWatcher();
+
         var loc = project_store.resolveRead(self.allocator, path, .{ .store_root = self.store_root }) catch {
             return;
         };
@@ -908,6 +930,10 @@ pub const Server = struct {
             self.ann = loaded;
             self.engine.?.useAnn(&self.ann.?);
         }
+
+        // Start the background file watcher if ZINDEKS_WATCH is set.
+        // Called after full attach so all resources are stable.
+        self.startWatcherIfEnabled();
     }
 
     /// Re-open the on-disk overlay (after `update_index` rewrites it) and
@@ -933,6 +959,96 @@ pub const Server = struct {
             self.ann = loaded;
             if (self.engine) |*e| e.useAnn(&self.ann.?);
         }
+    }
+
+    // ██████████████████████████████████████████████████████████████████████
+    // File-watcher driven auto-refresh (E1)
+    // ██████████████████████████████████████████████████████████████████████
+
+    /// Apply an incremental index refresh triggered by the file watcher.
+    /// Runs on the watcher thread. Acquires sub-locks in the documented order
+    /// (meta -> overlay -> gdb) so it never deadlocks against request handlers.
+    fn refreshIndexLocked(self: *Server) void {
+        // Non-blocking acquisition is mandatory: the watcher thread must never
+        // block on a project lock. A concurrent index_repository joins this
+        // thread (via stopWatcher in openProjectByPath) WHILE holding these
+        // locks exclusively — a blocking acquire here would deadlock the join.
+        // On contention we skip; the next poll tick retries. Exclusive locks
+        // also exclude in-flight readers, so no waitForInflight is needed.
+        if (!self.meta_lock.tryLock()) return;
+        defer self.meta_lock.unlock();
+        if (!self.overlay_rwlock.tryLock()) return;
+        defer self.overlay_rwlock.unlock();
+        if (!self.gdb_rwlock.tryLock()) return;
+        defer self.gdb_rwlock.unlock();
+
+        if (self.gdb == null) return;
+
+        var body_buf = std.ArrayList(u8).initCapacity(self.allocator, 1024) catch return;
+        defer body_buf.deinit(self.allocator);
+        const body_writer = body_buf.writer(self.allocator);
+
+        var call_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer call_arena.deinit();
+        var ctx = tools.Context{
+            .allocator = call_arena.allocator(),
+            .engine = if (self.engine != null) &self.engine.? else null,
+            .gdb = if (self.gdb != null) &self.gdb.? else null,
+            .project_path = self.project_path,
+            .index_dir = self.index_dir,
+            .store_root = self.store_root,
+            .transport = &self.transport,
+            .request_id = null,
+            .parser_pool = &self.parser_pool,
+            .result_cache = &self.result_cache,
+        };
+        tools.dispatch(&ctx, "update_index", null, body_writer) catch |err| {
+            std.log.err("watcher refresh failed: {s}", .{@errorName(err)});
+            return;
+        };
+        self.reattachOverlayLocked() catch |err| {
+            std.log.err("watcher overlay reattach failed: {s}", .{@errorName(err)});
+        };
+        self.result_cache.clear();
+    }
+
+    fn watcherCallback(ctx: ?*anyopaque, events: []const watcher_mod.Event) void {
+        _ = events; // refresh re-detects the full delta itself
+        const self: *Server = @ptrCast(@alignCast(ctx orelse return));
+        self.refreshIndexLocked();
+    }
+
+    fn stopWatcher(self: *Server) void {
+        if (self.watcher) |w| {
+            w.deinit(); // stops thread + frees its owned project_path copy
+            self.allocator.destroy(w);
+            self.watcher = null;
+        }
+    }
+
+    /// Start the background watcher if ZINDEKS_WATCH is set and a project is
+    /// loaded. Idempotent: stops any existing watcher first.
+    fn startWatcherIfEnabled(self: *Server) void {
+        self.stopWatcher();
+        const enabled = envOwnedNonEmpty(self.allocator, "ZINDEKS_WATCH") orelse return;
+        // envOwnedNonEmpty returns an owned slice — free it after use.
+        self.allocator.free(enabled);
+        const pp = self.project_path orelse return;
+        if (self.gdb == null) return;
+        var interval_ms: u32 = 2000;
+        if (envOwnedNonEmpty(self.allocator, "ZINDEKS_WATCH_INTERVAL_MS")) |iv| {
+            defer self.allocator.free(iv);
+            interval_ms = std.fmt.parseInt(u32, iv, 10) catch 2000;
+        }
+        const w = self.allocator.create(watcher_mod.PollWatcher) catch return;
+        w.* = watcher_mod.PollWatcher.init(self.allocator, &self.gdb.?, pp, interval_ms, watcherCallback, self);
+        w.start() catch {
+            w.deinit();
+            self.allocator.destroy(w);
+            return;
+        };
+        self.watcher = w;
+        std.log.info("file watcher enabled (interval {d}ms)", .{interval_ms});
     }
 
     fn respondError(self: *Server, id: ?std.json.Value, code: protocol.ErrorCode) !void {
@@ -1082,8 +1198,10 @@ pub const Server = struct {
                 .exclusive => self.gdb_rwlock.unlock(),
             };
 
+            var call_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer call_arena.deinit();
             var ctx = tools.Context{
-                .allocator = self.allocator,
+                .allocator = call_arena.allocator(),
                 .engine = if (self.engine != null) &self.engine.? else null,
                 .gdb = if (self.gdb != null) &self.gdb.? else null,
                 .project_path = self.project_path,
@@ -1136,8 +1254,10 @@ pub const Server = struct {
         var is_error = false;
         const served_from_cache = cacheable and self.result_cache.getInto(cache_key, &body_buf);
         if (!served_from_cache) {
+            var call_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer call_arena.deinit();
             var ctx = tools.Context{
-                .allocator = self.allocator,
+                .allocator = call_arena.allocator(),
                 .engine = if (self.engine != null) &self.engine.? else null,
                 .gdb = gdb_ptr,
                 .project_path = self.project_path,

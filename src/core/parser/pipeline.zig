@@ -33,6 +33,7 @@ pub const PipelineResult = struct {
     files_with_errors: u32,
     files_skipped: u32,
     duration_ms: u64,
+    err_extract_failed: u32,
 };
 
 // ██████████████████████████████████████████████████████████████████████████
@@ -80,6 +81,7 @@ pub const Pipeline = struct {
             .files_with_errors = 0,
             .files_skipped = 0,
             .duration_ms = 0,
+            .err_extract_failed = 0,
         };
 
         // ── Scan files ───────────────────────────────────────────────
@@ -129,6 +131,7 @@ pub const Pipeline = struct {
 
             const extraction = ext_ptr.extract(self.allocator, entry.content, lang_id) catch {
                 result.files_with_errors += 1;
+                result.err_extract_failed += 1;
                 continue;
             };
 

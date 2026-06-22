@@ -60,6 +60,12 @@ pub const UpdateStats = struct {
     symbols_added: u32 = 0,
     edges_added: u32 = 0,
     errors: u32 = 0,
+    // Per-reason error breakdown (sum == errors)
+    err_unknown_lang: u32 = 0,
+    err_no_extractor: u32 = 0,
+    err_read_failed: u32 = 0,
+    err_stat_failed: u32 = 0,
+    err_extract_failed: u32 = 0,
     duration_ms: u64 = 0,
     /// Stats from the optional BM25 overlay rebuild that runs after the
     /// graph-DB transaction commits.  Zeroed when `applyChangesWithOverlay`
@@ -276,17 +282,20 @@ pub fn applyChanges(
         const ext = std.fs.path.extension(rel_path);
         const lang_id = ts.LanguageId.fromExtension(ext) orelse {
             stats.errors += 1;
+            stats.err_unknown_lang += 1;
             continue;
         };
 
         const extractor = reg.get(lang_id) orelse {
             stats.errors += 1;
+            stats.err_no_extractor += 1;
             continue;
         };
 
         // Read file content
         const content = std.fs.cwd().readFileAlloc(allocator, full_path, 16 * 1024 * 1024) catch {
             stats.errors += 1;
+            stats.err_read_failed += 1;
             continue;
         };
         defer allocator.free(content);
@@ -295,6 +304,7 @@ pub fn applyChanges(
         const hash = std.hash.Wyhash.hash(0, content);
         const stat = std.fs.cwd().statFile(full_path) catch {
             stats.errors += 1;
+            stats.err_stat_failed += 1;
             continue;
         };
 
@@ -303,11 +313,13 @@ pub fn applyChanges(
         const extraction = if (pool != null and lang_id == .zig)
             zig_extractor.extractWithPool(allocator, content, lang_id, pool) catch {
                 stats.errors += 1;
+                stats.err_extract_failed += 1;
                 continue;
             }
         else
             extractor.extract(allocator, content, lang_id) catch {
                 stats.errors += 1;
+                stats.err_extract_failed += 1;
                 continue;
             };
 

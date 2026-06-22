@@ -306,10 +306,17 @@ pub fn extractWithPool(
         // Skip builtin calls like @import, @intCast etc.
         if (raw_called[0] == '@') continue;
 
+        // tree-sitter-zig misparses `!callee(args)` as a call_expression whose
+        // `function` field is an `error_union_type` (text `!callee`), because
+        // `!T` is Zig error-union syntax. Strip leading `!` so negated calls
+        // (`if (!validate(x))`) still produce CALLS edges.
+        const unwrapped = std.mem.trimLeft(u8, raw_called, "! \t");
+        if (unwrapped.len == 0) continue;
+
         // Strip dotted/scoped qualifiers: `pay.chargeCard` → `chargeCard`,
         // `self.foo` → `foo`, `std.debug.print` → `print`.
         // Mirrors generic_extractor's lastSegment helper.
-        const called_name = lastSegment(raw_called);
+        const called_name = lastSegment(unwrapped);
         if (called_name.len == 0) continue;
         // After stripping, skip if it still starts with a non-identifier char
         if (!isIdentStart(called_name[0])) continue;

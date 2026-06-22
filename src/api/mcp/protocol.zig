@@ -534,6 +534,8 @@ pub fn writeInitializeResult(writer: anytype, id: ?std.json.Value, name: []const
     try writeInitializeResultV(writer, id, name, version, DEFAULT_PROTOCOL_VERSION);
 }
 
+const INIT_INSTRUCTIONS = "zindeks code knowledge graph. Call index_repository with an absolute repo path to bind a project; already-indexed repos auto-attach (list_projects shows them). If any tool returns code NO_PROJECT, call index_repository first. Prefer get_context for task-scoped context, search for lookup, trace_call_path for callers/callees, and read_file/list_files/file_outline over raw filesystem access. Compact row keys in search/search_graph/file_outline results: p=path, f=file, n=name, k=kind, l=line, e=line_end, s=score, x=snippet, cs=col_start, ce=col_end.";
+
 pub fn writeInitializeResultV(writer: anytype, id: ?std.json.Value, name: []const u8, version: []const u8, protocol_version: []const u8) !void {
     try writer.writeAll("{\"jsonrpc\":\"2.0\"");
     try writeId(writer, id);
@@ -543,7 +545,9 @@ pub fn writeInitializeResultV(writer: anytype, id: ?std.json.Value, name: []cons
     try writeJsonString(writer, name);
     try writer.writeAll(",\"version\":");
     try writeJsonString(writer, version);
-    try writer.writeAll("}}}");
+    try writer.writeAll("},\"instructions\":");
+    try writeJsonString(writer, INIT_INSTRUCTIONS);
+    try writer.writeAll("}}");
 }
 
 pub fn writeToolsList(writer: anytype, id: ?std.json.Value, tools_json: []const u8) !void {

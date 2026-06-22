@@ -1,13 +1,24 @@
 //! Smart context window management — token budget estimation and
 //! section prioritisation for AI prompt assembly.
 //!
-//! Estimates tokens as ceil(chars / 4), a rough approximation
-//! sufficient for budget enforcement without a real tokeniser.
+//! Estimates tokens with a cheap BPE proxy: word runs split into
+//! ~CHARS_PER_TOKEN-sized subword pieces, plus one piece per visible
+//! punctuation byte. This tracks real tokenisers on code (which is denser
+//! than prose) far better than a flat chars/4 and is biased to slightly
+//! overestimate, so budget enforcement never silently overflows.
 
 const std = @import("std");
 
-/// Rough token estimation: characters / CHARS_PER_TOKEN.
+/// Subword piece size for the BPE-proxy estimate; also the truncation
+/// chars-per-token factor used by prioritizeSections.
 pub const CHARS_PER_TOKEN: usize = 4;
+
+/// A byte that belongs inside a word run (identifier/number/UTF-8). Anything
+/// else is treated as a standalone punctuation piece or free whitespace.
+fn isWordByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_' or c >= 0x80;
+}
 
 /// Token budget with reserved overhead (system prompt, etc.).
 pub const TokenBudget = struct {
@@ -32,16 +43,26 @@ pub const TokenBudget = struct {
     }
 };
 
-/// Estimate token count from a UTF-8 string.
+/// Estimate token count for a UTF-8 string with a BPE proxy: each word run
+/// contributes ceil(len / CHARS_PER_TOKEN) subword pieces and each visible
+/// non-word byte counts as one piece (whitespace is free). Biased to slightly
+/// overestimate so budgets are never exceeded in practice.
 pub fn estimateTokens(text: []const u8) usize {
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        i += len;
-        count += 1;
+    var total: usize = 0;
+    var word_len: usize = 0;
+    for (text) |c| {
+        if (isWordByte(c)) {
+            word_len += 1;
+        } else {
+            if (word_len > 0) {
+                total += (word_len + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN;
+                word_len = 0;
+            }
+            if (c > ' ') total += 1;
+        }
     }
-    return (count + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN;
+    if (word_len > 0) total += (word_len + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN;
+    return total;
 }
 
 /// Context section used by the context assembler.
