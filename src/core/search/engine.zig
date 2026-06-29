@@ -49,6 +49,11 @@ pub const Result = struct {
     snippet: []const u8,
 };
 
+/// Sentinel `doc_id` for hybrid results that exist only in the semantic
+/// id-space (a pure-semantic hit with no BM25 segment id). Never used as an
+/// index into any segment — only surfaced in output.
+pub const NO_DOC_ID: u32 = std.math.maxInt(u32);
+
 pub const SearchResults = struct {
     items: []Result,
 
@@ -72,6 +77,9 @@ pub const HybridResults = struct {
     items: []HybridResult,
 
     pub fn deinit(self: *HybridResults, allocator: std.mem.Allocator) void {
+        // `path` is owned (duped per item); `snippet` is borrowed (index-stable
+        // mmap slice or the empty literal) and is not freed.
+        for (self.items) |item| allocator.free(item.path);
         allocator.free(self.items);
         self.items = &.{};
     }
@@ -95,6 +103,8 @@ pub const MultiSignalResults = struct {
     items: []MultiSignalResult,
 
     pub fn deinit(self: *MultiSignalResults, allocator: std.mem.Allocator) void {
+        // `path` is owned (duped per item); `snippet` is borrowed.
+        for (self.items) |item| allocator.free(item.path);
         allocator.free(self.items);
         self.items = &.{};
     }
@@ -602,12 +612,31 @@ pub const Engine = struct {
                 }
             }
         };
+        // The semantic thread and the BM25 search below run concurrently but
+        // both allocate from `allocator`, which is not thread-safe (GPA/arena).
+        // Concurrent allocations corrupt the heap -> segfault. Serialize the
+        // two threads' allocations through a thread-safe wrapper for the
+        // concurrent window; everything after join() is single-threaded and
+        // can free via the raw `allocator` (same underlying child memory).
+        //
+        // Exception: when a snippet/term cache is attached, the BM25 side
+        // allocates cache nodes via the cache's own allocator (NOT `ca`) on the
+        // same heap — those allocations would race the semantic thread's `ca`
+        // allocations under a different lock. Fall back to running the two
+        // phases sequentially (no spawn, raw allocator) in that case.
+        const caches_attached = self.snippet_cache != null or self.term_cache != null;
+        var ts_alloc = std.heap.ThreadSafeAllocator{ .child_allocator = allocator };
+        const ca = if (caches_attached) allocator else ts_alloc.allocator();
+
         const sem_pool_size: usize = @max(limit * 3, 50);
-        var sem_ctx = SemCtx{ .gdb = gdb, .allocator = allocator, .query = query, .pool_size = sem_pool_size, .ann = self.ann };
-        const sem_thread = std.Thread.spawn(.{}, SemCtx.run, .{&sem_ctx}) catch null;
+        var sem_ctx = SemCtx{ .gdb = gdb, .allocator = ca, .query = query, .pool_size = sem_pool_size, .ann = self.ann };
+        const sem_thread = if (caches_attached)
+            null
+        else
+            std.Thread.spawn(.{}, SemCtx.run, .{&sem_ctx}) catch null;
 
         const bm25_pool_size: usize = @max(limit * 3, 50);
-        var bm25_results = self.search(allocator, query, bm25_pool_size) catch |e| {
+        var bm25_results = self.search(ca, query, bm25_pool_size) catch |e| {
             if (sem_thread) |t| { t.join(); } else { SemCtx.run(&sem_ctx); }
             if (sem_ctx.result) |*r| r.deinit(allocator);
             return e;
@@ -619,72 +648,115 @@ pub const Engine = struct {
         var sem_results = sem_ctx.result.?;
         defer sem_results.deinit(allocator);
 
-        // 3. Build RRF scores
+        // 3. Reciprocal-rank fusion keyed by PATH, carrying the per-path
+        //    semantic score in the same entry (one pass over each source — no
+        //    separate sem_map). BM25 doc_ids index the combined base+overlay
+        //    segment (resolved via filePathFor); semantic doc_ids are gdb
+        //    document rowids — DISJOINT id spaces. Fusing by raw doc_id both
+        //    crashes (OOB in index.filePath, base-segment only) and mis-merges
+        //    colliding ids. The file path is the one shared key. Empty paths
+        //    (index/overlay drift) are skipped so unrelated unresolved docs
+        //    don't collide under "".
         //    RRF(d) = Σ 1/(k + rank_in_list)
-        var rrf_scores = std.AutoHashMap(u32, f32).init(allocator);
+        const FusedScore = struct { rrf: f32 = 0, sem: f32 = 0 };
+        var rrf_scores = std.StringHashMap(FusedScore).init(allocator);
         defer rrf_scores.deinit();
 
-        // Add BM25 contributions
         for (bm25_results.items, 0..) |item, rank| {
+            if (item.path.len == 0) continue;
             const rrf = 1.0 / (RRF_K + @as(f32, @floatFromInt(rank + 1)));
-            const entry = try rrf_scores.getOrPut(item.doc_id);
-            if (!entry.found_existing) entry.value_ptr.* = 0;
-            entry.value_ptr.* += rrf;
+            const entry = try rrf_scores.getOrPut(item.path);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            entry.value_ptr.rrf += rrf;
         }
-
-        // Add semantic contributions
         for (sem_results.items, 0..) |item, rank| {
+            if (item.document_path.len == 0) continue;
             const rrf = 1.0 / (RRF_K + @as(f32, @floatFromInt(rank + 1)));
-            const entry = try rrf_scores.getOrPut(item.doc_id);
-            if (!entry.found_existing) entry.value_ptr.* = 0;
-            entry.value_ptr.* += rrf;
+            const entry = try rrf_scores.getOrPut(item.document_path);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            entry.value_ptr.rrf += rrf;
+            entry.value_ptr.sem = item.score;
         }
 
-        // 4. Build lookup maps for per-source scores
-        var bm25_map = std.AutoHashMap(u32, f32).init(allocator);
-        defer bm25_map.deinit();
-        for (bm25_results.items) |item| {
-            try bm25_map.put(item.doc_id, item.score);
+        // 4. Index BM25 hits by path for dedup + doc_id/snippet resolution.
+        //    First occurrence wins, collapsing a base+overlay duplicate of the
+        //    same path into a single output row.
+        var bm25_by_path = std.StringHashMap(usize).init(allocator);
+        defer bm25_by_path.deinit();
+        for (bm25_results.items, 0..) |item, idx| {
+            if (item.path.len == 0) continue;
+            const gop = try bm25_by_path.getOrPut(item.path);
+            if (!gop.found_existing) gop.value_ptr.* = idx;
         }
 
-        var sem_map = std.AutoHashMap(u32, f32).init(allocator);
-        defer sem_map.deinit();
-        for (sem_results.items) |item| {
-            try sem_map.put(item.doc_id, item.score);
-        }
-
-        // 5. Sort by fused RRF score
-        var fused = std.ArrayList(struct {
+        // 5. Materialize one candidate per UNIQUE path across BOTH id-spaces —
+        //    rrf_scores holds the union of BM25 and semantic paths. BM25-present
+        //    paths carry an index-stable doc_id + snippet; pure-semantic hits
+        //    carry the sentinel doc_id and an empty snippet (no in-segment
+        //    content). This is what keeps semantic-only matches in the result.
+        const Cand = struct {
+            path: []const u8, // borrowed here; duped into the result in step 6
             doc_id: u32,
+            snippet: []const u8,
+            bm25_score: f32,
+            semantic_score: f32,
             fused_score: f32,
-        }).initCapacity(allocator, rrf_scores.count()) catch @panic("OOM");
-        defer fused.deinit(allocator);
-
+        };
+        var cands = std.ArrayList(Cand).initCapacity(allocator, rrf_scores.count()) catch @panic("OOM");
+        defer cands.deinit(allocator);
         var rrf_it = rrf_scores.iterator();
-        while (rrf_it.next()) |entry| {
-            try fused.append(allocator, .{
-                .doc_id = entry.key_ptr.*,
-                .fused_score = entry.value_ptr.*,
-            });
+        while (rrf_it.next()) |e| {
+            const path = e.key_ptr.*;
+            const sem_score = e.value_ptr.sem;
+            const fused_score = e.value_ptr.rrf;
+            if (bm25_by_path.get(path)) |idx| {
+                const r = bm25_results.items[idx];
+                try cands.append(allocator, .{
+                    .path = r.path,
+                    .doc_id = r.doc_id,
+                    .snippet = r.snippet,
+                    .bm25_score = r.score,
+                    .semantic_score = sem_score,
+                    .fused_score = fused_score,
+                });
+            } else {
+                try cands.append(allocator, .{
+                    .path = path,
+                    .doc_id = NO_DOC_ID,
+                    .snippet = "",
+                    .bm25_score = 0,
+                    .semantic_score = sem_score,
+                    .fused_score = fused_score,
+                });
+            }
         }
-        std.mem.sort(@TypeOf(fused.items[0]), fused.items, {}, struct {
-            fn less(_: void, a: @TypeOf(fused.items[0]), b: @TypeOf(fused.items[0])) bool {
+        std.mem.sort(Cand, cands.items, {}, struct {
+            fn less(_: void, a: Cand, b: Cand) bool {
                 return a.fused_score > b.fused_score;
             }
         }.less);
-        if (fused.items.len > limit) fused.shrinkRetainingCapacity(limit);
+        if (cands.items.len > limit) cands.shrinkRetainingCapacity(limit);
 
-        // 6. Build results
-        const results = try allocator.alloc(HybridResult, fused.items.len);
-        for (fused.items, 0..) |item, result_idx| {
-            results[result_idx] = .{
-                .doc_id = item.doc_id,
-                .path = self.index.filePath(item.doc_id),
-                .snippet = self.snippet(item.doc_id, query),
-                .bm25_score = bm25_map.get(item.doc_id) orelse 0,
-                .semantic_score = sem_map.get(item.doc_id) orelse 0,
-                .fused_score = item.fused_score,
+        // 6. Build results, duping each path so it outlives sem_results (whose
+        //    gdb-owned strings back the pure-semantic paths) and bm25_results.
+        //    `snippet` stays borrowed (index-stable mmap slice, or the empty
+        //    literal for pure-semantic hits).
+        const results = try allocator.alloc(HybridResult, cands.items.len);
+        var built: usize = 0;
+        errdefer {
+            for (results[0..built]) |r| allocator.free(r.path);
+            allocator.free(results);
+        }
+        for (cands.items) |c| {
+            results[built] = .{
+                .doc_id = c.doc_id,
+                .path = try allocator.dupe(u8, c.path),
+                .snippet = c.snippet,
+                .bm25_score = c.bm25_score,
+                .semantic_score = c.semantic_score,
+                .fused_score = c.fused_score,
             };
+            built += 1;
         }
 
         return .{ .items = results };
@@ -707,6 +779,33 @@ pub const Engine = struct {
         // 1. Baseline hybrid search
         var hybrid = try self.hybridSearch(gdb, allocator, query, limit * 3);
         defer hybrid.deinit(allocator);
+
+        // 1b. Bridge id-spaces: the graph/kind/community signals below are keyed
+        //     by gdb document rowid, but hybrid hits carry a BM25 segment id (or
+        //     the NO_DOC_ID sentinel for pure-semantic hits) — disjoint spaces.
+        //     The shared file path is the only correct join, so map path -> gdb
+        //     rowid once and translate per hit.
+        var path_to_docid = std.StringHashMap(u32).init(allocator);
+        defer {
+            var key_it = path_to_docid.keyIterator();
+            while (key_it.next()) |k| allocator.free(k.*);
+            path_to_docid.deinit();
+        }
+        {
+            var stmt = try gdb.prepare("SELECT id, path FROM documents");
+            defer stmt.finalize();
+            while (try stmt.step()) {
+                const p = try stmt.columnText(1);
+                if (p.len == 0) continue;
+                const gop = try path_to_docid.getOrPut(p);
+                if (!gop.found_existing) {
+                    // Intern the key: sqlite's column slice is invalid after the
+                    // next step(); dupe over the just-inserted borrowed key.
+                    gop.key_ptr.* = try allocator.dupe(u8, p);
+                    gop.value_ptr.* = @intCast(try stmt.columnInt(0));
+                }
+            }
+        }
 
         // 2. Aggregate graph-proximity and kind-boost scores per document
         var graph_scores = std.AutoHashMap(u32, f32).init(allocator);
@@ -771,15 +870,20 @@ pub const Engine = struct {
         defer top_comms.deinit();
         const topk = @min(hybrid.items.len, 3);
         for (hybrid.items[0..topk]) |h| {
-            if (doc_comm.get(h.doc_id)) |c| try top_comms.put(c, {});
+            const rid = path_to_docid.get(h.path) orelse continue;
+            if (doc_comm.get(rid)) |c| try top_comms.put(c, {});
         }
         // Track communities already seen in rank order for diversity decay.
         var seen_comm = std.AutoHashMap(i64, u32).init(allocator);
         defer seen_comm.deinit();
 
-        // 4. Build final results with signal blending
+        // 4. Build final results with signal blending. Carry path + snippet
+        //    straight from the hybrid hit (already overlay-correct) instead of
+        //    re-resolving from doc_id with base-only accessors.
         var final_scores = std.ArrayList(struct {
             doc_id: u32,
+            path: []const u8, // borrowed from hybrid; duped into the result in step 6
+            snippet: []const u8,
             final_score: f32,
             bm25_score: f32,
             semantic_score: f32,
@@ -791,25 +895,30 @@ pub const Engine = struct {
         defer final_scores.deinit(allocator);
 
         for (hybrid.items) |h| {
-            const graph_score = graph_scores.get(h.doc_id) orelse 0;
-            const kind_score = kind_scores.get(h.doc_id) orelse 1.0;
+            // Translate the hit's path to its gdb rowid for signal lookups; a
+            // miss (file not in gdb) leaves every signal at its neutral default.
+            const rid_opt = path_to_docid.get(h.path);
+            const graph_score = if (rid_opt) |rid| graph_scores.get(rid) orelse 0 else 0;
+            const kind_score = if (rid_opt) |rid| kind_scores.get(rid) orelse 1.0 else 1.0;
 
             // Community signal: cohesion boosts same-community-as-top hits;
             // diversity decays each repeated community in rank order.
             var community_score: f32 = 0;
-            if (doc_comm.get(h.doc_id)) |c| switch (bias) {
-                .cohesion => if (top_comms.contains(c)) {
-                    community_score = SIGNAL_WEIGHTS.community_cohesion;
-                },
-                .diversity => {
-                    const e = try seen_comm.getOrPut(c);
-                    if (!e.found_existing) e.value_ptr.* = 0;
-                    community_score = -SIGNAL_WEIGHTS.community_diversity *
-                        @as(f32, @floatFromInt(e.value_ptr.*));
-                    e.value_ptr.* += 1;
-                },
-                .neutral => {},
-            };
+            if (rid_opt) |rid| {
+                if (doc_comm.get(rid)) |c| switch (bias) {
+                    .cohesion => if (top_comms.contains(c)) {
+                        community_score = SIGNAL_WEIGHTS.community_cohesion;
+                    },
+                    .diversity => {
+                        const e = try seen_comm.getOrPut(c);
+                        if (!e.found_existing) e.value_ptr.* = 0;
+                        community_score = -SIGNAL_WEIGHTS.community_diversity *
+                            @as(f32, @floatFromInt(e.value_ptr.*));
+                        e.value_ptr.* += 1;
+                    },
+                    .neutral => {},
+                };
+            }
 
             // Blend: fused_score * (1 + graph + kind + community)
             const graph_bonus = SIGNAL_WEIGHTS.graph_proximity * graph_score;
@@ -818,6 +927,8 @@ pub const Engine = struct {
 
             try final_scores.append(allocator, .{
                 .doc_id = h.doc_id,
+                .path = h.path,
+                .snippet = h.snippet,
                 .final_score = final,
                 .bm25_score = h.bm25_score,
                 .semantic_score = h.semantic_score,
@@ -836,13 +947,21 @@ pub const Engine = struct {
         }.less);
         if (final_scores.items.len > limit) final_scores.shrinkRetainingCapacity(limit);
 
-        // 6. Build results
+        // 6. Build results. Path is duped (owned; freed by deinit) so it
+        //    outlives hybrid.deinit; snippet is borrowed (index-stable, carried
+        //    from the hybrid hit — never re-resolved from the segment id, which
+        //    could be the NO_DOC_ID sentinel or an overlay id and would OOB).
         const results = try allocator.alloc(MultiSignalResult, final_scores.items.len);
-        for (final_scores.items, 0..) |item, idx| {
-            results[idx] = .{
+        var built: usize = 0;
+        errdefer {
+            for (results[0..built]) |r| allocator.free(r.path);
+            allocator.free(results);
+        }
+        for (final_scores.items) |item| {
+            results[built] = .{
                 .doc_id = item.doc_id,
-                .path = self.index.filePath(item.doc_id),
-                .snippet = self.snippet(item.doc_id, query),
+                .path = try allocator.dupe(u8, item.path),
+                .snippet = item.snippet,
                 .bm25_score = item.bm25_score,
                 .semantic_score = item.semantic_score,
                 .fused_score = item.fused_score,
@@ -851,6 +970,7 @@ pub const Engine = struct {
                 .community_score = item.community_score,
                 .final_score = item.final_score,
             };
+            built += 1;
         }
 
         return .{ .items = results };
@@ -1004,15 +1124,23 @@ fn bm25Only(engine: *Engine, allocator: std.mem.Allocator, query: []const u8, li
     defer bm25.deinit(allocator);
 
     const results = try allocator.alloc(HybridResult, bm25.items.len);
-    for (bm25.items, 0..) |r, i| {
-        results[i] = .{
+    var built: usize = 0;
+    errdefer {
+        for (results[0..built]) |r| allocator.free(r.path);
+        allocator.free(results);
+    }
+    for (bm25.items) |r| {
+        // `path` is owned by the result (HybridResults.deinit frees it); snippet
+        // stays borrowed from the index-stable mmap slice.
+        results[built] = .{
             .doc_id = r.doc_id,
-            .path = r.path,
+            .path = try allocator.dupe(u8, r.path),
             .snippet = r.snippet,
             .bm25_score = r.score,
             .semantic_score = 0,
             .fused_score = r.score,
         };
+        built += 1;
     }
     return .{ .items = results };
 }
