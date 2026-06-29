@@ -13,6 +13,7 @@ const ts = @import("tree_sitter.zig");
 const extractor_mod = @import("extractor.zig");
 const graph_db = @import("../storage/graph_db.zig");
 const edge_resolver = @import("edge_resolver.zig");
+const diag = @import("../diag.zig");
 
 const ExtractedSymbol = extractor_mod.ExtractedSymbol;
 const ExtractedEdge = extractor_mod.ExtractedEdge;
@@ -118,6 +119,9 @@ pub const Pipeline = struct {
 
         // ── Phase 1: Extract and store documents + symbols ───────────
         for (files) |entry| {
+            // Breadcrumb: if extract() panics (vs. errors, which are caught
+            // below), the abort names this file.
+            diag.setFile(entry.path);
             const ext = std.fs.path.extension(entry.path);
             const lang_id = ts.LanguageId.fromExtension(ext) orelse {
                 result.files_skipped += 1;

@@ -235,7 +235,16 @@ fn refill(allocator: std.mem.Allocator, src: ReaderSource, rb: *Transport.ReadBu
         rb.consumed = 0;
     }
     var tmp: [4096]u8 = undefined;
-    const n = try src.read(&tmp);
+    // A read() failure on the stdin pipe (Windows: BrokenPipe / OperationAborted /
+    // Unexpected / InputOutput; POSIX: ConnectionResetByPeer, etc.) is NOT
+    // error.EndOfStream, so without this it would propagate out of readMessage,
+    // through serve()'s `while (try ...)`, and kill the whole server — the MCP
+    // client sees the connection "drop". Treat any read failure as clean EOF so
+    // the event loop exits gracefully; log the real reason for diagnosis.
+    const n = src.read(&tmp) catch |err| {
+        std.log.warn("stdin read error ({s}); treating as EOF", .{@errorName(err)});
+        return error.EndOfStream;
+    };
     if (n == 0) return error.EndOfStream;
     try rb.data.appendSlice(allocator, tmp[0..n]);
 }

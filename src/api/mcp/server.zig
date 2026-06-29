@@ -15,6 +15,7 @@ const pool = @import("../../core/storage/pool.zig");
 const project_store = @import("../../core/project_store.zig");
 const version = @import("../../version.zig");
 const incremental = @import("../../core/indexer/incremental.zig");
+const diag = @import("../../core/diag.zig");
 const ParserPool = incremental.ParserPool;
 const hnsw = @import("../../core/search/hnsw.zig");
 const semantic = @import("../../core/search/semantic.zig");
@@ -786,6 +787,10 @@ pub const Server = struct {
             mut.server.allocator.free(mut.tool_name);
             mut.server.inflightDecrement();
         }
+
+        // Breadcrumb: if this tool's work panics, the abort names the tool.
+        diag.setTool(mut.tool_name);
+        defer diag.clear();
 
         const mode = lockMode(mut.tool_name);
         acquireSharedLocks(mut.server, mode);

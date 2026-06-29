@@ -18,6 +18,7 @@ pub const indexer = struct {
 };
 pub const project_store = @import("core/project_store.zig");
 pub const config = @import("core/config.zig");
+pub const diag = @import("core/diag.zig");
 pub const project = struct {
     pub const watcher = @import("project/watcher.zig");
 };

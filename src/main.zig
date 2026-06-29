@@ -2,6 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zindeks = @import("zindeks");
 
+/// Route panics through the crash-diagnostics handler so a worker-thread abort
+/// names the in-flight tool/file in the log before the default trace + abort.
+pub const panic = std.debug.FullPanic(zindeks.diag.panicHandler);
+
 pub fn main() u8 {
     var gpa: std.heap.GeneralPurposeAllocator(.{ .safety = builtin.mode == .Debug }) = .{};
     defer _ = gpa.deinit();

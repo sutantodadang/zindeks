@@ -35,6 +35,7 @@ const scanner = @import("../scanner/scanner.zig");
 const storage = @import("../storage/index.zig");
 const graph_db = @import("../storage/graph_db.zig");
 const symbols = @import("../../parser/symbols.zig");
+const diag = @import("../diag.zig");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types shared between producer, workers, and writer
@@ -546,10 +547,13 @@ fn workerThread(ctx: *WorkerCtx) void {
         //
         // On parse / alloc failure we fall back to the zero-length sentinel;
         // document metadata (path, hash, mtime) is still recorded.
+        // Breadcrumb: a parser panic here aborts the process; name the file.
+        diag.setFile(item.path);
         const parsed: []symbols.ParsedSymbol = if (!item.is_large)
             symbols.parseSymbols(arena_alloc, item.content) catch &empty_parsed
         else
             &empty_parsed;
+        diag.clear();
 
         ctx.output.push(.{
             .file_path = item.path,
