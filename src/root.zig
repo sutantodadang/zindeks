@@ -87,3 +87,8 @@ pub const ai = struct {
 };
 
 pub const bench = @import("core/bench.zig");
+
+/// Checked C ABI (ABI version 1) for in-process embedding.  Exported as the
+/// `zindeks` shared library; also importable so the ABI tests run under
+/// `zig build test`.
+pub const ffi = @import("ffi.zig");

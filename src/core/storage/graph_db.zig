@@ -17,6 +17,27 @@ const SQLITE_OK = sqlite3.SQLITE_OK;
 const SQLITE_ROW = sqlite3.SQLITE_ROW;
 const SQLITE_DONE = sqlite3.SQLITE_DONE;
 
+/// Minimum SQLite runtime version accepted by the embedded ABI, as an
+/// `sqlite3_libversion_number()` integer: 3.51.3.  The 3.51 line contains
+/// the WAL-reset concurrency fix that the cross-process graph DB relies on.
+pub const MIN_SQLITE_VERSION_NUMBER: i32 = 3051003;
+
+/// Runtime SQLite version string (e.g. "3.53.4").
+pub fn sqliteVersion() []const u8 {
+    return std.mem.sliceTo(sqlite3.sqlite3_libversion(), 0);
+}
+
+/// Runtime SQLite version as a `sqlite3_libversion_number()` integer
+/// (e.g. 3053004 for "3.53.4").
+pub fn sqliteVersionNumber() i32 {
+    return sqlite3.sqlite3_libversion_number();
+}
+
+/// True when the linked SQLite satisfies `MIN_SQLITE_VERSION_NUMBER`.
+pub fn sqliteVersionSatisfiesFloor() bool {
+    return sqliteVersionNumber() >= MIN_SQLITE_VERSION_NUMBER;
+}
+
 /// SQLITE_TRANSIENT sentinel — tells SQLite to make an internal copy.
 /// We define our own rather than using the @cImport-generated version,
 /// which fails @ptrFromInt alignment checks on aarch64 targets in Zig 0.15.2.

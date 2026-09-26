@@ -29,3 +29,12 @@ jobs:
 
       - name: Test
         run: zig build test
+
+      - name: Build embedded shared library
+        run: zig build library
+
+      - name: Verify ABI export allowlist
+        run: zig build ffi-exports
+
+      - name: C ABI smoke test
+        run: zig build ffi-test

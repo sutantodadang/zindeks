@@ -200,9 +200,24 @@ pub const Server = struct {
     /// Invalidated on any mutating tool call.
     result_cache: result_cache_mod.ResultCache,
 
-    /// Optional background file watcher; non-null only when ZINDEKS_WATCH is
-    /// set and a project is attached. Auto-applies incremental updates.
+    /// Optional background file watcher; non-null only when watching is
+    /// enabled and a project is attached. Auto-applies incremental updates.
     watcher: ?*watcher_mod.PollWatcher = null,
+
+    /// Watcher enablement.  For the CLI these default to zero and fall back
+    /// to the `ZINDEKS_WATCH` / `ZINDEKS_WATCH_INTERVAL_MS` environment
+    /// variables.  Embedded hosts set them explicitly so no process-global
+    /// environment is consulted.
+    watch_enabled: bool = false,
+    watch_interval_ms: u32 = 2000,
+
+    /// True when this server was constructed via `initEmbedded` (inert
+    /// transport, options-owned store root, no environment reads).
+    embedded: bool = false,
+
+    /// True when `store_root` points at memory this server owns and must
+    /// free in `deinit` (set by `initEmbedded`).
+    owns_store_root: bool = false,
 
     /// Long-lived parser pool — reuses TSParser instances across incremental
     /// index updates so we avoid alloc/free of TSParser + grammar binding per
@@ -220,6 +235,14 @@ pub const Server = struct {
     }
 
     pub fn initWithTransport(allocator: std.mem.Allocator, info: ServerInfo, transport: protocol.Transport) Server {
+        return buildServer(allocator, info, transport) catch @panic("OOM");
+    }
+
+    /// Fallible core constructor.  The `init`/`initWithTransport` wrappers
+    /// keep their historical infallible signature for the CLI, but the
+    /// embedded path uses this directly so allocation failure is reported to
+    /// the host instead of aborting its process.
+    fn buildServer(allocator: std.mem.Allocator, info: ServerInfo, transport: protocol.Transport) !Server {
         return .{
             .allocator = allocator,
             .transport = transport,
@@ -243,11 +266,57 @@ pub const Server = struct {
             .inflight = 0,
             .inflight_mu = .{},
             .inflight_cv = .{},
-            .response_buf = std.ArrayList(u8).initCapacity(allocator, 4096) catch @panic("OOM"),
+            .response_buf = try std.ArrayList(u8).initCapacity(allocator, 4096),
             .result_cache = result_cache_mod.ResultCache.init(allocator),
             .parser_pool = ParserPool.init(allocator),
             .watcher = null,
         };
+    }
+
+    /// Options for an in-process embedded server (shared-library ABI).
+    pub const EmbeddedOptions = struct {
+        /// Absolute, canonical repository path to bind.  When the store
+        /// already holds a warm index it is opened; otherwise the handle is
+        /// created without a project and an explicit `index_repository`
+        /// call performs the first index.
+        repository: []const u8,
+        /// Optional store-root override.  Copied and owned by the server.
+        store_root: ?[]const u8 = null,
+        /// Enable the background incremental file watcher for this handle.
+        watch: bool = false,
+        /// Watcher poll interval in milliseconds.
+        watch_interval_ms: u32 = 2000,
+        pool_conns: u32 = DEFAULT_POOL_CONNS,
+        worker_threads: u32 = DEFAULT_WORKER_THREADS,
+    };
+
+    /// Construct a server for in-process embedding.  Uses an inert transport
+    /// (never touches host stdio), takes watcher settings from `opts` rather
+    /// than the environment, and binds an existing index without rebuilding.
+    pub fn initEmbedded(allocator: std.mem.Allocator, opts: EmbeddedOptions) !Server {
+        var s = try buildServer(allocator, .{
+            .pool_conns = opts.pool_conns,
+            .worker_threads = opts.worker_threads,
+        }, protocol.Transport.initInert());
+        errdefer s.deinit();
+
+        s.embedded = true;
+        s.watch_enabled = opts.watch;
+        s.watch_interval_ms = opts.watch_interval_ms;
+
+        if (opts.store_root) |sr| {
+            const dup = try allocator.dupe(u8, sr);
+            s.store_root = dup;
+            s.owns_store_root = true;
+        }
+
+        // Bind an existing index if the store has one; never build here.
+        // A missing index leaves the handle project-less until the host
+        // issues `index_repository`.
+        s.openProjectByPath(opts.repository) catch |err| {
+            std.log.debug("embedded bind skipped: {s}", .{@errorName(err)});
+        };
+        return s;
     }
 
     pub fn deinit(self: *Server) void {
@@ -267,6 +336,10 @@ pub const Server = struct {
         if (self.idx) |*idx| idx.close();
         if (self.project_path) |p| self.allocator.free(p);
         if (self.index_dir) |p| self.allocator.free(p);
+        if (self.owns_store_root) {
+            if (self.store_root) |p| self.allocator.free(p);
+            self.store_root = null;
+        }
         self.result_cache.deinit();
         self.parser_pool.deinit();
         self.response_buf.deinit(self.allocator);
@@ -1031,20 +1104,27 @@ pub const Server = struct {
         }
     }
 
-    /// Start the background watcher if ZINDEKS_WATCH is set and a project is
-    /// loaded. Idempotent: stops any existing watcher first.
+    /// Start the background watcher when watching is enabled and a project
+    /// is loaded.  Embedded servers use per-instance options exclusively;
+    /// CLI servers fall back to `ZINDEKS_WATCH` / `ZINDEKS_WATCH_INTERVAL_MS`.
+    /// Idempotent: stops any existing watcher first.
     fn startWatcherIfEnabled(self: *Server) void {
         self.stopWatcher();
-        const enabled = envOwnedNonEmpty(self.allocator, "ZINDEKS_WATCH") orelse return;
-        // envOwnedNonEmpty returns an owned slice — free it after use.
-        self.allocator.free(enabled);
+        var enabled = self.watch_enabled;
+        var interval_ms = self.watch_interval_ms;
+        if (!self.embedded) {
+            if (envOwnedNonEmpty(self.allocator, "ZINDEKS_WATCH")) |e| {
+                self.allocator.free(e);
+                enabled = true;
+            }
+            if (envOwnedNonEmpty(self.allocator, "ZINDEKS_WATCH_INTERVAL_MS")) |iv| {
+                defer self.allocator.free(iv);
+                interval_ms = std.fmt.parseInt(u32, iv, 10) catch 2000;
+            }
+        }
+        if (!enabled) return;
         const pp = self.project_path orelse return;
         if (self.gdb == null) return;
-        var interval_ms: u32 = 2000;
-        if (envOwnedNonEmpty(self.allocator, "ZINDEKS_WATCH_INTERVAL_MS")) |iv| {
-            defer self.allocator.free(iv);
-            interval_ms = std.fmt.parseInt(u32, iv, 10) catch 2000;
-        }
         const w = self.allocator.create(watcher_mod.PollWatcher) catch return;
         w.* = watcher_mod.PollWatcher.init(self.allocator, &self.gdb.?, pp, interval_ms, watcherCallback, self);
         w.start() catch {
@@ -1117,9 +1197,11 @@ pub const Server = struct {
             const negotiated = protocol.negotiateProtocolVersion(requested);
             try protocol.writeInitializeResultV(w, req.id, self.info.name, self.info.version, negotiated);
             self.initialized = true;
-            // Lazily attach a warm project if none is bound yet.
+            // Lazily attach a warm project if none is bound yet.  Embedded
+            // servers never auto-attach: they are bound to an explicit
+            // repository and must not consult CWD or the environment.
             self.meta_lock.lock();
-            const need_attach = self.project_path == null;
+            const need_attach = self.project_path == null and !self.embedded;
             self.meta_lock.unlock();
             if (need_attach) self.autoAttach();
             return true;

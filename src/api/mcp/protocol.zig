@@ -60,6 +60,11 @@ pub const ServerCapabilities = struct {
 pub const Transport = union(enum) {
     stdio: Stdio,
     socket: Socket,
+    /// In-process transport used by the embedded shared library.  It has no
+    /// backing file or socket and never touches the host's stdio.  It exists
+    /// only so the `Server` keeps its single transport field; all embedded
+    /// request/response traffic goes through `Server.executeMessageToBuffer`.
+    inert,
 
     pub const MAX_HEADER_LEN = 4096;
     pub const MAX_BODY_LEN = 16 * 1024 * 1024; // 16 MiB
@@ -128,6 +133,12 @@ pub const Transport = union(enum) {
         } };
     }
 
+    /// Construct a transport that owns no host resources.  Safe for an
+    /// embedded host: `deinit` is a no-op and no read/write touches stdio.
+    pub fn initInert() Transport {
+        return .inert;
+    }
+
     pub fn deinit(self: *Transport) void {
         switch (self.*) {
             .stdio => |*s| s.read_buf.data.deinit(s.allocator),
@@ -135,6 +146,7 @@ pub const Transport = union(enum) {
                 s.read_buf.data.deinit(s.allocator);
                 s.stream.close();
             },
+            .inert => {},
         }
     }
 
@@ -144,6 +156,7 @@ pub const Transport = union(enum) {
         switch (self.*) {
             .stdio => |*s| return readFramed(s.allocator, .{ .file = s.stdin }, &s.read_buf, &s.framing),
             .socket => |*s| return readFramed(s.allocator, .{ .stream = s.stream }, &s.read_buf, &s.framing),
+            .inert => return null,
         }
     }
 
@@ -163,6 +176,7 @@ pub const Transport = union(enum) {
                 defer s.write_mutex.unlock();
                 try writeFramed(.{ .stream = s.stream }, s.framing, json);
             },
+            .inert => {},
         }
     }
 
@@ -174,6 +188,7 @@ pub const Transport = union(enum) {
         return switch (self.*) {
             .stdio => |*s| &s.write_mutex,
             .socket => |*s| &s.write_mutex,
+            .inert => &inert_write_mutex,
         };
     }
 
@@ -184,6 +199,7 @@ pub const Transport = union(enum) {
         switch (self.*) {
             .stdio => |*s| try s.stdout.writeAll(bytes),
             .socket => |*s| try s.stream.writeAll(bytes),
+            .inert => {},
         }
     }
 
@@ -191,9 +207,14 @@ pub const Transport = union(enum) {
         switch (self.*) {
             .stdio => |*s| s.stdout.sync() catch {},
             .socket => {},
+            .inert => {},
         }
     }
 };
+
+/// Backing mutex for the inert transport's `writeMutex()`.  Never contended
+/// (embedded callers do not stream), but must return a valid pointer.
+var inert_write_mutex: std.Thread.Mutex = .{};
 
 /// Reader abstraction over either a File or a net.Stream — both expose
 /// `read([]u8) !usize`, so we tag-dispatch at each call site rather than

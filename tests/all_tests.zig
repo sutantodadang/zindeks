@@ -20,4 +20,5 @@ test {
     _ = @import("install_test.zig");
     _ = @import("http_test.zig");
     _ = @import("accuracy_test.zig");
+    _ = @import("embedded_ffi_test.zig");
 }
