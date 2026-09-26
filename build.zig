@@ -238,6 +238,9 @@ pub fn build(b: *std.Build) void {
     // and COFF `.def` files are platform-specific; the allowlist above plus
     // SQLITE_API/TREE_SITTER_HIDE_SYMBOLS cover those targets.
     if (target.result.ofmt == .elf) {
+        // Zig 0.15's native ELF linker does not apply version scripts.
+        lib.use_llvm = true;
+        lib.use_lld = true;
         lib.version_script = b.path("build/lib/zindeks.map");
     }
     if (optimize != .Debug) {
