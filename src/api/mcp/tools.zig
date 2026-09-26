@@ -1747,7 +1747,7 @@ fn handleHealthCheck(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
     const cache_misses: u64 = if (ctx.result_cache) |rc| rc.misses else 0;
 
     try writer.print(
-        \\{{"status":{f},"counts":{{"documents":{},"symbols":{},"edges":{},"embeddings":{},"communities":{}}},"last_indexed":{},"uptime_seconds":0,"cache_hits":{},"cache_misses":{}}}
+        \\{{"status":{f},"counts":{{"documents":{},"symbols":{},"edges":{},"embeddings":{},"communities":{}}},"last_indexed":{},"uptime_seconds":0,"cache_hits":{},"cache_misses":{},"sqlite_version":{f},"sqlite_version_number":{}}}
     , .{
         std.json.fmt(status, .{}),
         doc_count,
@@ -1758,6 +1758,8 @@ fn handleHealthCheck(ctx: *Context, params_obj: ?std.json.ObjectMap, writer: any
         last_indexed,
         cache_hits,
         cache_misses,
+        std.json.fmt(graph_db.sqliteVersion(), .{}),
+        graph_db.sqliteVersionNumber(),
     });
 }
 

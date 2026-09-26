@@ -1,0 +1,14 @@
+/* ELF symbol allowlist for the embedded zindeks shared library (ABI 1).
+ * Everything except the five zindeks_* entry points is localized so a
+ * host-provided SQLite / tree-sitter in the same process cannot interpose
+ * (or be interposed by) the vendored copies. */
+{
+  global:
+    zindeks_abi_version;
+    zindeks_open;
+    zindeks_request;
+    zindeks_buffer_free;
+    zindeks_close;
+  local:
+    *;
+};

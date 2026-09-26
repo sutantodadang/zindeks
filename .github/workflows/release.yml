@@ -78,6 +78,107 @@ jobs:
           path: dist/zindeks-${{ matrix.name }}.${{ matrix.archive }}
           if-no-files-found: error
 
+  ffi:
+    name: Embedded library ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-linux
+            lib: libzindeks.so
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-linux
+            lib: libzindeks.so
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-macos
+            lib: libzindeks.dylib
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-windows-msvc
+            lib: zindeks.dll
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build embedded library (ReleaseSafe)
+        run: zig build library -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Verify export allowlist (native targets only)
+        if: matrix.target == 'x86_64-linux' || matrix.target == 'aarch64-macos' || matrix.target == 'x86_64-windows-msvc'
+        run: zig build ffi-exports -Doptimize=ReleaseSafe
+
+      - name: Package asset with header, notice and metadata
+        shell: python
+        env:
+          ASSET_NAME: zindeks-ffi-${{ matrix.name }}
+          LIB_FILE: ${{ matrix.lib }}
+          TARGET: ${{ matrix.target }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          import hashlib, json, os, shutil, tarfile, pathlib
+
+          name = os.environ["ASSET_NAME"]
+          lib_file = os.environ["LIB_FILE"]
+          root = pathlib.Path("dist") / name
+          (root / "include").mkdir(parents=True, exist_ok=True)
+
+          lib_src = next(p for p in pathlib.Path("zig-out").rglob(lib_file))
+          shutil.copy2(lib_src, root / lib_file)
+          shutil.copy2("include/zindeks.h", root / "include" / "zindeks.h")
+          shutil.copy2("vendor/sqlite3/SOURCE.md", root / "NOTICE.sqlite.md")
+
+          zon = pathlib.Path("build.zig.zon").read_text(encoding="utf-8")
+          version = zon.split('.version = "', 1)[1].split('"', 1)[0]
+
+          def digest(p):
+              h = hashlib.sha256(p.read_bytes()).hexdigest()
+              return h, p.stat().st_size
+
+          files = []
+          for p in sorted(root.rglob("*")):
+              if p.is_file():
+                  h, size = digest(p)
+                  files.append({"name": str(p.relative_to(root)).replace(os.sep, "/"), "sha256": h, "size": size})
+
+          metadata = {
+              "abi_version": 1,
+              "zindeks_version": version,
+              "target": os.environ["TARGET"],
+              "source_revision": os.environ["SOURCE_REVISION"],
+              "sqlite": {"version": "3.53.4", "version_number": 3053004},
+              "files": files,
+          }
+          (root / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+          archive = pathlib.Path("dist") / f"{name}.tar.gz"
+          with tarfile.open(archive, "w:gz") as tf:
+              tf.add(root, arcname=name)
+
+          (pathlib.Path("dist") / f"{name}.sha256").write_text(
+              hashlib.sha256(archive.read_bytes()).hexdigest() + f"  {archive.name}\n",
+              encoding="utf-8",
+          )
+
+      - name: Upload asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: zindeks-ffi-${{ matrix.name }}
+          path: |
+            dist/zindeks-ffi-${{ matrix.name }}.tar.gz
+            dist/zindeks-ffi-${{ matrix.name }}.sha256
+          if-no-files-found: error
+
   release:
     name: Publish GitHub release
     runs-on: ubuntu-latest
