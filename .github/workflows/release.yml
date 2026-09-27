@@ -87,11 +87,11 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-latest
-            target: x86_64-linux
+            target: x86_64-linux-gnu
             lib: libzindeks.so
           - name: linux-aarch64
             os: ubuntu-latest
-            target: aarch64-linux
+            target: aarch64-linux-gnu
             lib: libzindeks.so
           - name: macos-aarch64
             os: macos-14
