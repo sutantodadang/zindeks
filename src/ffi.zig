@@ -172,7 +172,7 @@ pub export fn zindeks_open(
         .server = undefined,
         .response = response_buf,
     };
-    h.server = server_mod.Server.initEmbedded(alloc, .{
+    h.server.initEmbedded(alloc, .{
         .repository = canonical,
         .store_root = store_root,
         .watch = watch,
