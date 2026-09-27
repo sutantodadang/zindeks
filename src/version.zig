@@ -1,2 +1,2 @@
 // Auto-generated from build.zig.zon — do not edit manually
-pub const version = "0.10.1";
+pub const version = "0.10.2";
