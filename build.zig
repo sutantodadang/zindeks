@@ -164,10 +164,15 @@ pub fn build(b: *std.Build) void {
 
     // ── Vendored C: tree-sitter core ─────────────────────────────────────────
     const ts_mod = b.createModule(.{ .target = target, .optimize = optimize, .pic = true });
-    ts_mod.addCSourceFiles(.{ .files = &.{"vendor/tree-sitter/src/lib.c"} });
+    ts_mod.addCSourceFiles(.{
+        .files = &.{"vendor/tree-sitter/src/lib.c"},
+        .flags = &.{"-fvisibility=hidden"},
+    });
     ts_mod.addIncludePath(b.path("vendor/tree-sitter/src"));
     ts_mod.addIncludePath(b.path("vendor/tree-sitter/include"));
     ts_mod.addCMacro("TREE_SITTER_HIDE_SYMBOLS", "1");
+    // alloc.h uses a different macro for the allocator function pointers.
+    ts_mod.addCMacro("TREE_SITTER_HIDDEN_SYMBOLS", "1");
     const ts = b.addLibrary(.{
         .linkage = .static,
         .name = "tree-sitter",
