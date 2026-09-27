@@ -30,7 +30,8 @@ test "initEmbedded binds options without touching stdio" {
     defer allocator.free(store);
     try std.fs.makeDirAbsolute(store);
 
-    var srv = try server_mod.Server.initEmbedded(allocator, .{
+    var srv: server_mod.Server = undefined;
+    try srv.initEmbedded(allocator, .{
         .repository = repo,
         .store_root = store,
         .watch = true,
@@ -161,6 +162,7 @@ test "ABI: 100 open/request/close cycles and watcher teardown" {
     const store = try std.fs.path.join(allocator, &.{ repo, "store" });
     defer allocator.free(store);
     try std.fs.makeDirAbsolute(store);
+    try tmp.dir.writeFile(.{ .sub_path = "answer.rs", .data = "pub fn answer() -> u32 { 42 }\n" });
 
     const options = try std.fmt.allocPrint(
         allocator,
@@ -169,7 +171,7 @@ test "ABI: 100 open/request/close cycles and watcher teardown" {
     );
     defer allocator.free(options);
 
-    for (0..100) |_| {
+    for (0..100) |cycle| {
         var handle: ?*ffi.Handle = null;
         var err = ffi.ZindeksBuffer{};
         const rc = ffi.zindeks_open(options.ptr, options.len, &handle, &err);
@@ -177,11 +179,31 @@ test "ABI: 100 open/request/close cycles and watcher teardown" {
             ffi.zindeks_buffer_free(&err);
             return error.UnexpectedOpenFailure;
         }
+        if (cycle == 0) {
+            // Seed a real index. Subsequent opens must attach it and start
+            // a watcher with pointers into the final, immovable server.
+            const index_json = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"index_repository\",\"arguments\":{{\"path\":{f}}}}}}}", .{std.json.fmt(repo, .{})});
+            defer allocator.free(index_json);
+            var indexed = ffi.ZindeksBuffer{};
+            try std.testing.expectEqual(@as(i32, 0), ffi.zindeks_request(handle, index_json.ptr, index_json.len, &indexed));
+            const body = indexed.ptr.?[0..indexed.len];
+            const indexed_ok = std.mem.indexOf(u8, body, "\"isError\":true") == null;
+            ffi.zindeks_buffer_free(&indexed);
+            try std.testing.expect(indexed_ok);
+        }
         var resp = ffi.ZindeksBuffer{};
-        const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
-        _ = ffi.zindeks_request(handle, json.ptr, json.len, &resp);
+        if (handle.?.server.watcher) |watcher| {
+            try std.testing.expectEqual(@intFromPtr(&handle.?.server), @intFromPtr(watcher.callback_ctx.?));
+            try std.testing.expectEqual(@intFromPtr(&handle.?.server.gdb.?), @intFromPtr(watcher.gdb));
+        } else {
+            return error.ExpectedActiveWatcher;
+        }
+        const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_context\",\"arguments\":{\"query\":\"answer\",\"max_tokens\":500}}}";
+        try std.testing.expectEqual(@as(i32, 0), ffi.zindeks_request(handle, json.ptr, json.len, &resp));
+        const found = std.mem.indexOf(u8, resp.ptr.?[0..resp.len], "answer") != null;
         ffi.zindeks_buffer_free(&resp);
-        // Closes with the (project-less) watcher configured; must not hang.
+        try std.testing.expect(found);
+        // Closes with an active watcher; it must join before freeing the server.
         ffi.zindeks_close(handle);
     }
 }

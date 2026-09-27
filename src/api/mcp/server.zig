@@ -293,30 +293,31 @@ pub const Server = struct {
     /// Construct a server for in-process embedding.  Uses an inert transport
     /// (never touches host stdio), takes watcher settings from `opts` rather
     /// than the environment, and binds an existing index without rebuilding.
-    pub fn initEmbedded(allocator: std.mem.Allocator, opts: EmbeddedOptions) !Server {
-        var s = try buildServer(allocator, .{
+    /// Initialize at the final address: search state and watcher callbacks
+    /// retain pointers into this server, so it must not move after attach.
+    pub fn initEmbedded(self: *Server, allocator: std.mem.Allocator, opts: EmbeddedOptions) !void {
+        self.* = try buildServer(allocator, .{
             .pool_conns = opts.pool_conns,
             .worker_threads = opts.worker_threads,
         }, protocol.Transport.initInert());
-        errdefer s.deinit();
+        errdefer self.deinit();
 
-        s.embedded = true;
-        s.watch_enabled = opts.watch;
-        s.watch_interval_ms = opts.watch_interval_ms;
+        self.embedded = true;
+        self.watch_enabled = opts.watch;
+        self.watch_interval_ms = opts.watch_interval_ms;
 
         if (opts.store_root) |sr| {
             const dup = try allocator.dupe(u8, sr);
-            s.store_root = dup;
-            s.owns_store_root = true;
+            self.store_root = dup;
+            self.owns_store_root = true;
         }
 
         // Bind an existing index if the store has one; never build here.
         // A missing index leaves the handle project-less until the host
         // issues `index_repository`.
-        s.openProjectByPath(opts.repository) catch |err| {
+        self.openProjectByPath(opts.repository) catch |err| {
             std.log.debug("embedded bind skipped: {s}", .{@errorName(err)});
         };
-        return s;
     }
 
     pub fn deinit(self: *Server) void {
