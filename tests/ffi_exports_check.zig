@@ -22,6 +22,7 @@ const forbidden = [_][*:0]const u8{
     "sqlite3_exec",
     "ts_parser_new",
     "ts_parser_delete",
+    "ts_current_malloc",
     "tree_sitter_zig",
     "tree_sitter_c",
     "tree_sitter_python",
