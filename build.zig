@@ -61,7 +61,7 @@ fn linkGrammars(
             // library exports only the zindeks ABI (the ELF version script
             // enforces the same allowlist on Linux).  TREE_SITTER_HIDE_SYMBOLS
             // makes the generated parser's TS_PUBLIC expand to nothing.
-            .flags = &.{"-fvisibility=hidden"},
+            .flags = &.{ "-fvisibility=hidden", vendored_c_sanitize },
         });
         g_mod.addCMacro("TREE_SITTER_HIDE_SYMBOLS", "1");
         g_mod.addIncludePath(b.path(b.pathJoin(&.{ "vendor/grammars", g.include })));
@@ -86,6 +86,16 @@ const exported_symbols = [_][]const u8{
     "zindeks_buffer_free",
     "zindeks_close",
 };
+
+/// Vendored third-party C (SQLite, tree-sitter, grammars) is compiled with
+/// UBSan disabled.  Zig turns on `-fsanitize=undefined` for C sources at Debug
+/// and ReleaseSafe, and the embedded library is loaded by the host at a
+/// relocated image base (LoadLibrary).  At that relocated base a benign
+/// pointer/overflow UB check inside the vendored C traps the whole host process
+/// (`ud1`, STATUS_ILLEGAL_INSTRUCTION) even though the code computes correctly.
+/// That C is not ours to fix, and a shipped library must never carry UBSan
+/// traps into a host process, so the checks are disabled for vendored C only.
+const vendored_c_sanitize = "-fno-sanitize=undefined";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -135,7 +145,10 @@ pub fn build(b: *std.Build) void {
 
     // ── Vendored C: SQLite 3 ─────────────────────────────────────────────────
     const sqlite_mod = b.createModule(.{ .target = target, .optimize = optimize, .pic = true });
-    sqlite_mod.addCSourceFiles(.{ .files = &.{"vendor/sqlite3/sqlite3.c"} });
+    sqlite_mod.addCSourceFiles(.{
+        .files = &.{"vendor/sqlite3/sqlite3.c"},
+        .flags = &.{vendored_c_sanitize},
+    });
     sqlite_mod.addIncludePath(b.path("vendor/sqlite3"));
     // Multi-thread mode: safe to use across threads as long as no single
     // connection is touched by two threads at once. The MCP server's read-only
@@ -166,7 +179,7 @@ pub fn build(b: *std.Build) void {
     const ts_mod = b.createModule(.{ .target = target, .optimize = optimize, .pic = true });
     ts_mod.addCSourceFiles(.{
         .files = &.{"vendor/tree-sitter/src/lib.c"},
-        .flags = &.{"-fvisibility=hidden"},
+        .flags = &.{ "-fvisibility=hidden", vendored_c_sanitize },
     });
     ts_mod.addIncludePath(b.path("vendor/tree-sitter/src"));
     ts_mod.addIncludePath(b.path("vendor/tree-sitter/include"));
