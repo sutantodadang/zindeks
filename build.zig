@@ -48,7 +48,8 @@ fn linkGrammars(
     ts_lib: *std.Build.Step.Compile,
 ) void {
     inline for (grammar_specs) |g| {
-        const g_mod = b.createModule(.{ .target = target, .optimize = optimize });
+        // These static archives also feed the shared library, including musl builds.
+        const g_mod = b.createModule(.{ .target = target, .optimize = optimize, .pic = true });
         const parser_path = b.pathJoin(&.{ "vendor/grammars", g.parser });
         const c_files: []const []const u8 = if (g.scanner) |s|
             &.{ parser_path, b.pathJoin(&.{ "vendor/grammars", s }) }
@@ -133,7 +134,7 @@ pub fn build(b: *std.Build) void {
     };
 
     // ── Vendored C: SQLite 3 ─────────────────────────────────────────────────
-    const sqlite_mod = b.createModule(.{ .target = target, .optimize = optimize });
+    const sqlite_mod = b.createModule(.{ .target = target, .optimize = optimize, .pic = true });
     sqlite_mod.addCSourceFiles(.{ .files = &.{"vendor/sqlite3/sqlite3.c"} });
     sqlite_mod.addIncludePath(b.path("vendor/sqlite3"));
     // Multi-thread mode: safe to use across threads as long as no single
@@ -162,7 +163,7 @@ pub fn build(b: *std.Build) void {
     sqlite.linkLibC();
 
     // ── Vendored C: tree-sitter core ─────────────────────────────────────────
-    const ts_mod = b.createModule(.{ .target = target, .optimize = optimize });
+    const ts_mod = b.createModule(.{ .target = target, .optimize = optimize, .pic = true });
     ts_mod.addCSourceFiles(.{ .files = &.{"vendor/tree-sitter/src/lib.c"} });
     ts_mod.addIncludePath(b.path("vendor/tree-sitter/src"));
     ts_mod.addIncludePath(b.path("vendor/tree-sitter/include"));
