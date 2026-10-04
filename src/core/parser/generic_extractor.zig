@@ -459,6 +459,7 @@ pub fn extract(
                     .target_kind = .method,
                     .edge_type = .contains,
                     .confidence = 1.0,
+                    .target_line = node.startPoint().row + 1,
                 });
             }
             continue;
@@ -500,6 +501,7 @@ pub fn extract(
                         .target_kind = .method,
                         .edge_type = .contains,
                         .confidence = 1.0,
+                        .target_line = node.startPoint().row + 1,
                     });
                 }
             }
@@ -577,6 +579,8 @@ pub fn extract(
                     .target_kind = .function,
                     .edge_type = .calls,
                     .confidence = 1.0,
+                    .target_qualifier = if (extractor_mod.qualifierSegment(raw)) |q| try allocator.dupe(u8, q) else null,
+                    .source_line = parent_node.startPoint().row + 1,
                 });
             }
         }

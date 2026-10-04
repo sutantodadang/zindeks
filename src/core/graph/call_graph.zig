@@ -471,7 +471,14 @@ pub fn tracePath(
 
 /// Resolve a symbol name to its database ID. Returns null if not found.
 fn resolveSymbolId(gdb: *graph_db.GraphDb, name: []const u8) !?i64 {
-    var stmt = try gdb.prepare("SELECT id FROM symbols WHERE name = ? LIMIT 1");
+    // Shared names (`new`, `run`) → root at the most-connected definition,
+    // not an arbitrary one.
+    var stmt = try gdb.prepare(
+        \\SELECT s.id FROM symbols s WHERE s.name = ?
+        \\ORDER BY (SELECT COUNT(*) FROM edges e WHERE e.target_symbol_id = s.id)
+        \\       + (SELECT COUNT(*) FROM edges e WHERE e.source_symbol_id = s.id) DESC, s.id
+        \\LIMIT 1
+    );
     defer stmt.finalize();
     try stmt.bindText(1, name);
     if (!(try stmt.step())) return null;

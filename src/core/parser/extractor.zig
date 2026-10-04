@@ -75,6 +75,15 @@ pub const ExtractedEdge = struct {
     target_kind: SymbolKind = .module, // default, overridden by import edges
     edge_type: EdgeKind,
     confidence: f32 = 1.0, // 1.0 = certain, lower = heuristic guess
+    /// Segment before the callee in a scoped call (`session` in
+    /// `session::append_turn()`, `Foo` in `Foo::new()`); used to pick
+    /// among same-named cross-file targets.
+    target_qualifier: ?[]const u8 = null,
+    /// Start line of the source/target symbol when known (0 = unknown);
+    /// picks between same-named symbols in one file (two `impl` blocks
+    /// each with a `new`).
+    source_line: u32 = 0,
+    target_line: u32 = 0,
 
     pub fn format(
         self: ExtractedEdge,
@@ -105,11 +114,63 @@ pub const ExtractionResult = struct {
         for (self.edges) |edge| {
             allocator.free(edge.source_name);
             allocator.free(edge.target_name);
+            if (edge.target_qualifier) |q| allocator.free(q);
         }
         allocator.free(self.symbols);
         allocator.free(self.edges);
     }
 };
+
+/// Segment immediately before the callee name in a scoped/dotted call
+/// expression: `crate::session::append_turn` → `session`, `Foo::new` → `Foo`,
+/// `pay.charge` → `pay`, `obj->run` → `obj`, `Foo::<T>::new` → `Foo`.
+/// Null for an unqualified call or a non-identifier qualifier (`a.b().c`).
+pub fn qualifierSegment(raw: []const u8) ?[]const u8 {
+    const t = std.mem.trimRight(u8, std.mem.trim(u8, raw, " \t\r\n"), "( ");
+    var i = skipGenerics(t, t.len); // turbofish on the callee: `parse::<T>`
+    if (i != t.len) while (i > 0 and t[i - 1] == ':') : (i -= 1) {};
+    while (i > 0 and isIdentChar(t[i - 1])) i -= 1; // callee name
+    // Separators (`.`, `::`, `->`), whitespace and generic args `<...>`.
+    var saw_sep = false;
+    while (i > 0) {
+        const c = t[i - 1];
+        if (c == '>' and !(i >= 2 and t[i - 2] == '-')) {
+            const j = skipGenerics(t, i);
+            if (j == i) break; // unbalanced `>`
+            i = j;
+        } else if (std.mem.indexOfScalar(u8, ".:->", c) != null or std.ascii.isWhitespace(c)) {
+            if (c != ' ' and c != '\t' and c != '\r' and c != '\n') saw_sep = true;
+            i -= 1;
+        } else break;
+    }
+    if (!saw_sep) return null;
+    const end = i;
+    while (i > 0 and isIdentChar(t[i - 1])) i -= 1;
+    return if (end == i) null else t[i..end];
+}
+
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+}
+
+/// If `t[0..end]` ends with a balanced `<...>` group, return its start index.
+fn skipGenerics(t: []const u8, end: usize) usize {
+    if (end == 0 or t[end - 1] != '>') return end;
+    var depth: usize = 0;
+    var i = end;
+    while (i > 0) {
+        i -= 1;
+        switch (t[i]) {
+            '>' => depth += 1,
+            '<' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return end; // unbalanced: leave as-is
+}
 
 // ██████████████████████████████████████████████████████████████████████████
 // Extractor interface — vtable pattern for language-specific extractors
