@@ -174,10 +174,7 @@ pub const Pipeline = struct {
                     edge_alloc,
                     &pending_edges,
                     doc_id,
-                    edge.source_name,
-                    edge.target_name,
-                    edge.edge_type,
-                    edge.confidence,
+                    edge,
                 );
             }
             result.edges_extracted += @intCast(extraction.edges.len);

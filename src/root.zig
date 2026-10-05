@@ -49,6 +49,7 @@ pub const parser = struct {
     pub const zig_extractor = @import("core/parser/zig_extractor.zig");
     pub const generic_extractor = @import("core/parser/generic_extractor.zig");
     pub const pipeline = @import("core/parser/pipeline.zig");
+    pub const edge_resolver = @import("core/parser/edge_resolver.zig");
     pub const http_routes = @import("core/parser/http_routes.zig");
 };
 

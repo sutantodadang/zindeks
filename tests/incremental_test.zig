@@ -224,3 +224,92 @@ test "applyChanges removeFileFromGraph only deletes the targeted file" {
     const path = try path_stmt.columnText(0);
     try std.testing.expectEqualStrings("keep.zig", path);
 }
+
+// ── Inbound cross-file edges survive incremental edits of the callee ────
+
+fn writeSrc(dir: std.fs.Dir, name: []const u8, body: []const u8) !void {
+    const f = try dir.createFile(name, .{});
+    defer f.close();
+    try f.writeAll(body);
+}
+
+fn scalarInt(db: *graph_db.GraphDb, sql: [:0]const u8) !i64 {
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    _ = try stmt.step();
+    return try stmt.columnInt(0);
+}
+
+const caller_helper_edges =
+    \\SELECT COUNT(*) FROM edges e
+    \\JOIN symbols s ON s.id = e.source_symbol_id
+    \\JOIN symbols t ON t.id = e.target_symbol_id
+    \\WHERE e.edge_type = 'calls' AND s.name = 'caller' AND t.name = 'helper'
+;
+const dangling_edges = "SELECT COUNT(*) FROM edges WHERE target_symbol_id NOT IN (SELECT id FROM symbols)";
+
+/// Full-index a.zig (`helper`) + b.zig (`caller` → `a.helper()`), apply
+/// `edit` to the tree, run an incremental update, return the db.
+fn indexThenEdit(tmp: *std.testing.TmpDir, edit: *const fn (std.fs.Dir) anyerror!void) !graph_db.GraphDb {
+    try writeSrc(tmp.dir, "a.zig", "pub fn helper() void {}\n");
+    try writeSrc(tmp.dir, "b.zig",
+        \\const a = @import("a.zig");
+        \\pub fn caller() void {
+        \\    a.helper();
+        \\}
+        \\
+    );
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &buf);
+
+    var db = try graph_db.GraphDb.open(":memory:");
+    errdefer db.close();
+    try db.migrate();
+    var pipe = zindeks.parser.pipeline.Pipeline.init(std.testing.allocator, db, root);
+    _ = try pipe.run();
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, caller_helper_edges));
+
+    try edit(tmp.dir);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diff = try incremental.detectChanges(arena.allocator(), &db, root);
+    defer diff.deinit();
+    _ = try incremental.applyChanges(arena.allocator(), &db, root, &diff, null);
+    return db;
+}
+
+test "applyChanges keeps inbound edges when the callee file is edited" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try indexThenEdit(&tmp, struct {
+        fn f(dir: std.fs.Dir) !void {
+            try writeSrc(dir, "a.zig", "// edited\npub fn helper() void {\n    _ = 1;\n}\n");
+        }
+    }.f);
+    defer db.close();
+    try std.testing.expectEqual(@as(i64, 1), try scalarInt(&db, caller_helper_edges));
+    try std.testing.expectEqual(@as(i64, 0), try scalarInt(&db, dangling_edges));
+}
+
+test "applyChanges drops inbound edges when the callee is renamed or deleted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var renamed = try indexThenEdit(&tmp, struct {
+        fn f(dir: std.fs.Dir) !void {
+            try writeSrc(dir, "a.zig", "pub fn helper2() void {}\n");
+        }
+    }.f);
+    defer renamed.close();
+    try std.testing.expectEqual(@as(i64, 0), try scalarInt(&renamed, caller_helper_edges));
+    try std.testing.expectEqual(@as(i64, 0), try scalarInt(&renamed, dangling_edges));
+
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var deleted = try indexThenEdit(&tmp2, struct {
+        fn f(dir: std.fs.Dir) !void {
+            try dir.deleteFile("a.zig");
+        }
+    }.f);
+    defer deleted.close();
+    try std.testing.expectEqual(@as(i64, 0), try scalarInt(&deleted, dangling_edges));
+}

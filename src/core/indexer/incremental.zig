@@ -233,11 +233,17 @@ pub fn applyChanges(
     try gdb.exec("BEGIN TRANSACTION");
 
     // ── Remove old data for changed/deleted files ──────────────────────
+    // Edges INTO these files from unchanged files are not re-extracted, so
+    // remember their targets first and re-point them after re-insert.
+    try gdb.exec("CREATE TEMP TABLE IF NOT EXISTS edge_rebind (edge_id INTEGER PRIMARY KEY, path TEXT, name TEXT, kind TEXT, line INTEGER)");
+    try gdb.exec("DELETE FROM edge_rebind");
     for (diff.modified) |change| {
+        try stashInboundEdges(gdb, change.path);
         try removeFileFromGraph(gdb, change.path);
         stats.modified += 1;
     }
     for (diff.deleted) |change| {
+        try stashInboundEdges(gdb, change.path);
         try removeFileFromGraph(gdb, change.path);
         stats.deleted += 1;
     }
@@ -357,10 +363,7 @@ pub fn applyChanges(
                 edge_alloc,
                 &pending_edges,
                 doc_id,
-                edge.source_name,
-                edge.target_name,
-                edge.edge_type,
-                edge.confidence,
+                edge,
             );
         }
         stats.edges_added += @intCast(extraction.edges.len);
@@ -373,6 +376,22 @@ pub fn applyChanges(
 
     // ── Phase B: Resolve + insert edges (all delta symbols now present) ─
     _ = try edge_resolver.resolveEdges(gdb, pending_edges.items);
+
+    // ── Re-point stashed inbound edges at the re-inserted symbols (same
+    // path, name, kind; nearest line).  Targets that no longer exist
+    // (renamed, deleted file) take the edge with them.
+    try gdb.exec(
+        \\UPDATE edges SET target_symbol_id = COALESCE((
+        \\    SELECT s.id FROM edge_rebind r
+        \\    JOIN documents d ON d.path = r.path
+        \\    JOIN symbols s ON s.document_id = d.id AND s.name = r.name AND s.kind = r.kind
+        \\    WHERE r.edge_id = edges.id
+        \\    ORDER BY ABS(s.line_start - r.line), s.id LIMIT 1
+        \\), -1)
+        \\WHERE id IN (SELECT edge_id FROM edge_rebind)
+    );
+    try gdb.exec("DELETE FROM edges WHERE target_symbol_id = -1");
+    try gdb.exec("DELETE FROM edge_rebind");
 
     // ── Commit transaction ────────────────────────────────────────────
     try gdb.exec("COMMIT");
@@ -424,6 +443,24 @@ pub fn applyChangesWithOverlayPooled(
 /// honored.  ON DELETE CASCADE on symbols/edges' FKs handles the
 /// dependent rows, but we still delete edges first to avoid relying on
 /// foreign_keys=ON being enabled.
+/// Record every edge whose target lives in `path` (into the `edge_rebind`
+/// temp table) so `applyChanges` can re-point it once the file's symbols are
+/// re-inserted with new ids.  Edges whose source is also in a changed file
+/// are deleted with that file and simply skipped later.
+fn stashInboundEdges(gdb: *GraphDb, path: []const u8) !void {
+    var stmt = try gdb.prepare(
+        \\INSERT OR REPLACE INTO edge_rebind (edge_id, path, name, kind, line)
+        \\SELECT e.id, d.path, t.name, t.kind, t.line_start
+        \\FROM edges e
+        \\JOIN symbols t ON t.id = e.target_symbol_id
+        \\JOIN documents d ON d.id = t.document_id
+        \\WHERE d.path = ?
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, path);
+    _ = try stmt.step();
+}
+
 fn removeFileFromGraph(gdb: *GraphDb, path: []const u8) !void {
     {
         var stmt = try gdb.prepare(
